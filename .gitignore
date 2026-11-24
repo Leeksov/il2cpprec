@@ -1,0 +1,15 @@
+.DS_Store
+build/
+analysis/
+*.ipa
+*.dSYM/
+**/bin/
+**/obj/
+tests/differential/il2cpprec-differential-*/
+tests/differential/.modern-behaviors*
+tests/differential/criticalops.py
+tests/differential/support/CriticalOpsOracle.cpp
+tests/differential/fixtures/criticalops/
+tests/acceptance/.acceptance-*/
+__pycache__/
+*.pyc

@@ -1,0 +1,23 @@
+function x64 SharedJoin @ 0x5000
+block 0x5000
+  @0x5000 if binary<bool1>(==,reg<p64>(x0),const<p64>(0x0)) branch const<p64>(0x5010)
+  @0x5004 assign reg<p64>(x1) = const<p64>(0x1)
+  @0x5008 branch const<p64>(0x5020)
+end
+block 0x5010
+  @0x5010 assign reg<p64>(x1) = const<p64>(0x2)
+  @0x5014 branch const<p64>(0x5020)
+end
+block 0x5020
+  @0x5020 if binary<bool1>(==,reg<p64>(x1),const<p64>(0x0)) branch const<p64>(0x5030)
+  @0x5024 assign reg<p64>(x0) = const<p64>(0x3)
+  @0x5028 branch const<p64>(0x5040)
+end
+block 0x5030
+  @0x5030 assign reg<p64>(x0) = const<p64>(0x4)
+  @0x5034 branch const<p64>(0x5040)
+end
+block 0x5040
+  @0x5040 return reg<p64>(x1)
+end
+end

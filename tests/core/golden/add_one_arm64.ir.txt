@@ -1,0 +1,7 @@
+function arm64 AddOneArm64 @ 0x1000
+block 0x1000
+  @0x0 assign reg<p64>(x0) = reg<p64>(x1)
+  @0x0 assign reg<p64>(x0) = binary<p64>(+,reg<p64>(x0),binary<p64>(<<,const<p64>(0x0),const<p64>(0xC)))
+  @0x1008 return reg<p64>(x0)
+end
+end

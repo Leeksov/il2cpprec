@@ -1,0 +1,7 @@
+function x64 AddOneX64 @ 0x2000
+block 0x2000
+  @0x2000 assign reg<u64>(rax) = reg<u64>(rcx)
+  @0x2003 assign reg<u64>(rax) = binary<u64>(+,reg<u64>(rax),const<u64>(0x1))
+  @0x2007 return reg<u64>(rax)
+end
+end

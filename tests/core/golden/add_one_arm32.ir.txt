@@ -1,0 +1,7 @@
+function arm32 AddOneArm32 @ 0x4000
+block 0x4000
+  @0x4000 assign reg<u32>(r0) = binary<u32>(+,reg<u32>(r0),binary<u32>(<<,reg<u32>(r0),const<u32>(0x1)))
+  @0x4004 assign reg<u32>(r0) = binary<u32>(-,reg<u32>(r0),const<u32>(0x1))
+  @0x4008 return reg<u32>(r0)
+end
+end

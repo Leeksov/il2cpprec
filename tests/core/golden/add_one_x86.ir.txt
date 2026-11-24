@@ -1,0 +1,7 @@
+function x86 AddOneX86 @ 0x6000
+block 0x6000
+  @0x6000 assign reg<u32>(eax) = cast<u32>(reg<u32>(ecx))
+  @0x6002 assign reg<u32>(eax) = cast<u32>(binary<u32>(+,reg<u32>(eax),const<u32>(0x1)))
+  @0x6005 return reg<u32>(eax)
+end
+end

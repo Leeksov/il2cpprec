@@ -1,0 +1,148 @@
+using System;
+using NativeUInt = System.__NATIVE_UINT__;
+
+public static class RuntimeMemory
+{
+    private static byte[] storage = new byte[0];
+
+    public static int PointerSize
+    {
+        get { return sizeof(NativeUInt); }
+    }
+
+    public static void Reset(int size)
+    {
+        if (size < 0)
+            throw new ArgumentOutOfRangeException("size");
+        storage = new byte[size];
+    }
+
+    public static void Fill(byte value)
+    {
+        for (int i = 0; i < storage.Length; ++i)
+            storage[i] = value;
+    }
+
+    public static byte[] Snapshot()
+    {
+        return (byte[])storage.Clone();
+    }
+
+    private static int Offset(NativeUInt address, int size)
+    {
+        ulong raw = (ulong)address;
+        if (raw > int.MaxValue)
+            throw new IndexOutOfRangeException("The recovered address is outside the managed buffer.");
+        int offset = (int)raw;
+        if (size < 0 || offset > storage.Length || size > storage.Length - offset)
+            throw new IndexOutOfRangeException("The recovered access is outside the managed buffer.");
+        return offset;
+    }
+
+    public static bool ReadBoolean(NativeUInt address) { return ReadU8(address) != 0; }
+    public static bool ReadU1(NativeUInt address) { return ReadBoolean(address); }
+    public static byte ReadU8(NativeUInt address) { return storage[Offset(address, 1)]; }
+    public static ushort ReadU16(NativeUInt address) { return BitConverter.ToUInt16(storage, Offset(address, 2)); }
+    public static uint ReadU32(NativeUInt address) { return BitConverter.ToUInt32(storage, Offset(address, 4)); }
+    public static ulong ReadU64(NativeUInt address) { return BitConverter.ToUInt64(storage, Offset(address, 8)); }
+    public static sbyte ReadS8(NativeUInt address) { return unchecked((sbyte)ReadU8(address)); }
+    public static short ReadS16(NativeUInt address) { return BitConverter.ToInt16(storage, Offset(address, 2)); }
+    public static int ReadS32(NativeUInt address) { return BitConverter.ToInt32(storage, Offset(address, 4)); }
+    public static long ReadS64(NativeUInt address) { return BitConverter.ToInt64(storage, Offset(address, 8)); }
+    public static float ReadF32(NativeUInt address) { return BitConverter.ToSingle(storage, Offset(address, 4)); }
+    public static double ReadF64(NativeUInt address) { return BitConverter.ToDouble(storage, Offset(address, 8)); }
+
+    public static NativeUInt ReadPtr(NativeUInt address)
+    {
+        return PointerSize == 4 ? (NativeUInt)ReadU32(address) : (NativeUInt)ReadU64(address);
+    }
+
+    private static void WriteBytes(NativeUInt address, byte[] bytes)
+    {
+        int offset = Offset(address, bytes.Length);
+        System.Buffer.BlockCopy(bytes, 0, storage, offset, bytes.Length);
+    }
+
+    public static void WriteBoolean(NativeUInt address, bool value) { WriteU8(address, value ? (byte)1 : (byte)0); }
+    public static void WriteU1(NativeUInt address, bool value) { WriteBoolean(address, value); }
+    public static void WriteU8(NativeUInt address, byte value) { storage[Offset(address, 1)] = value; }
+    public static void WriteU16(NativeUInt address, ushort value) { WriteBytes(address, BitConverter.GetBytes(value)); }
+    public static void WriteU32(NativeUInt address, uint value) { WriteBytes(address, BitConverter.GetBytes(value)); }
+    public static void WriteU64(NativeUInt address, ulong value) { WriteBytes(address, BitConverter.GetBytes(value)); }
+    public static void WriteS8(NativeUInt address, sbyte value) { WriteU8(address, unchecked((byte)value)); }
+    public static void WriteS16(NativeUInt address, short value) { WriteBytes(address, BitConverter.GetBytes(value)); }
+    public static void WriteS32(NativeUInt address, int value) { WriteBytes(address, BitConverter.GetBytes(value)); }
+    public static void WriteS64(NativeUInt address, long value) { WriteBytes(address, BitConverter.GetBytes(value)); }
+    public static void WriteF32(NativeUInt address, float value) { WriteBytes(address, BitConverter.GetBytes(value)); }
+    public static void WriteF64(NativeUInt address, double value) { WriteBytes(address, BitConverter.GetBytes(value)); }
+
+    public static void WritePtr(NativeUInt address, NativeUInt value)
+    {
+        if (PointerSize == 4)
+            WriteU32(address, (uint)value);
+        else
+            WriteU64(address, (ulong)value);
+    }
+}
+
+public delegate NativeUInt RuntimeCallHandler(NativeUInt target, NativeUInt[] arguments);
+
+public static class RuntimeCalls
+{
+    public static RuntimeCallHandler DirectCallHandler;
+    public static RuntimeCallHandler IndirectCallHandler;
+
+    public static NativeUInt InvokeDirect(NativeUInt target, params NativeUInt[] arguments)
+    {
+        RuntimeCallHandler handler = DirectCallHandler ?? IndirectCallHandler;
+        if (handler == null)
+            throw new MissingMethodException("Unexpected direct call to 0x" + target.ToString("X") + ".");
+        return handler(target, arguments ?? new NativeUInt[0]);
+    }
+
+    public static NativeUInt Invoke(NativeUInt target, params NativeUInt[] arguments)
+    {
+        return InvokeDirect(target, arguments);
+    }
+
+    public static NativeUInt InvokeIndirect(NativeUInt target, params NativeUInt[] arguments)
+    {
+        RuntimeCallHandler handler = IndirectCallHandler ?? DirectCallHandler;
+        if (handler == null)
+            throw new MissingMethodException("Unexpected indirect call to 0x" + target.ToString("X") + ".");
+        return handler(target, arguments ?? new NativeUInt[0]);
+    }
+}
+
+public static class RuntimeString
+{
+    public static int LengthOffset { get { return 2 * RuntimeMemory.PointerSize; } }
+    public static int CharsOffset { get { return 2 * RuntimeMemory.PointerSize + 4; } }
+
+    public static int GetLength(NativeUInt address)
+    {
+        if (address == 0)
+            throw new NullReferenceException();
+        int length = RuntimeMemory.ReadS32(address + (NativeUInt)LengthOffset);
+        if (length < 0)
+            throw new InvalidOperationException("Negative UTF-16 string length.");
+        return length;
+    }
+
+    public static NativeUInt GetCharsAddress(NativeUInt address)
+    {
+        if (address == 0)
+            throw new NullReferenceException();
+        return address + (NativeUInt)CharsOffset;
+    }
+
+    public static string ReadString(NativeUInt address)
+    {
+        int length = GetLength(address);
+        char[] characters = new char[length];
+        NativeUInt chars = GetCharsAddress(address);
+        for (int i = 0; i < length; ++i)
+            characters[i] = (char)RuntimeMemory.ReadU16(chars + (NativeUInt)(i * 2));
+        return new string(characters);
+    }
+}

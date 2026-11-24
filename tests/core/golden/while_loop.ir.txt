@@ -1,0 +1,10 @@
+function x64 WhileLoop @ 0x3000
+block 0x3000
+  @0x3000 if binary<bool1>(<,reg<p64>(x0),const<p64>(0xA)) branch const<p64>(0x3010)
+  @0x3004 return reg<p64>(x0)
+end
+block 0x3010
+  @0x3010 assign reg<p64>(x0) = binary<p64>(+,reg<p64>(x0),const<p64>(0x1))
+  @0x3014 branch const<p64>(0x3000)
+end
+end

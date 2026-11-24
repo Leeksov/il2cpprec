@@ -1,0 +1,9 @@
+function x64 EarlyReturn @ 0x2000
+block 0x2000
+  @0x2000 if binary<bool1>(==,reg<p64>(x0),const<p64>(0x0)) branch const<p64>(0x2010)
+  @0x2004 return const<p64>(0x1)
+end
+block 0x2010
+  @0x2010 return const<p64>(0x2)
+end
+end
