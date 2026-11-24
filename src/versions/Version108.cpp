@@ -376,7 +376,7 @@ Version108Header Version108::readHeader(const std::vector<uint8_t>& data) {
 
 Version108Header Version108::readHeader(const uint8_t* data, size_t size) {
     MetadataReader reader(data, size);
-    reader.require(0, serializedSize);
+    reader.require(0, Version108Header::serializedSize);
     if (reader.u32(0) != sanityValue) invalid("incorrect global metadata sanity value");
 
     Version108Header header;
@@ -402,9 +402,9 @@ Version108Header Version108::readHeader(const uint8_t* data, size_t size) {
 
     auto& sections = header.sections;
     auto& widths = header.indices;
-    widths.methodDefinition = indexWidth(sections.methods.count);
-    widths.typeDefinition = indexWidth(sections.typeDefinitions.count);
-    widths.methodSpec = indexWidth(
+    widths.methodDefinition = Version108Header::indexWidth(sections.methods.count);
+    widths.typeDefinition = Version108Header::indexWidth(sections.typeDefinitions.count);
+    widths.methodSpec = Version108Header::indexWidth(
         sections.methodSpecsOnGenericType.count +
         sections.genericMethodSpecsOnType.count +
         sections.methodSpecs.count);

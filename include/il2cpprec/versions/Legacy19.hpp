@@ -13,6 +13,7 @@ struct Legacy19Profile {
     int32_t version = 0;
     bool supported = false;
     size_t headerSize = 0;
+    size_t metadataUsageHeaderSize = 0;
     size_t typeDefinitionStride = 0;
     size_t methodDefinitionStride = 0;
     size_t parameterDefinitionStride = 0;
@@ -24,6 +25,8 @@ struct Legacy19Profile {
     size_t metadataRegistrationPairs = 0;
     size_t codeRegistrationPairs = 0;
     size_t fieldOffsetsPair = 0;
+    int32_t methodReferencesPair = -1;
+    bool metadataUsage18 = false;
     size_t genericMethodPointersPair = 0;
     size_t invokerPointersPair = 0;
     size_t methodIndexOffset = 0;
@@ -93,6 +96,9 @@ struct Legacy19Diagnostic {
 };
 
 struct Legacy19NativeRegistration {
+    uint64_t methodReferencesAddress = 0;
+    uint64_t methodReferencesCount = 0;
+    std::vector<uint64_t> methodReferences;
     uint64_t metadataUsagesAddress = 0;
     uint64_t metadataUsagesCount = 0;
     std::vector<uint64_t> metadataUsages;

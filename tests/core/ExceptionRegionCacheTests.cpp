@@ -49,7 +49,9 @@ TEST_CASE("exceptionRegions and vector expressions survive disk cache roundtrip 
     profile.lifterSemanticsVersion = 1;
 
     const auto before = cacheFixture();
-    const auto bytes = serializeDiskCache(job, before, profile);
+    RecoveryOutcome outcome;
+    outcome.function = before;
+    const auto bytes = serializeDiskCache(job, outcome, profile);
     CHECK(!bytes.empty());
     const auto decoded = deserializeDiskCache(bytes, job, profile);
     CHECK(decoded.has_value());

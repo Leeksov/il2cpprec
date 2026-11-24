@@ -719,6 +719,7 @@ std::vector<std::string> validateSourceLayout(const SourceLayoutSelection& selec
         selection.string.chars.offset != 2 * selection.pointerSize + sizeof(std::uint32_t)) {
         errors.push_back("Il2CppString header does not match the native length/chars layout");
     }
+    } // nativeRuntimeAvailable
     return errors;
 }
 
