@@ -1,5 +1,8 @@
 #include <il2cpprec/diagnostics/SemanticVerifier.hpp>
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <array>
 #include <cassert>
 #include <memory>

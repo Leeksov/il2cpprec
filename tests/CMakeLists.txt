@@ -33,3 +33,11 @@ endif()
 
 enable_testing()
 add_test(NAME il2cpprec_core_tests COMMAND il2cpprec_core_tests)
+
+add_executable(il2cpprec_verifier_tests verification/SemanticVerifierTests.cpp)
+target_link_libraries(il2cpprec_verifier_tests PRIVATE il2cpprec)
+add_test(NAME il2cpprec_verifier_tests COMMAND il2cpprec_verifier_tests)
+
+add_executable(il2cpprec_runtime_helper_tests core/RuntimeHelperTests.cpp)
+target_link_libraries(il2cpprec_runtime_helper_tests PRIVATE il2cpprec)
+add_test(NAME il2cpprec_runtime_helper_tests COMMAND il2cpprec_runtime_helper_tests)

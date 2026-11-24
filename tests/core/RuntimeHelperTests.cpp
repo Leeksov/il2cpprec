@@ -1,6 +1,9 @@
 #include <il2cpprec/analysis/ManagedPatterns.hpp>
 #include <il2cpprec/analysis/RuntimeHelpers.hpp>
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <string>
 
