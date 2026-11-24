@@ -1,4 +1,5 @@
 #include <il2cpprec/Recovery.hpp>
+#include <il2cpprec/diagnostics/SemanticVerifier.hpp>
 #include <il2cpprec/emit/ProjectWriter.hpp>
 #include <il2cpprec/formats/BinaryLoader.hpp>
 #include <il2cpprec/ida/IdaRecovery.hpp>
@@ -55,6 +56,7 @@ struct Arguments {
     size_t maxMethodSize = 0;
     bool inspectModules = false;
     bool failOnPartial = false;
+    bool verify = false;
     bool protectedProfile = false;
     bool idaMcp = false;
     bool help = false;
@@ -74,6 +76,7 @@ struct MethodReport {
     size_t size = 0;
     MethodStatus status = MethodStatus::Error;
     std::vector<std::string> reasons;
+    std::optional<il2cpprec::VerificationResult> verification;
 };
 
 struct RecoveryOutcome {
@@ -189,6 +192,7 @@ void printHelp(std::ostream& output) {
            << "  --max-method-size N      Maximum bytes lifted per method (0 = resolver default)\n"
            << "  --protected-profile      Enable the protected-binary recovery profile\n"
            << "  --fail-on-partial        Return a non-zero status when any method is partial\n"
+           << "  --verify                 Audit decoded instruction addresses and final IR structure\n"
            << "  --report FILE            Write a JSON report with per-method statuses and reasons\n"
            << "  --idamcp HOST[:PORT]     Connect to IDA MCP (default port: 13337)\n"
            << "  --idamcp-host HOST       Set the IDA MCP host and enable IDA MCP\n"
@@ -358,10 +362,12 @@ Arguments parseArguments(int argc, char** argv) {
             result.help = true;
             continue;
         }
-        if (option == "--modules" || option == "--fail-on-partial" || option == "--protected-profile") {
+        if (option == "--modules" || option == "--fail-on-partial" ||
+            option == "--protected-profile" || option == "--verify") {
             if (hasInlineValue) throw std::invalid_argument("Unexpected value for " + option);
             if (option == "--modules") result.inspectModules = true;
             else if (option == "--fail-on-partial") result.failOnPartial = true;
+            else if (option == "--verify") result.verify = true;
             else result.protectedProfile = true;
             continue;
         }
@@ -917,6 +923,9 @@ RecoveryOutcome recoverMethods(
 
         if (function) {
             outcome.functions.push_back(*function);
+            if (arguments.verify) {
+                report.verification = il2cpprec::SemanticVerifier{}.verify(images[i], *function);
+            }
             auto reasons = partialReasons(*function);
             for (auto& reason : reasons) {
                 report.reasons.push_back(std::move(reason));
@@ -931,6 +940,9 @@ RecoveryOutcome recoverMethods(
             }
         } else {
             outcome.functions.push_back(std::nullopt);
+            if (arguments.verify) {
+                report.verification = il2cpprec::VerificationResult{};
+            }
             report.status = MethodStatus::Error;
             ++outcome.errors;
             if (report.reasons.empty()) {
@@ -967,6 +979,27 @@ void printSummary(const RecoveryOutcome& outcome, std::ostream& output) {
            << " exact=" << outcome.exact
            << " partial=" << outcome.partial
            << " errors=" << outcome.errors << '\n';
+}
+
+void printVerificationSummary(const RecoveryOutcome& outcome, std::ostream& output) {
+    size_t checked = 0;
+    size_t suspect = 0;
+    size_t unverifiable = 0;
+    size_t unmapped = 0;
+    for (const auto& method : outcome.methods) {
+        if (!method.verification) continue;
+        const auto& verification = *method.verification;
+        if (verification.status == il2cpprec::VerificationStatus::Unverifiable) {
+            ++unverifiable;
+        } else {
+            ++checked;
+            if (verification.status == il2cpprec::VerificationStatus::Suspect) ++suspect;
+            unmapped += verification.unmappedInstructions;
+        }
+    }
+    output << "verification: checked=" << checked << " suspect=" << suspect
+           << " unverifiable=" << unverifiable << " unmapped-instructions=" << unmapped
+           << " (unmapped is informational; no semantic-equivalence claim)\n";
 }
 
 std::string partialReasonCategory(const std::string& reason) {
@@ -1129,6 +1162,7 @@ void writeJsonReport(
            << "    \"maxMethodSize\": " << arguments.maxMethodSize << ",\n"
            << "    \"protectedProfile\": " << (arguments.protectedProfile ? "true" : "false") << ",\n"
            << "    \"failOnPartial\": " << (arguments.failOnPartial ? "true" : "false") << ",\n"
+           << "    \"verify\": " << (arguments.verify ? "true" : "false") << ",\n"
            << "    \"idaMcp\": " << (arguments.idaMcp ? "true" : "false") << ",\n"
            << "    \"idaInstance\": " << jsonString(idaInstance) << ",\n"
            << "    \"il2cppVersion\": " << jsonString(arguments.il2cppVersion) << ",\n"
@@ -1158,7 +1192,25 @@ void writeJsonReport(
             if (j != 0) output << ", ";
             output << jsonString(method.reasons[j]);
         }
-        output << "]}" << (i + 1 == outcome.methods.size() ? "\n" : ",\n");
+        output << "]";
+        if (method.verification) {
+            const auto& audit = *method.verification;
+            output << ", \"verification\": {\"status\": "
+                   << jsonString(il2cpprec::toString(audit.status))
+                   << ", \"decodedInstructions\": " << audit.decodedInstructions
+                   << ", \"representedInstructions\": " << audit.representedInstructions
+                   << ", \"unmappedInstructions\": " << audit.unmappedInstructions
+                   << ", \"findings\": [";
+            for (size_t j = 0; j < audit.findings.size(); ++j) {
+                if (j != 0) output << ", ";
+                const auto& finding = audit.findings[j];
+                output << "{\"code\": " << jsonString(finding.code)
+                       << ", \"address\": " << jsonString(hexAddress(finding.address))
+                       << ", \"message\": " << jsonString(finding.message) << "}";
+            }
+            output << "]}";
+        }
+        output << "}" << (i + 1 == outcome.methods.size() ? "\n" : ",\n");
     }
     output << "  ]\n}\n";
     output.flush();
@@ -1505,6 +1557,7 @@ int main(int argc, char** argv) {
             }
             printDiagnostics(outcome, std::cout);
             printSummary(outcome, std::cout);
+            if (arguments.verify) printVerificationSummary(outcome, std::cout);
             return recoveryExitCode(outcome, arguments.failOnPartial);
         }
         if (!arguments.inspectPath.empty()) {
@@ -1548,6 +1601,7 @@ int main(int argc, char** argv) {
         }
         printDiagnostics(outcome, std::cerr);
         printSummary(outcome, std::cerr);
+        if (arguments.verify) printVerificationSummary(outcome, std::cerr);
 
         if (outcome.functions.size() == 1 && outcome.functions.front() && arguments.outputDirectory.empty()) {
             std::cout << outcome.functions.front()->toCSharp();
