@@ -184,6 +184,44 @@ size_t countSubstring(const std::string& text, const std::string& needle) {
     return count;
 }
 
+flow::StructuredNodePtr structuredNode(flow::StructuredKind kind) {
+    auto node = std::make_unique<flow::StructuredNode>();
+    node->kind = kind;
+    return node;
+}
+
+flow::StructuredNodePtr emptyStructuredBlock(uint64_t address) {
+    auto node = structuredNode(flow::StructuredKind::Block);
+    node->address = address;
+    node->isLabel = true;
+    return node;
+}
+
+flow::StructuredNodePtr structuredReturn(uint64_t address, ExpressionPtr value) {
+    auto node = structuredNode(flow::StructuredKind::Return);
+    node->address = address;
+    node->returnStatement = returnValue(address, std::move(value));
+    return node;
+}
+
+flow::StructuredNodePtr nestedGuard() {
+    auto inner = structuredNode(flow::StructuredKind::IfElse);
+    inner->condition = reg("second", ScalarType::boolean());
+    inner->thenBranch = structuredNode(flow::StructuredKind::Block);
+    inner->thenBranch->statements.push_back(assign(0x2020, "x2", one()));
+    inner->elseBranch = structuredNode(flow::StructuredKind::Empty);
+
+    auto sequence = structuredNode(flow::StructuredKind::Sequence);
+    sequence->children.push_back(emptyStructuredBlock(0x2010));
+    sequence->children.push_back(std::move(inner));
+
+    auto outer = structuredNode(flow::StructuredKind::IfElse);
+    outer->condition = reg("first", ScalarType::boolean());
+    outer->thenBranch = std::move(sequence);
+    outer->elseBranch = structuredNode(flow::StructuredKind::Empty);
+    return outer;
+}
+
 void checkFlowGolden(
     const std::string& slug,
     const RecoveredFunction& function,
@@ -306,8 +344,9 @@ TEST_CASE("if/else has one shared join") {
     CHECK_EQ(countSubstring(function.toCSharp(), "return x1;"), 1);
 }
 
-TEST_CASE("early returns remain in both branches") {
-    checkFlowGolden("early_return", earlyReturnFunction(), flow::StructuredKind::Return, 2);
+TEST_CASE("early return values remain in conditional expression") {
+    checkFlowGolden("early_return", earlyReturnFunction(), flow::StructuredKind::Return, 1);
+    CHECK(earlyReturnFunction().toCSharp().find("? 0x2UL : 0x1UL") != std::string::npos);
 }
 
 TEST_CASE("while loop is structured") {
@@ -332,6 +371,52 @@ TEST_CASE("nested conditions share joins without duplication") {
     checkFlowGolden("shared_join", function, flow::StructuredKind::IfElse, 2);
     CHECK_EQ(countSubstring(function.toCSharp(), "return x1;"), 1);
     CHECK_EQ(countSubstring(function.toCSharp(), "x1 = 0x2UL;"), 1);
+}
+
+TEST_CASE("post-structuring joins two return arms into a conditional return") {
+    auto root = structuredNode(flow::StructuredKind::IfElse);
+    root->address = 0x1000;
+    root->condition = reg("condition", ScalarType::boolean());
+    root->thenBranch = structuredReturn(0x1010, one());
+    root->elseBranch = structuredReturn(0x1020, zero());
+    flow::simplifyStructuredIdioms(root);
+    CHECK(root->kind == flow::StructuredKind::Return);
+    CHECK(root->returnStatement.value->kind == Expression::Kind::Select);
+    CHECK_EQ(root->returnStatement.value->arguments.size(), 3);
+    CHECK_EQ(root->returnStatement.value->arguments[1]->constant, 1);
+    CHECK_EQ(root->returnStatement.value->arguments[2]->constant, 0);
+}
+
+TEST_CASE("post-structuring joins guards only without intervening effects") {
+    auto root = nestedGuard();
+    flow::simplifyStructuredIdioms(root);
+    CHECK(root->kind == flow::StructuredKind::IfElse);
+    CHECK(root->condition->kind == Expression::Kind::Binary);
+    CHECK_EQ(root->condition->op, std::string("&&"));
+    CHECK(root->thenBranch->kind == flow::StructuredKind::Block);
+    CHECK_EQ(root->thenBranch->statements.size(), 1);
+
+    auto withEffect = nestedGuard();
+    withEffect->thenBranch->children.front()->statements.push_back(assign(0x2010, "x2", zero()));
+    flow::simplifyStructuredIdioms(withEffect);
+    CHECK(withEffect->condition->kind == Expression::Kind::Register);
+}
+
+TEST_CASE("post-structuring preserves blocks targeted by residual jumps") {
+    auto root = structuredNode(flow::StructuredKind::Sequence);
+    root->children.push_back(nestedGuard());
+    auto jump = structuredNode(flow::StructuredKind::Goto);
+    jump->target = 0x2010;
+    root->children.push_back(std::move(jump));
+    flow::simplifyStructuredIdioms(root);
+    CHECK(root->children.front()->condition->kind == Expression::Kind::Register);
+
+    auto unlikeTypes = structuredNode(flow::StructuredKind::IfElse);
+    unlikeTypes->condition = reg("condition", ScalarType::boolean());
+    unlikeTypes->thenBranch = structuredReturn(0x3010, one());
+    unlikeTypes->elseBranch = structuredReturn(0x3020, constant(0, ScalarType::uintBits(32)));
+    flow::simplifyStructuredIdioms(unlikeTypes);
+    CHECK(unlikeTypes->kind == flow::StructuredKind::IfElse);
 }
 
 TEST_CASE("ARM32 memory loads have explicit widths") {

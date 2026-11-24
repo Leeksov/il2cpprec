@@ -28,16 +28,7 @@ public static class RecoveredMethods_EarlyReturn
     public static ulong EarlyReturn(ulong rcx, ulong rdx, ulong r8, ulong r9)
     {
         ulong x0 = default(ulong);
-        if ((x0 == 0x0UL))
-        {
-            label_0x2010:
-            ;
-            return 0x2UL;
-        }
-        else
-        {
-            return 0x1UL;
-        }
+        return ((x0 == 0x0UL) ? 0x2UL : 0x1UL);
         return default(ulong);
     }
 }

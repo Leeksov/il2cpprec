@@ -84,4 +84,8 @@ public:
     StructuredFunction structure(const RecoveredFunction& function) const;
 };
 
+// Apply local C#-level rewrites after control-flow structuring. This function
+// preserves any block targeted by a residual goto or branch.
+void simplifyStructuredIdioms(StructuredNodePtr& root);
+
 } // namespace il2cpprec::flow

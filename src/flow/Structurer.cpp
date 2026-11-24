@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <queue>
+#include <unordered_set>
 #include <utility>
 
 namespace il2cpprec::flow {
@@ -128,6 +129,89 @@ StructuredNodePtr flattenSequences(StructuredNodePtr root) {
         if (current->body) pending.push_back(current->body.get());
     }
     return root;
+}
+
+// Only residual branches need a C# label. A native branch already represented
+// by an IfElse/loop does not: retaining its empty target block would prevent
+// otherwise local, semantics-preserving C# idioms.
+void collectResidualTargets(const StructuredNode* node, std::unordered_set<uint64_t>& targets) {
+    if (!node) return;
+    if (node->kind == StructuredKind::Goto) targets.insert(node->target);
+    if (node->kind == StructuredKind::Block) {
+        for (const auto& statement : node->statements) {
+            if ((statement.kind == Statement::Kind::Branch ||
+                 statement.kind == Statement::Kind::ConditionalBranch) &&
+                statement.target && statement.target->kind == Expression::Kind::Constant) {
+                targets.insert(statement.target->constant);
+            }
+        }
+    }
+    for (const auto& child : node->children) collectResidualTargets(child.get(), targets);
+    collectResidualTargets(node->thenBranch.get(), targets);
+    collectResidualTargets(node->elseBranch.get(), targets);
+    collectResidualTargets(node->body.get(), targets);
+}
+
+bool emptyUnreferencedBlock(const StructuredNode* node, const std::unordered_set<uint64_t>& targets) {
+    return node && node->kind == StructuredKind::Block && node->statements.empty() &&
+           !targets.contains(node->address);
+}
+
+StructuredNode* singleAction(
+    StructuredNode* node,
+    StructuredKind kind,
+    const std::unordered_set<uint64_t>& targets) {
+    if (!node) return nullptr;
+    if (node->kind == kind) return node;
+    if (node->kind != StructuredKind::Sequence || node->children.empty()) return nullptr;
+    for (size_t i = 0; i + 1 < node->children.size(); ++i) {
+        if (!emptyUnreferencedBlock(node->children[i].get(), targets)) return nullptr;
+    }
+    auto* last = node->children.back().get();
+    return last && last->kind == kind ? last : nullptr;
+}
+
+bool emptyBranch(const StructuredNode* node) {
+    return !node || node->kind == StructuredKind::Empty;
+}
+
+void applyLocalIdioms(StructuredNodePtr& node, const std::unordered_set<uint64_t>& targets) {
+    if (!node) return;
+    for (auto& child : node->children) applyLocalIdioms(child, targets);
+    applyLocalIdioms(node->thenBranch, targets);
+    applyLocalIdioms(node->elseBranch, targets);
+    applyLocalIdioms(node->body, targets);
+    if (node->kind != StructuredKind::IfElse || !node->condition) return;
+
+    // Both arms return exactly once. C#'s conditional operator evaluates the
+    // condition once and only the selected arm, as the two native paths do.
+    const auto* thenReturn = singleAction(node->thenBranch.get(), StructuredKind::Return, targets);
+    const auto* elseReturn = singleAction(node->elseBranch.get(), StructuredKind::Return, targets);
+    if (thenReturn && elseReturn && thenReturn->returnStatement.value && elseReturn->returnStatement.value) {
+        const auto& trueType = thenReturn->returnStatement.value->type;
+        const auto& falseType = elseReturn->returnStatement.value->type;
+        if (trueType.kind == falseType.kind && trueType.bits == falseType.bits &&
+            trueType.kind != ScalarKind::Unknown) {
+            auto merged = makeNode(StructuredKind::Return);
+            merged->address = node->address;
+            merged->returnStatement = thenReturn->returnStatement;
+            merged->returnStatement.address = node->address;
+            merged->returnStatement.value = select(
+                node->condition, thenReturn->returnStatement.value,
+                elseReturn->returnStatement.value, trueType);
+            node = std::move(merged);
+            return;
+        }
+    }
+
+    // Two nested guards with no intervening operations are one short-circuit
+    // guard. Keep any block that a residual goto still targets.
+    while (emptyBranch(node->elseBranch.get())) {
+        auto* nested = singleAction(node->thenBranch.get(), StructuredKind::IfElse, targets);
+        if (!nested || !nested->condition || !emptyBranch(nested->elseBranch.get())) break;
+        node->condition = binary("&&", node->condition, nested->condition, ScalarType::boolean());
+        node->thenBranch = std::move(nested->thenBranch);
+    }
 }
 
 struct NaturalLoop {
@@ -1055,9 +1139,16 @@ size_t ControlFlowGraph::indexOf(uint64_t address) const {
 StructuredFunction::StructuredFunction(const RecoveredFunction& function)
     : cfg(function) {}
 
+void simplifyStructuredIdioms(StructuredNodePtr& root) {
+    std::unordered_set<uint64_t> residualTargets;
+    collectResidualTargets(root.get(), residualTargets);
+    applyLocalIdioms(root, residualTargets);
+}
+
 StructuredFunction Structurer::structure(const RecoveredFunction& function) const {
     StructuredFunction result(function);
     result.root = RegionStructurer(result.cfg).run();
+    simplifyStructuredIdioms(result.root);
     return result;
 }
 
