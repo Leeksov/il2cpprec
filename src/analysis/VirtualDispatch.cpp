@@ -99,9 +99,11 @@ public:
         const VirtualDispatchOptions& options,
         VirtualDispatchAnalysisResult& result)
         : function_(function), metadata_(metadata), options_(options), result_(result),
+          metadataIndex_(options.metadataIndex && options.metadataIndex->source == &metadata
+              ? options.metadataIndex : nullptr),
           pointerBits_(function.architecture == Architecture::Arm64 || function.architecture == Architecture::X64 ? 64 : 32),
           pointerSize_(pointerBits_ / 8) {
-        buildMethodIndex();
+        if (!metadataIndex_) buildMethodIndex();
     }
 
     void run() {
@@ -123,6 +125,7 @@ private:
     const MetadataModel& metadata_;
     const VirtualDispatchOptions& options_;
     VirtualDispatchAnalysisResult& result_;
+    const ManagedMetadataIndex* metadataIndex_ = nullptr;
     uint16_t pointerBits_;
     size_t pointerSize_;
     bool memoryMayHaveChanged_ = false;
@@ -214,6 +217,10 @@ private:
                     std::tie(right.address, right.imageName, right.declaringType, right.name, right.token, right.definitionIndex);
             });
         }
+    }
+
+    const std::map<uint64_t, std::vector<ManagedMethodReference>>& methodsByAddress() const {
+        return metadataIndex_ ? metadataIndex_->methodsByAddress : methodsByAddress_;
     }
 
     std::optional<uint64_t> readImage(uint64_t address, size_t width) const {
@@ -456,8 +463,9 @@ private:
 
     void appendMethods(uint64_t address, std::vector<ManagedMethodReference>& methods) const {
         if (address == 0) return;
-        const auto found = methodsByAddress_.find(address);
-        if (found != methodsByAddress_.end()) methods.insert(methods.end(), found->second.begin(), found->second.end());
+        const auto& index = methodsByAddress();
+        const auto found = index.find(address);
+        if (found != index.end()) methods.insert(methods.end(), found->second.begin(), found->second.end());
     }
 
     void appendGenerics(VirtualDispatchOperation& result, uint64_t address) const {

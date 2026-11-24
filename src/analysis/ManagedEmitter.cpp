@@ -10,6 +10,7 @@
 #include <charconv>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -19,6 +20,19 @@ namespace il2cpprec {
 namespace {
 
 using StatementKey = std::pair<size_t, size_t>;
+
+bool sameAbiOptions(const AbiAdapterOptions& left, const AbiAdapterOptions& right) {
+    const auto& l = left.runtime;
+    const auto& r = right.runtime;
+    return left.methodInfo == right.methodInfo && left.x64 == right.x64 &&
+        left.x86 == right.x86 && left.arm32Float == right.arm32Float &&
+        l.id == r.id && l.invoker == r.invoker &&
+        l.methodInfoPointers == r.methodInfoPointers &&
+        l.adjustorThunks == r.adjustorThunks &&
+        l.unresolvedReducedSignatures == r.unresolvedReducedSignatures &&
+        l.genericContexts == r.genericContexts &&
+        l.generatedMethodInfo == r.generatedMethodInfo;
+}
 
 struct PendingCall {
     ManagedCallSite output;
@@ -454,7 +468,28 @@ ManagedEmitResult ManagedEmitter::emit(
         addCall(std::move(call), true);
     }
 
-    AbiAdapter adapter(options.abi);
+    std::unique_ptr<AbiAdapter> ownedAdapter;
+    const AbiAdapter* adapter = !ownedMetadata && options.abiAdapter &&
+        options.abiAdapterSource == &metadata &&
+        sameAbiOptions(options.abiAdapter->options(), options.abi)
+        ? options.abiAdapter : nullptr;
+    const auto currentAdapter = [&]() -> const AbiAdapter& {
+        if (!adapter) {
+            ownedAdapter = std::make_unique<AbiAdapter>(options.abi, resolvedMetadata);
+            adapter = ownedAdapter.get();
+        }
+        return *adapter;
+    };
+    std::unique_ptr<UniversalGenericResolver> ownedUniversal;
+    const UniversalGenericResolver* universal = !ownedMetadata &&
+        options.universalGenericsSource == &metadata ? options.universalGenerics : nullptr;
+    const auto universalResolver = [&]() -> const UniversalGenericResolver& {
+        if (!universal) {
+            ownedUniversal = std::make_unique<UniversalGenericResolver>(resolvedMetadata);
+            universal = ownedUniversal.get();
+        }
+        return *universal;
+    };
     auto copy = function;
     for (size_t index = 0; index < order.size(); ++index) {
         auto& call = pending.at(order[index]);
@@ -476,7 +511,7 @@ ManagedEmitResult ManagedEmitter::emit(
                 call.output.reason = "The generic method index is invalid.";
                 continue;
             }
-            const auto inflated = UniversalGenericResolver(resolvedMetadata).resolve(static_cast<uint32_t>(genericIndex));
+            const auto inflated = universalResolver().resolve(static_cast<uint32_t>(genericIndex));
             if (!inflated.ok() || !inflated.method || inflated.methodPointer == 0 ||
                 (call.output.genericTarget.adjustor && inflated.adjustorThunk != call.output.method.address)) {
                 call.output.status = ManagedPatternStatus::Placeholder;
@@ -485,7 +520,7 @@ ManagedEmitResult ManagedEmitter::emit(
             }
             call.method = *inflated.method;
             for (const auto typeIndex : inflated.substitution.methodArguments) {
-                const auto type = UniversalGenericResolver(resolvedMetadata).substitute(typeIndex);
+                const auto type = universalResolver().substitute(typeIndex);
                 const auto syntax = type.ok() ? csharpType(type.name, resolvedMetadata) : std::string{};
                 if (syntax.empty()) break;
                 call.methodTypeArguments.push_back(syntax);
@@ -577,7 +612,7 @@ ManagedEmitResult ManagedEmitter::emit(
                 }
             }
         }
-        call.output.abi = adapter.bindCallSite(call.method, resolvedMetadata, function.architecture, call.spec);
+        call.output.abi = currentAdapter().bindCallSite(call.method, resolvedMetadata, function.architecture, call.spec);
         if (!call.output.abi.supported()) {
             call.output.status = ManagedPatternStatus::Placeholder;
             call.output.reason = "CallSiteAbiModel rejected the managed signature.";

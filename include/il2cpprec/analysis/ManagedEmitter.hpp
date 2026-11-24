@@ -11,11 +11,21 @@
 
 namespace il2cpprec {
 
+class UniversalGenericResolver;
+
 struct ManagedEmitterOptions {
     ManagedTargetProfile profile;
     ManagedPatternOptions patterns;
     VirtualDispatchOptions dispatch;
     AbiAdapterOptions abi;
+    // Optional indexed adapter for exactly this MetadataModel and ABI policy.
+    // A metadata clone or changed ABI policy uses a local adapter instead.
+    const AbiAdapter* abiAdapter = nullptr;
+    const MetadataModel* abiAdapterSource = nullptr;
+    // Optional resolver built for exactly this MetadataModel. An emitter that
+    // clones metadata for discovery ignores it and builds a local resolver.
+    const UniversalGenericResolver* universalGenerics = nullptr;
+    const MetadataModel* universalGenericsSource = nullptr;
 };
 
 struct ManagedCallSite {

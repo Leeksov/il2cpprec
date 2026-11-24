@@ -97,6 +97,23 @@ public:
     std::map<int64_t, std::vector<ManagedFieldReference>> fieldsByOffset;
 };
 
+struct GenericMethodInfoEvidence {
+    // Native metadata-usage slot VA -> MethodRef genericMethodIndex.
+    // Values are admitted only when the native slot table and metadata pair
+    // agree; the runtime contents of a BSS slot are never guessed.
+    std::unordered_map<uint64_t, uint32_t> bySlotAddress;
+    // Native Il2CppType* VA -> index in MetadataModel::typeReferences.
+    std::unordered_map<uint64_t, int32_t> typeReferencesByAddress;
+    size_t conflictingDestinations = 0;
+    size_t unmappedSlots = 0;
+    size_t conflictingTypeAddresses = 0;
+    size_t unmappedTypeDescriptors = 0;
+};
+
+GenericMethodInfoEvidence deriveEarlyArm64MethodInfoEvidence(
+    const BinaryImage& binary,
+    const MetadataModel& metadata);
+
 struct ManagedOperation {
     ManagedOperationKind kind = ManagedOperationKind::DirectMethodCall;
     ManagedPatternStatus status = ManagedPatternStatus::Unresolved;
@@ -126,6 +143,7 @@ struct ManagedOperation {
     ManagedFieldReference field;
     std::vector<ManagedMethodReference> methodCandidates;
     std::vector<ManagedFieldReference> fieldCandidates;
+    size_t fieldCandidateCount = 0;
     std::vector<uint32_t> stringLiteralTokens;
 
     std::vector<Statement> nativeStatements;
@@ -135,6 +153,15 @@ struct ManagedPatternOptions {
     const BinaryImage* binary = nullptr;
     const GenericMethodResolver* genericResolver = nullptr;
     const ManagedMetadataIndex* metadataIndex = nullptr;
+    // Caller-supplied evidence: a concrete MethodInfo value or a slot loaded
+    // into the configured call argument identifies one generic method spec.
+    // A shared native pointer alone never selects an instantiation.
+    std::optional<size_t> genericMethodInfoArgumentIndex;
+    std::unordered_map<uint64_t, uint32_t> genericMethodInfoByAddress;
+    // Borrowed immutable map for batch analysis. The caller keeps it alive
+    // through analyze()/emit(); this avoids copying a game's slot table per
+    // recovered method. When present it takes precedence over the owned map.
+    const std::unordered_map<uint64_t, uint32_t>* genericMethodInfoByAddressView = nullptr;
     ManagedTargetProfile profile;
     std::unordered_map<uint32_t, uint64_t> stringLiteralAddresses;
     std::unordered_map<uint64_t, std::string> runtimeTypeAddresses;
@@ -156,6 +183,9 @@ struct ManagedPatternOptions {
     size_t runtimeClassInitTypeArgument = 0;
     bool recognizeArrayLayout = true;
     bool recognizeNullBranches = true;
+    // Public analysis keeps candidate details by default. Batch C# emission
+    // can skip copying ambiguous offset buckets while retaining the count.
+    bool collectAmbiguousFieldCandidates = true;
     std::optional<int64_t> arrayLengthOffset;
     std::optional<int64_t> arrayElementsOffset;
 };

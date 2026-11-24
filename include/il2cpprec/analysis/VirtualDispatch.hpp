@@ -31,6 +31,9 @@ struct VirtualInterfaceOffset {
 
 struct VirtualDispatchOptions {
     const BinaryImage* binary = nullptr;
+    // Borrow the immutable method-address index already built for this exact
+    // MetadataModel. A mismatched source falls back to a local index.
+    const ManagedMetadataIndex* metadataIndex = nullptr;
     ManagedTargetProfile profile;
     bool unity2017Layout = true;
     bool vtablePointer = false;

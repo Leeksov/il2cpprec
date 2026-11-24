@@ -2,13 +2,17 @@
 #include <il2cpprec/analysis/RuntimeHelpers.hpp>
 
 #include <il2cpprec/metadata/GenericMethodResolver.hpp>
+#include <il2cpprec/metadata/MetadataUsage.hpp>
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace il2cpprec {
@@ -62,7 +66,139 @@ bool addOffset(int64_t left, int64_t right, int64_t& result) {
     return true;
 }
 
+std::optional<uint64_t> readNativeU64(const BinaryImage& binary, uint64_t address) {
+    try {
+        const auto offset = binary.mapVATR(address);
+        uint64_t value = 0;
+        std::memcpy(&value, binary.data(offset, sizeof(value)), sizeof(value));
+        return value;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+bool virtualSlotMapped(const BinaryImage& binary, uint64_t address) {
+    if (address == 0 || address % sizeof(uint64_t) != 0) return false;
+    for (const auto& section : binary.sections) {
+        if (section.virtualSize < sizeof(uint64_t) || address < section.virtualAddress) continue;
+        if (address - section.virtualAddress <= section.virtualSize - sizeof(uint64_t)) return true;
+    }
+    return false;
+}
+
 } // namespace
+
+GenericMethodInfoEvidence deriveEarlyArm64MethodInfoEvidence(
+    const BinaryImage& binary,
+    const MetadataModel& metadata) {
+    GenericMethodInfoEvidence result;
+    const double version = metadata.versionInfo.preciseVersion != 0
+        ? metadata.versionInfo.preciseVersion : metadata.version;
+    if (binary.format != BinaryFormat::MachO || binary.architecture != Architecture::Arm64 ||
+        version < 24.0 || version >= 24.2 || metadata.metadataRegistrationAddress == 0 ||
+        metadata.metadataUsagePairs.empty()) return result;
+
+    // The verified v24.0/24.1 64-bit metadata registration has eight
+    // count/pointer pairs; pair 7 lists addresses of metadata-usage slots.
+    constexpr uint64_t countOffset = 7 * 2 * sizeof(uint64_t);
+    if (metadata.metadataRegistrationAddress > std::numeric_limits<uint64_t>::max() - countOffset - sizeof(uint64_t))
+        return result;
+    const auto count = readNativeU64(binary, metadata.metadataRegistrationAddress + countOffset);
+    const auto table = readNativeU64(binary, metadata.metadataRegistrationAddress + countOffset + sizeof(uint64_t));
+    if (!count || !table || *count == 0 || *count > 1'000'000 ||
+        (metadata.metadataUsagesCount != 0 && metadata.metadataUsagesCount != *count) ||
+        *count > std::numeric_limits<size_t>::max() / sizeof(uint64_t)) return result;
+    const auto tableBytes = static_cast<size_t>(*count) * sizeof(uint64_t);
+    if (*table > std::numeric_limits<uint64_t>::max() - (tableBytes - 1)) return result;
+    size_t tableOffset = 0;
+    try {
+        tableOffset = binary.mapVATR(*table);
+        const auto lastOffset = binary.mapVATR(*table + tableBytes - 1);
+        if (lastOffset < tableOffset || lastOffset - tableOffset != tableBytes - 1) return result;
+        binary.data(tableOffset, tableBytes);
+    } catch (const std::exception&) {
+        return result;
+    }
+
+    // The same validated registration contains the native Il2CppType*
+    // table at pair 3. Its order is the TypeReference index order. Keep only
+    // file-backed descriptors with unique addresses; an unresolved argument
+    // remains unresolved in UniversalGenericResolver.
+    constexpr uint64_t typeCountOffset = 3 * 2 * sizeof(uint64_t);
+    const auto typeCount = readNativeU64(binary, metadata.metadataRegistrationAddress + typeCountOffset);
+    const auto typeTable = readNativeU64(binary, metadata.metadataRegistrationAddress + typeCountOffset + sizeof(uint64_t));
+    if (typeCount && typeTable && *typeCount == metadata.typeReferences.size() &&
+        *typeCount <= static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) &&
+        *typeCount <= std::numeric_limits<size_t>::max() / sizeof(uint64_t) && *typeCount != 0) {
+        const auto typeBytes = static_cast<size_t>(*typeCount) * sizeof(uint64_t);
+        if (*typeTable <= std::numeric_limits<uint64_t>::max() - (typeBytes - 1)) {
+            try {
+                const auto typeTableOffset = binary.mapVATR(*typeTable);
+                const auto lastTypeOffset = binary.mapVATR(*typeTable + typeBytes - 1);
+                if (lastTypeOffset >= typeTableOffset && lastTypeOffset - typeTableOffset == typeBytes - 1) {
+                    binary.data(typeTableOffset, typeBytes);
+                    std::unordered_set<uint64_t> conflictingTypes;
+                    for (size_t index = 0; index < *typeCount; ++index) {
+                        uint64_t address = 0;
+                        std::memcpy(&address,
+                                    binary.data(typeTableOffset + index * sizeof(uint64_t), sizeof(uint64_t)),
+                                    sizeof(uint64_t));
+                        try {
+                            const auto descriptorOffset = binary.mapVATR(address);
+                            binary.data(descriptorOffset, 16);
+                        } catch (const std::exception&) {
+                            ++result.unmappedTypeDescriptors;
+                            continue;
+                        }
+                        const auto [entry, inserted] = result.typeReferencesByAddress.emplace(address, static_cast<int32_t>(index));
+                        if (!inserted && entry->second != static_cast<int32_t>(index)) conflictingTypes.insert(address);
+                    }
+                    for (const auto address : conflictingTypes) result.typeReferencesByAddress.erase(address);
+                    result.conflictingTypeAddresses = conflictingTypes.size();
+                }
+            } catch (const std::exception&) {
+                // Type-address evidence is optional. Slot evidence below can
+                // still be used for a guarded, non-emitting identification.
+            }
+        }
+    }
+
+    std::vector<std::optional<uint32_t>> encoded(static_cast<size_t>(*count));
+    std::vector<bool> conflicts(static_cast<size_t>(*count));
+    for (const auto& pair : metadata.metadataUsagePairs) {
+        if (pair.destinationIndex >= *count) continue;
+        auto& first = encoded[pair.destinationIndex];
+        if (!first) first = pair.encodedSourceIndex;
+        else if (*first != pair.encodedSourceIndex) conflicts[pair.destinationIndex] = true;
+    }
+    const GenericMethodResolver resolver(metadata);
+    std::unordered_map<uint64_t, uint32_t> admitted;
+    std::unordered_set<uint64_t> conflictingSlots;
+    for (size_t destination = 0; destination < encoded.size(); ++destination) {
+        if (conflicts[destination]) {
+            ++result.conflictingDestinations;
+            continue;
+        }
+        if (!encoded[destination]) continue;
+        const auto source = MetadataUsageReader::decode(*encoded[destination]);
+        if (source.kind != MetadataUsageKind::MethodRef) continue;
+        const auto target = resolver.resolve(source.index);
+        if (target.status != MetadataUsageStatus::Resolved || !target.mapping ||
+            target.mapping->methodPointer == 0) continue;
+        uint64_t slot = 0;
+        std::memcpy(&slot, binary.data(tableOffset + destination * sizeof(uint64_t), sizeof(uint64_t)), sizeof(uint64_t));
+        if (!virtualSlotMapped(binary, slot)) {
+            ++result.unmappedSlots;
+            continue;
+        }
+        const auto [entry, inserted] = admitted.emplace(slot, source.index);
+        if (!inserted && entry->second != source.index) conflictingSlots.insert(slot);
+    }
+    for (const auto slot : conflictingSlots) admitted.erase(slot);
+    result.conflictingDestinations += conflictingSlots.size();
+    result.bySlotAddress = std::move(admitted);
+    return result;
+}
 
 ManagedMetadataIndex::ManagedMetadataIndex(const MetadataModel& metadata) : source(&metadata) {
     std::unordered_map<std::string, int> firstDefinitionByImage;
@@ -469,6 +605,59 @@ private:
         return true;
     }
 
+    const std::unordered_map<uint64_t, uint32_t>& genericMethodInfoAddresses() const {
+        return options_.genericMethodInfoByAddressView
+            ? *options_.genericMethodInfoByAddressView : options_.genericMethodInfoByAddress;
+    }
+
+    std::optional<size_t> provenMethodInfoArgumentIndex(const std::vector<GenericCandidate>& candidates) {
+        if (options_.genericMethodInfoArgumentIndex) return options_.genericMethodInfoArgumentIndex;
+        const double version = metadata_.versionInfo.preciseVersion != 0
+            ? metadata_.versionInfo.preciseVersion : metadata_.version;
+        if (genericMethodInfoAddresses().empty() ||
+            function_.architecture != Architecture::Arm64 || version < 24.0 || version >= 24.2)
+            return std::nullopt;
+        // Only the verified early-v24 ARM64 zero-parameter instance shape has
+        // `this` in x0 and hidden MethodInfo in x1. Shared native bodies may
+        // represent many different instantiations, but their MethodDef and
+        // incoming ABI must agree before the caller's slot may choose one.
+        std::optional<int32_t> definition;
+        if (!genericResolver_) {
+            ownedGenericResolver_ = std::make_unique<GenericMethodResolver>(metadata_);
+            genericResolver_ = ownedGenericResolver_.get();
+        }
+        for (const auto& candidate : candidates) {
+            if (candidate.adjustor) return std::nullopt;
+            const auto resolved = genericResolver_->resolve(static_cast<uint32_t>(candidate.index));
+            if (resolved.status != MetadataUsageStatus::Resolved || !resolved.method ||
+                !resolved.methodDefinitionIndex || resolved.method->isStatic ||
+                !resolved.method->parameters.empty()) return std::nullopt;
+            if (definition && *definition != *resolved.methodDefinitionIndex) return std::nullopt;
+            definition = *resolved.methodDefinitionIndex;
+        }
+        return definition ? std::optional<size_t>{1} : std::nullopt;
+    }
+
+    std::optional<int32_t> configuredGenericIndex(
+        const Statement& statement,
+        const std::vector<GenericCandidate>& candidates) {
+        const auto argumentIndex = provenMethodInfoArgumentIndex(candidates);
+        if (!argumentIndex || *argumentIndex >= statement.arguments.size()) return std::nullopt;
+        const auto argument = stripCasts(expandTarget(statement.arguments[*argumentIndex]));
+        if (!argument) return std::nullopt;
+        // A runtime-initialized slot may not be backed by the input file.
+        // The caller may provide its identity explicitly; we never infer the
+        // MethodInfo value from the shared target or from an unreadable slot.
+        const auto address = argument->kind == Expression::Kind::Load && argument->arguments.size() == 1
+            ? evaluate(argument->arguments.front()) : evaluate(argument);
+        if (!address) return std::nullopt;
+        const auto& addresses = genericMethodInfoAddresses();
+        const auto match = addresses.find(*address);
+        if (match == addresses.end() ||
+            match->second > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) return std::nullopt;
+        return static_cast<int32_t>(match->second);
+    }
+
     void recognizeDirectCall(
         size_t blockIndex,
         size_t statementIndex,
@@ -489,6 +678,28 @@ private:
         }
         const auto methods = methodsByAddress().find(targetAddress);
         const auto generics = genericCandidates(targetAddress);
+        if (methods == methodsByAddress().end() && generics.size() > 1) {
+            if (const auto selected = configuredGenericIndex(statement, generics)) {
+                const auto match = std::find_if(generics.begin(), generics.end(), [&](const GenericCandidate& candidate) {
+                    return candidate.index == *selected;
+                });
+                const auto count = std::count_if(generics.begin(), generics.end(), [&](const GenericCandidate& candidate) {
+                    return candidate.index == *selected;
+                });
+                if (count == 1 && resolveGeneric(result, *match, targetAddress)) {
+                    result.status = ManagedPatternStatus::Resolved;
+                    result.confidence = ManagedPatternConfidence::High;
+                } else {
+                    result.status = count > 1 ? ManagedPatternStatus::Ambiguous : ManagedPatternStatus::Unresolved;
+                    result.confidence = ManagedPatternConfidence::Low;
+                    result.reason = count == 0
+                        ? "Explicit MethodInfo evidence conflicts with the native generic target."
+                        : "Explicit MethodInfo evidence does not resolve one valid generic method spec.";
+                }
+                result_.operations.push_back(std::move(result));
+                return;
+            }
+        }
         size_t resolvedGenerics = 0;
         if (methods == methodsByAddress().end() && !generics.empty()) {
             for (const auto& candidate : generics) {
@@ -508,7 +719,8 @@ private:
         } else if (methods == methodsByAddress().end() && resolvedGenerics > 0) {
             result.status = ManagedPatternStatus::Ambiguous;
             result.confidence = ManagedPatternConfidence::Low;
-            result.reason = "Multiple generic instantiations share the native target.";
+            result.reason = std::to_string(generics.size()) +
+                " generic instantiations share the native target; explicit MethodInfo evidence is required.";
         } else if (methods != methodsByAddress().end()) {
             result.methodCandidates = methods->second;
             if (methods->second.size() == 1 && generics.empty()) {
@@ -557,7 +769,9 @@ private:
     }
 
     void addFieldCandidates(ManagedOperation& result, const std::vector<ManagedFieldReference>& candidates) const {
-        result.fieldCandidates = candidates;
+        result.fieldCandidateCount = candidates.size();
+        if (candidates.size() == 1 || options_.collectAmbiguousFieldCandidates)
+            result.fieldCandidates = candidates;
         if (candidates.size() == 1) {
             result.status = ManagedPatternStatus::Resolved;
             result.confidence = ManagedPatternConfidence::High;
