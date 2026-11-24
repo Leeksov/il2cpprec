@@ -135,14 +135,17 @@ def validate_profile(report: dict[str, Any], profile: Profile) -> dict[str, Any]
     source = report.get("sourceProfile")
     if not isinstance(source, dict) or source.get("supported") is not True:
         raise RuntimeError(f"profile {profile.id} was not marked supported by CLI")
-    expected_variant = {
-        "24.1": "2017.4.11f1-metadata-24.1",
-        "24.3": "24.2",
-    }.get(profile.version, profile.version)
+    expected_variant = {"24.3": "24.2"}.get(profile.version, profile.version)
     if source.get("variant") != expected_variant:
         raise RuntimeError(
             f"profile {profile.id} selected variant {source.get('variant')!r}, expected {expected_variant!r}"
         )
+    # A synthetic 24.1 metadata header contains no Unity version evidence. It
+    # must select the compatible family, not claim the exact 2017.4.11f1 source.
+    if profile.version == "24.1" and (
+        source.get("id") != "il2cpp-24-base" or source.get("confidence") != "compatible"
+    ):
+        raise RuntimeError(f"profile {profile.id} claimed an exact Unity source without evidence")
     return {
         "requestedMetadataVersion": profile.version,
         "reportedVariant": source.get("variant"),

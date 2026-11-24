@@ -120,7 +120,7 @@ def _metadata(version: str, methods: tuple[SyntheticMethod, ...]) -> bytes:
     method_rids = {method_index: rid
                    for _, indices in image_groups
                    for rid, method_index in enumerate(indices, start=1)}
-    header_size = 240 if version in ("24.0", "24.1") else 264
+    header_size = 240 if version == "24.0" else 272 if version == "24.1" else 264
     type_stride = {
         "24.0": 104,
         "24.1": 100,
@@ -186,6 +186,11 @@ def _metadata(version: str, methods: tuple[SyntheticMethod, ...]) -> bytes:
             generic_type_offset = base + 28
             flags_offset = base + 32
             counts_offset = base + 68
+        elif version == "24.1":
+            declaring_offset = base + 16
+            generic_type_offset = base + 36
+            flags_offset = base + 40
+            counts_offset = base + 76
         else:
             declaring_offset = base + 20
             generic_type_offset = base + (40 if version in ("24.0", "24.1") else 32)
