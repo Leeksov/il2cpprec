@@ -504,6 +504,29 @@ void MetadataRegistrationReader::readFieldOffsets(
     uint64_t fieldOffsetsAddress,
     uint64_t fieldOffsetsCount) const {
     ImageReader reader(binary, inferredPointerSize(binary, pointerSize_));
+    // IL2CPP 19/20 and early 21 store one flat int32 offset per field. Later
+    // layouts store one pointer per type to an array of int32 offsets.
+    const bool legacyFlat = metadata.version >= 19.0 && metadata.version < 21.0;
+    bool flat = legacyFlat;
+    if (metadata.version == 21.0 && fieldOffsetsCount != 0) {
+        const auto candidates = reader.pointerTable(fieldOffsetsAddress, fieldOffsetsCount);
+        flat = std::none_of(candidates.begin(), candidates.end(), [&](uint64_t candidate) {
+            return candidate >= binary.imageBase;
+        });
+    }
+    if (flat) {
+        metadata.fieldOffsetsByToken.clear();
+        size_t fieldIndex = 0;
+        for (auto& type : metadata.types) {
+            for (auto& field : type.fields) {
+                if (fieldIndex >= fieldOffsetsCount) invalid("flat field offset table is shorter than metadata fields");
+                field.offset = reader.i32(checkedAdd(fieldOffsetsAddress, fieldIndex * sizeof(int32_t)));
+                ++fieldIndex;
+                if (field.token != 0) metadata.fieldOffsetsByToken.insert_or_assign(field.token, field.offset);
+            }
+        }
+        return;
+    }
     const auto table = reader.pointerTable(fieldOffsetsAddress, fieldOffsetsCount);
     const size_t count = std::min(table.size(), metadata.types.size());
     std::vector<std::vector<int32_t>> offsets(count);

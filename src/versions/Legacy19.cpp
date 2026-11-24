@@ -358,6 +358,7 @@ bool validOptionalIndex(int32_t index, const std::vector<T>& table) {
 }
 
 bool validRange(int32_t start, uint64_t count, size_t tableSize) {
+    if (start == -1 && count == 0) return true;
     return start >= 0 && static_cast<uint64_t>(static_cast<uint32_t>(start)) + count <= tableSize;
 }
 

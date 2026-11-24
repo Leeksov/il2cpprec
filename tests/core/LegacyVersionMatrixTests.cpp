@@ -206,7 +206,9 @@ MetadataModel parsed(int version) {
 
 std::vector<uint8_t> legacy16Fixture(int version) {
     auto bytes = metadataFixture(version);
-    put32(bytes, 8, version == 18 ? 208 : 192);
+    const size_t literalOffset = version == 18 ? 208 : 192;
+    std::memcpy(bytes.data() + literalOffset, bytes.data() + 0x280, 8);
+    put32(bytes, 8, static_cast<uint32_t>(literalOffset));
     put32(bytes, 164, 108);
     put32(bytes, 100, 12);
     put32(bytes, 180, 20);
@@ -302,6 +304,8 @@ void checkPointerOffsets(int version) {
 void checkLegacy16Registration(int version) {
     auto binary = registrationBinary();
     binary.bytes->resize(0x1000, 0);
+    binary.sections[0].fileSize = binary.bytes->size();
+    binary.sections[0].virtualSize = binary.bytes->size();
     auto& bytes = *binary.bytes;
     const auto profile = describeLegacy16Profile(version);
     const auto pair = [&](size_t pairIndex, uint64_t address, uint64_t count, uint64_t pointer) {
@@ -413,6 +417,7 @@ TEST_CASE("legacy v21 Unity54 layout uses per-type offsets and VirtualInvokeData
     evidence.fieldOffsets = Legacy21FieldOffsetStorage::PerTypePointers;
     evidence.typeDefinitionSizes = Legacy21TypeDefinitionSizeStorage::PointerArray;
     evidence.vtable = Legacy21VTableKind::VirtualInvokeData;
+    evidence.hasGenericRecursionDepth = true;
     const auto detected = detectLegacy21Layout(evidence, 8);
     CHECK(detected.ok());
     CHECK(detected.layout.has_value());

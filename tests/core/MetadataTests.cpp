@@ -41,16 +41,17 @@ BinaryImage moduleBinary() {
     binary.architecture = Architecture::X64;
     binary.format = BinaryFormat::ELF;
     binary.imageBase = 0x10000000;
-    binary.bytes = std::make_shared<std::vector<uint8_t>>(0xC0, 0);
+    binary.bytes = std::make_shared<std::vector<uint8_t>>(0x200, 0);
     binary.sections.push_back({".text", 0, binary.bytes->size(), 0, binary.bytes->size(), true});
     auto& bytes = *binary.bytes;
-    put64(bytes, 0x00, 0xFFFF000000000000ULL | (binary.imageBase + 0x80));
+    put64(bytes, 0x00, 0xFFFF000000000000ULL | (binary.imageBase + 0x180));
     put64(bytes, 0x08, 2);
-    put64(bytes, 0x10, binary.imageBase + 0x40);
-    put64(bytes, 0x40, binary.imageBase + 0x20);
-    put64(bytes, 0x48, 0xABCD000000000000ULL | (binary.imageBase + 0x24));
+    put64(bytes, 0x10, binary.imageBase + 0x100);
+    put64(bytes, 0x18, binary.imageBase + 0x120);
+    put64(bytes, 0x100, binary.imageBase + 0x20);
+    put64(bytes, 0x108, 0xABCD000000000000ULL | (binary.imageBase + 0x24));
     const std::string name = "Assembly-CSharp.dll";
-    std::memcpy(bytes.data() + 0x80, name.c_str(), name.size() + 1);
+    std::memcpy(bytes.data() + 0x180, name.c_str(), name.size() + 1);
     return binary;
 }
 

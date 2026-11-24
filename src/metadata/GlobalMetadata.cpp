@@ -334,7 +334,7 @@ Header readHeader(const Reader& reader) {
     reader.require(0, 8);
     if (reader.u32(0) != sanityValue) invalid("incorrect sanity value");
     const int32_t version = reader.i32(4);
-    if (version < 16 || version > 31) {
+    if (version < 16 || version == 17 || version > 31) {
         throw std::runtime_error("Unsupported global metadata version: " + std::to_string(version));
     }
 
@@ -402,11 +402,14 @@ Header readHeader(const Reader& reader) {
         header.metadataUsagePairsOffset = reader.u32(usagePairsField);
         header.metadataUsagePairsSize = reader.i32(usagePairsField + 4);
     }
-    if (unresolvedTypesField != 0) {
+    if (unresolvedTypesField != 0 && unresolvedRangesField + 8 <= requiredSize) {
         header.unresolvedTypesOffset = reader.u32(unresolvedTypesField);
         header.unresolvedTypesSize = reader.i32(unresolvedTypesField + 4);
         header.unresolvedRangesOffset = reader.u32(unresolvedRangesField);
         header.unresolvedRangesSize = reader.i32(unresolvedRangesField + 4);
+    } else {
+        header.unresolvedTypesOffset = 0;
+        header.unresolvedRangesOffset = 0;
     }
     return header;
 }
@@ -627,6 +630,7 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
     size_t compatibleTypeStride = 0;
     if (header.version == 24.0 || header.version == 24.1) compatibleTypeStride = 120;
     if (header.version == 24.2 || header.version == 24.4) compatibleTypeStride = 96;
+    if (header.version == 24.5) compatibleTypeStride = 88;
     const size_t typeStride = selectStride(
         reader,
         header.typeDefinitionsOffset,
