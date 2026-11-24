@@ -621,6 +621,20 @@ public static class RuntimeAbi
     public static global::System.Func<NativeUInt, global::System.Type, object> NativeToManagedHandler { get; set; }
     public static global::System.Func<NativeUInt, object[], object> DirectCallHandler { get; set; }
     public static global::System.Func<NativeUInt, object[], object> IndirectCallHandler { get; set; }
+    public static global::System.Func<string, uint, NativeUInt> MethodInfoResolver { get; set; }
+
+    public static NativeUInt ResolveMethodInfo(string imageName, uint methodToken)
+    {
+        if (string.IsNullOrEmpty(imageName) || (methodToken & 0xFF000000U) != 0x06000000U ||
+            (methodToken & 0x00FFFFFFU) == 0)
+            throw new ArgumentException("A unique MethodDef token and image are required.");
+        if (MethodInfoResolver == null)
+            throw new NotSupportedException("No MethodInfo resolver is registered.");
+        NativeUInt address = MethodInfoResolver(imageName, methodToken);
+        if (address == 0)
+            throw new MissingMethodException($"MethodInfo for {imageName} token 0x{methodToken:X8} is unavailable.");
+        return address;
+    }
 
     public static NativeUInt ToNative<T>(T value) => ToNative(value, typeof(T));
     public static NativeUInt FromManaged<T>(T value) => ToNative(value, typeof(T));

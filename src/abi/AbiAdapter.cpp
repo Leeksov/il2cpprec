@@ -125,11 +125,29 @@ ClassifiedType classifyType(
     bool emptyIsVoid,
     const AbiTypeNameIndex* typeIndex);
 
-ClassifiedType classifyDefinition(const TypeModel& definition, uint16_t pointerBits) {
+ClassifiedType classifyDefinition(const TypeModel& definition, const MetadataModel& metadata,
+                                  uint16_t pointerBits) {
     const auto name = normalizedTypeName(qualifiedName(definition));
     if (name == "System.ValueType" || name == "System.Enum") {
         return {AbiValueKind::ObjectReference, ScalarType::pointer(pointerBits), pointerBits};
     }
+    if ((definition.bitfield & 0x2) != 0) {
+        const auto underlying = std::find_if(definition.fields.begin(), definition.fields.end(), [](const auto& field) {
+            return field.name == "value__";
+        });
+        if (underlying == definition.fields.end()) return {};
+        const auto type = TypeSystem::resolve(underlying->type, &metadata);
+        if (type == "sbyte" || type == "System.SByte") return {AbiValueKind::Integer, ScalarType::intBits(8), 8};
+        if (type == "byte" || type == "System.Byte") return {AbiValueKind::Integer, ScalarType::uintBits(8), 8};
+        if (type == "short" || type == "System.Int16") return {AbiValueKind::Integer, ScalarType::intBits(16), 16};
+        if (type == "ushort" || type == "System.UInt16") return {AbiValueKind::Integer, ScalarType::uintBits(16), 16};
+        if (type == "int" || type == "System.Int32") return {AbiValueKind::Integer, ScalarType::intBits(32), 32};
+        if (type == "uint" || type == "System.UInt32") return {AbiValueKind::Integer, ScalarType::uintBits(32), 32};
+        if (type == "long" || type == "System.Int64") return {AbiValueKind::Integer, ScalarType::intBits(64), 64};
+        if (type == "ulong" || type == "System.UInt64") return {AbiValueKind::Integer, ScalarType::uintBits(64), 64};
+        return {};
+    }
+    if ((definition.bitfield & 0x1) != 0) return {};
     const auto base = normalizedTypeName(definition.baseType);
     if (base == "System.ValueType" || base == "System.Enum") return {};
     return {AbiValueKind::ObjectReference, ScalarType::pointer(pointerBits), pointerBits};
@@ -171,11 +189,15 @@ ClassifiedType classifyTypeReference(
     case Il2CppTypeCode::Internal:
         return {AbiValueKind::ObjectReference, ScalarType::pointer(pointerBits), pointerBits};
     case Il2CppTypeCode::GenericInst:
-        if (const auto* type = definition()) return classifyDefinition(*type, pointerBits);
+        if (const auto* type = definition()) return classifyDefinition(*type, metadata, pointerBits);
         return {};
     case Il2CppTypeCode::ValueType: {
         const auto* type = definition();
         return classifyType(type ? qualifiedName(*type) : reference.name, metadata, pointerBits, emptyIsVoid, typeIndex);
+    }
+    case Il2CppTypeCode::Enum: {
+        const auto* type = definition();
+        return type ? classifyDefinition(*type, metadata, pointerBits) : ClassifiedType{};
     }
     case Il2CppTypeCode::Var:
     case Il2CppTypeCode::MVar: {
@@ -313,7 +335,7 @@ ClassifiedType classifyType(
         return {AbiValueKind::ObjectReference, ScalarType::pointer(pointerBits), pointerBits};
     }
     if (const auto* definition = findTypeDefinition(type, metadata, typeIndex)) {
-        return classifyDefinition(*definition, pointerBits);
+        return classifyDefinition(*definition, metadata, pointerBits);
     }
     return {};
 }

@@ -647,4 +647,429 @@ TEST_CASE("unresolved generic token is omitted and unique generated type name is
     CHECK(source.find("public !703") == std::string::npos);
 }
 
+TEST_CASE("managed class receiver requires an explicit native handle callback") {
+    MetadataModel metadata;
+    TypeModel type;
+    type.name = "ManagedReceiver";
+    type.imageName = "Game.dll";
+    type.flags = 1;
+    MethodModel method;
+    method.name = "GetHandle";
+    method.declaringType = "ManagedReceiver";
+    method.imageName = "Game.dll";
+    method.address = 0x1000;
+    method.definitionIndex = 0;
+    method.token = 0x06000001;
+    method.returnType = "ulong";
+    method.flags = 0x6;
+    type.methods.push_back(method);
+    metadata.types.push_back(type);
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/managed-receiver-handler");
+    const auto report = ProjectWriter::write(output.path, metadata, {namedBody("GetHandle", 0x1000)},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    CHECK_EQ(report.partial, 1);
+    CHECK_EQ(report.unsupported, 0);
+    CHECK(report.methods[0].reason.find("ManagedToNativeHandler") != std::string::npos);
+    CHECK(source.find("x0 = RuntimeAbi.ToNative(this);") != std::string::npos);
+    CHECK(source.find("fixed (ManagedReceiver*") == std::string::npos);
+}
+
+TEST_CASE("hidden MethodInfo uses a unique image scoped MethodDef callback") {
+    MetadataModel metadata;
+    TypeModel type;
+    type.name = "MethodInfoReceiver";
+    type.imageName = "Game.dll";
+    type.flags = 1;
+    MethodModel method;
+    method.name = "ReadInfo";
+    method.declaringType = "MethodInfoReceiver";
+    method.imageName = "Game.dll";
+    method.address = 0x2000;
+    method.definitionIndex = 0;
+    method.token = 0x06000012;
+    method.returnType = "ulong";
+    method.flags = 0x16;
+    method.isStatic = true;
+    type.methods.push_back(method);
+    metadata.types.push_back(type);
+
+    const auto function = namedBody("ReadInfo", 0x2000);
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/method-info-handler");
+    const auto report = ProjectWriter::write(output.path, metadata, {function},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    CHECK_EQ(report.partial, 1);
+    CHECK(report.methods[0].reason.find("MethodInfoResolver") != std::string::npos);
+    CHECK(source.find("RuntimeAbi.ResolveMethodInfo(\"Game.dll\", 100663314U)") != std::string::npos);
+    CHECK(source.find("No MethodInfo resolver is registered") != std::string::npos);
+
+    auto ambiguous = metadata;
+    auto duplicate = method;
+    duplicate.address = 0x3000;
+    ambiguous.types.front().methods.push_back(duplicate);
+    OutputDirectory ambiguousOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/ambiguous-method-info");
+    const auto ambiguousReport = ProjectWriter::write(ambiguousOutput.path, ambiguous, {function},
+                                                      {"RegressionChecks", "net8.0", {}, {}});
+    CHECK_EQ(ambiguousReport.unsupported, 1);
+    CHECK(ambiguousReport.methods[0].reason.find("native register 'x0'") != std::string::npos);
+}
+
+TEST_CASE("ARM64 primitive floating and Boolean parameters keep their native ABI views") {
+    MetadataModel metadata;
+    TypeModel type;
+    type.name = "PrimitiveAbi";
+    type.flags = 1;
+    const auto add = [&](std::string name, uint64_t address, std::string resultType,
+                         std::string parameterType) {
+        MethodModel method;
+        method.name = std::move(name);
+        method.address = address;
+        method.returnType = std::move(resultType);
+        method.flags = 0x16;
+        method.isStatic = true;
+        method.parameters.push_back({"value", std::move(parameterType), -1});
+        type.methods.push_back(std::move(method));
+    };
+    add("SingleIdentity", 0x1000, "float", "float");
+    add("DoubleIdentity", 0x2000, "double", "double");
+    add("BooleanIdentity", 0x3000, "bool", "bool");
+    metadata.types.push_back(type);
+
+    auto single = functionWithStatements("SingleIdentity", {
+        returnValue(reg("v0", ScalarType::vectorBits(128)), 0x1000)});
+    auto twice = functionWithStatements("DoubleIdentity", {
+        returnValue(reg("v0", ScalarType::vectorBits(128)), 0x2000)});
+    twice.address = 0x2000;
+    twice.blocks[0].address = 0x2000;
+    auto boolean = functionWithStatements("BooleanIdentity", {
+        returnValue(reg("x0", ScalarType::pointer(64)), 0x3000)});
+    boolean.address = 0x3000;
+    boolean.blocks[0].address = 0x3000;
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/primitive-abi-emission");
+    const auto report = ProjectWriter::write(output.path, metadata, {single, twice, boolean},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    CHECK_EQ(report.supported, 3);
+    CHECK(source.find("v0 = RuntimeVector128.Zero.WithSingle(0, value);") != std::string::npos);
+    CHECK(source.find("v0 = RuntimeVector128.Zero.WithDouble(0, value);") != std::string::npos);
+    CHECK(source.find("x0 = unchecked((ulong)(value ? 1UL : 0UL));") != std::string::npos);
+
+    auto missingFloat = functionWithStatements("MissingFloat", {
+        returnValue(reg("v1", ScalarType::vectorBits(128)), 0x4000)});
+    missingFloat.address = 0x4000;
+    missingFloat.blocks[0].address = 0x4000;
+    MethodModel noArgument;
+    noArgument.name = "MissingFloat";
+    noArgument.address = 0x4000;
+    noArgument.returnType = "float";
+    noArgument.flags = 0x16;
+    noArgument.isStatic = true;
+    metadata.types.front().methods.push_back(noArgument);
+    OutputDirectory unsupportedOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/unbound-float-emission");
+    const auto unsupported = ProjectWriter::write(unsupportedOutput.path, metadata, {missingFloat},
+                                                  {"RegressionChecks", "net8.0", {}, {}});
+    CHECK_EQ(unsupported.unsupported, 1);
+    CHECK(unsupported.methods.front().reason.find("floating register 'v1'") != std::string::npos);
+}
+
+TEST_CASE("enum ABI uses verified underlying integer and explicit managed return cast") {
+    MetadataModel metadata;
+    metadata.typeReferences.resize(1);
+    metadata.typeReferences[0].code = static_cast<uint8_t>(Il2CppTypeCode::ValueType);
+    metadata.typeReferences[0].name = "Mode";
+    metadata.typeReferences[0].definitionIndex = 0;
+    TypeModel mode;
+    mode.name = "Mode";
+    mode.flags = 1;
+    mode.bitfield = 0x2;
+    mode.fields.push_back({"value__", "int", 0, false, 0, 0, -1});
+    metadata.types.push_back(mode);
+    TypeModel use;
+    use.name = "ModeUser";
+    use.flags = 1;
+    MethodModel method;
+    method.name = "Identity";
+    method.returnType = "type[0]";
+    method.parameters.push_back({"value", "type[0]", -1});
+    method.address = 0x5000;
+    method.flags = 0x16;
+    method.isStatic = true;
+    use.methods.push_back(method);
+    metadata.types.push_back(use);
+    auto function = functionWithStatements("Identity", {
+        returnValue(reg("x0", ScalarType::pointer(64)), 0x5000)});
+    function.address = 0x5000;
+    function.blocks[0].address = 0x5000;
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/enum-abi-emission");
+    const auto report = ProjectWriter::write(output.path, metadata, {function},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    CHECK_EQ(report.supported, 1);
+    CHECK(source.find("Mode Identity(Mode value)") != std::string::npos);
+    CHECK(source.find("return unchecked((Mode)(") != std::string::npos);
+
+    auto invalid = metadata;
+    invalid.types[0].fields[0].type = "string";
+    OutputDirectory invalidOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/invalid-enum-abi");
+    const auto invalidReport = ProjectWriter::write(invalidOutput.path, invalid, {function},
+                                                    {"RegressionChecks", "net8.0", {}, {}});
+    CHECK_EQ(invalidReport.unsupported, 1);
+}
+
+TEST_CASE("char ABI return preserves the 16 bit native value") {
+    MetadataModel metadata;
+    TypeModel type;
+    type.name = "CharUser";
+    type.flags = 1;
+    MethodModel method;
+    method.name = "Identity";
+    method.returnType = "char";
+    method.parameters.push_back({"value", "char", -1});
+    method.address = 0x5800;
+    method.flags = 0x16;
+    method.isStatic = true;
+    type.methods.push_back(method);
+    metadata.types.push_back(type);
+    auto function = functionWithStatements("Identity", {
+        returnValue(reg("x0", ScalarType::pointer(64)), 0x5800)});
+    function.address = 0x5800;
+    function.blocks[0].address = 0x5800;
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/char-abi-emission");
+    const auto report = ProjectWriter::write(output.path, metadata, {function},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    CHECK_EQ(report.supported, 1);
+    CHECK(source.find("char Identity(char value)") != std::string::npos);
+    CHECK(source.find("return unchecked((char)(") != std::string::npos);
+}
+
+TEST_CASE("short named enum return requires a uniquely proven nested owner") {
+    MetadataModel metadata;
+    metadata.typeReferences.resize(6);
+    metadata.typeReferences[5].code = static_cast<uint8_t>(Il2CppTypeCode::Class);
+    metadata.typeReferences[5].name = "Owner";
+    metadata.typeReferences[5].definitionIndex = 0;
+    TypeModel owner;
+    owner.name = "Owner";
+    owner.imageName = "Game.dll";
+    owner.flags = 1;
+    MethodModel method;
+    method.name = "GetShape";
+    method.imageName = "Game.dll";
+    method.returnType = "Shape";
+    method.address = 0x5900;
+    method.flags = 0x16;
+    method.isStatic = true;
+    owner.methods.push_back(method);
+    metadata.types.push_back(owner);
+    TypeModel nested;
+    nested.name = "Shape";
+    nested.imageName = "Game.dll";
+    nested.flags = 1;
+    nested.bitfield = 0x2;
+    nested.declaringTypeIndex = 5;
+    nested.fields.push_back({"value__", "int", 0, false, 0, 0, -1});
+    metadata.types.push_back(nested);
+    auto function = functionWithStatements("GetShape", {
+        assignment(reg("x0", ScalarType::pointer(64)), constant(1, ScalarType::pointer(64)), 0x5900),
+        returnValue(reg("x0", ScalarType::pointer(64)), 0x5904)});
+    function.address = 0x5900;
+    function.blocks[0].address = 0x5900;
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/nested-enum-abi");
+    const auto report = ProjectWriter::write(output.path, metadata, {function},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    if (report.supported != 1) {
+        fail("nested enum emission: " + (report.methods.empty() ? std::string("no method") : report.methods.front().reason),
+             __FILE__, __LINE__);
+    }
+    CHECK(readSources(output.path).find("return unchecked((Shape)(") != std::string::npos);
+
+    auto ambiguous = metadata;
+    ambiguous.types[1].declaringTypeIndex = -1;
+    TypeModel second = ambiguous.types[1];
+    second.declaringTypeIndex = -1;
+    ambiguous.types.push_back(second);
+    OutputDirectory ambiguousOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/ambiguous-enum-abi");
+    const auto ambiguousReport = ProjectWriter::write(ambiguousOutput.path, ambiguous, {function},
+                                                      {"RegressionChecks", "net8.0", {}, {}});
+    CHECK_EQ(ambiguousReport.unsupported, 1);
+    CHECK(readSources(ambiguousOutput.path).find("return unchecked((int)(") == std::string::npos);
+}
+
+TEST_CASE("reference parameter and return require explicit runtime handlers") {
+    MetadataModel metadata;
+    TypeModel type;
+    type.name = "ReferenceAbi";
+    type.flags = 1;
+    MethodModel method;
+    method.name = "Echo";
+    method.address = 0x6000;
+    method.returnType = "object";
+    method.flags = 0x16;
+    method.isStatic = true;
+    method.parameters.push_back({"value", "object", -1});
+    type.methods.push_back(method);
+    metadata.types.push_back(type);
+    auto function = functionWithStatements("Echo", {
+        returnValue(reg("x0", ScalarType::pointer(64)), 0x6000)});
+    function.address = 0x6000;
+    function.blocks[0].address = 0x6000;
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/reference-abi-emission");
+    const auto report = ProjectWriter::write(output.path, metadata, {function},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    CHECK_EQ(report.partial, 1);
+    CHECK_EQ(report.unsupported, 0);
+    CHECK(report.methods[0].reason.find("ManagedToNativeHandler") != std::string::npos);
+    CHECK(report.methods[0].reason.find("NativeToManagedHandler") != std::string::npos);
+    CHECK(source.find("x0 = RuntimeAbi.ToNativeArgument(value);") != std::string::npos);
+    CHECK(source.find("return RuntimeAbi.FromNativeReturn<object>(") != std::string::npos);
+}
+
+TEST_CASE("native argument register written before read is declared as an uninitialized local") {
+    MetadataModel metadata;
+    TypeModel type;
+    type.name = "LocalConstructor";
+    type.flags = 1;
+    MethodModel method;
+    method.name = ".ctor";
+    method.address = 0x7000;
+    method.returnType = "void";
+    method.flags = 0x6;
+    type.methods.push_back(method);
+    metadata.types.push_back(type);
+
+    Statement setRegister = assignment(reg("x1", ScalarType::pointer(64)),
+                                       constant(0, ScalarType::pointer(64)), 0x7000);
+    Statement done;
+    done.kind = Statement::Kind::Return;
+    done.address = 0x7004;
+    auto function = functionWithStatements(".ctor", {setRegister, done});
+    function.address = 0x7000;
+    function.blocks[0].address = 0x7000;
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/native-local-register");
+    const auto report = ProjectWriter::write(output.path, metadata, {function},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    CHECK_EQ(report.supported, 1);
+    CHECK(source.find("ulong x1;") != std::string::npos);
+    CHECK(source.find("ulong x1 = default") == std::string::npos);
+    CHECK(source.find("x1 = 0x0UL;") != std::string::npos);
+
+    MethodModel reader;
+    reader.name = "ReadBeforeWrite";
+    reader.address = 0x8000;
+    reader.returnType = "ulong";
+    reader.flags = 0x16;
+    reader.isStatic = true;
+    metadata.types.front().methods.push_back(reader);
+    auto readFunction = functionWithStatements("ReadBeforeWrite", {
+        returnValue(reg("x0", ScalarType::pointer(64)), 0x8000)});
+    readFunction.address = 0x8000;
+    readFunction.blocks[0].address = 0x8000;
+    OutputDirectory unsupportedOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/native-unbound-input");
+    const auto unsupported = ProjectWriter::write(unsupportedOutput.path, metadata, {readFunction},
+                                                  {"RegressionChecks", "net8.0", {}, {}});
+    CHECK_EQ(unsupported.unsupported, 1);
+    CHECK(unsupported.methods.front().reason.find("native register 'x0'") != std::string::npos);
+}
+
+TEST_CASE("full declarations expose only prior callable managed methods") {
+    const auto makeFunction = [](const std::string& name, uint64_t address, uint64_t target = 0) {
+        RecoveredFunction function;
+        function.architecture = Architecture::Arm64;
+        function.address = address;
+        function.name = name;
+        BasicBlock block;
+        block.address = address;
+        if (target != 0) {
+            Statement call;
+            call.kind = Statement::Kind::Call;
+            call.address = address;
+            call.target = constant(target, ScalarType::pointer(64));
+            block.statements.push_back(call);
+        }
+        Statement result;
+        result.kind = Statement::Kind::Return;
+        result.address = address + (target != 0 ? 4 : 0);
+        block.statements.push_back(result);
+        function.blocks.push_back(std::move(block));
+        return function;
+    };
+    const auto makeMetadata = [](std::string targetName, std::string callerName, uint16_t targetFlags = 0x16) {
+        MetadataModel metadata;
+        metadata.version = 24.0;
+        TypeModel type;
+        type.name = "SurfaceOwner";
+        type.imageName = "Assembly-CSharp.dll";
+        type.flags = 1;
+        MethodModel target;
+        target.name = std::move(targetName);
+        target.declaringType = "SurfaceOwner";
+        target.imageName = type.imageName;
+        target.returnType = "void";
+        target.isStatic = true;
+        target.flags = targetFlags;
+        target.definitionIndex = 0;
+        target.address = 0x1000;
+        target.token = 0x06000001;
+        MethodModel caller = target;
+        caller.name = std::move(callerName);
+        caller.definitionIndex = 1;
+        caller.address = 0x2000;
+        caller.token = 0x06000002;
+        type.methods = {target, caller};
+        metadata.types.push_back(std::move(type));
+        return metadata;
+    };
+    ProjectWriterOptions options;
+    options.projectName = "SurfaceChecks";
+    options.targetFramework = "net8.0";
+    options.includedImages = {"Assembly-CSharp.dll"};
+    options.includeExternalDeclarations = true;
+
+    OutputDirectory priorOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/prior-emitted-call");
+    const auto prior = ProjectWriter{options}.write(priorOutput.path,
+        makeMetadata("A", "B"), {makeFunction("A", 0x1000), makeFunction("B", 0x2000, 0x1000)});
+    CHECK_EQ(prior.supported, 2);
+    CHECK(readSources(priorOutput.path).find("global::SurfaceOwner.A(") != std::string::npos);
+
+    OutputDirectory forwardOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/forward-native-call");
+    const auto forward = ProjectWriter{options}.write(forwardOutput.path,
+        makeMetadata("Z_Target", "A_Caller"),
+        {makeFunction("Z_Target", 0x1000), makeFunction("A_Caller", 0x2000, 0x1000)});
+    CHECK_EQ(forward.supported, 1);
+    CHECK_EQ(forward.partial, 1);
+    CHECK(readSources(forwardOutput.path).find("global::SurfaceOwner.Z_Target(") == std::string::npos);
+
+    OutputDirectory privateOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/private-native-call");
+    const auto privateTarget = ProjectWriter{options}.write(privateOutput.path,
+        makeMetadata("A", "B", 0x11),
+        {makeFunction("A", 0x1000), makeFunction("B", 0x2000, 0x1000)});
+    CHECK_EQ(privateTarget.supported, 1);
+    CHECK_EQ(privateTarget.partial, 1);
+    CHECK(readSources(privateOutput.path).find("global::SurfaceOwner.A(") == std::string::npos);
+}
+
 } // namespace il2cpprec::tests

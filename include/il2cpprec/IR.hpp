@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -119,12 +120,23 @@ struct CSharpEmissionResult {
 struct CSharpBodyOptions {
     bool voidReturn = false;
     bool declareNativeParameters = true;
+    // Native argument registers initialized by the caller of emitCSharpBody.
+    std::set<std::string> externalNativeRegisters;
+    // Optional managed enum type for a verified integral native return.
+    std::string managedReturnCast;
+    // Optional managed reference type for a handler-dependent native pointer return.
+    std::string managedReturnReferenceType;
 };
 
 struct CSharpBodyEmissionResult {
+    struct SupportFragment {
+        std::string key;
+        std::string source;
+    };
     std::string declarations;
     std::string body;
     std::string support;
+    std::vector<SupportFragment> supportFragments;
     std::vector<CSharpDiagnostic> diagnostics;
     bool partial = false;
 };

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -11,12 +12,19 @@
 
 namespace il2cpprec {
 
+struct GenericMethodInfoEvidence;
+
 struct ProjectWriterOptions {
     std::string projectName = "Il2CppRecovered";
     std::string targetFramework = "netstandard2.1";
     std::vector<std::string> assemblyReferences;
     // Empty means all images. Types without type or method image evidence are kept conservatively.
     std::vector<std::string> includedImages;
+    // With an image filter, retain metadata-backed declarations from all images
+    // while recovering native bodies only for the selected images.
+    bool includeExternalDeclarations = false;
+    // Optional evidence derived from this exact binary and metadata model.
+    std::shared_ptr<const GenericMethodInfoEvidence> genericMethodInfoEvidence;
 };
 
 enum class ProjectMethodBodyStatus {
@@ -33,6 +41,7 @@ struct ProjectMethodEmission {
     ProjectMethodBodyStatus status = ProjectMethodBodyStatus::Unsupported;
     std::string reason;
     bool declarationPartial = false;
+    std::string imageName;
 };
 
 struct ProjectWriteReport {

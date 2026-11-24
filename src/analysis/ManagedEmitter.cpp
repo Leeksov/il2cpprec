@@ -37,6 +37,7 @@ bool sameAbiOptions(const AbiAdapterOptions& left, const AbiAdapterOptions& righ
 struct PendingCall {
     ManagedCallSite output;
     MethodModel method;
+    std::optional<ManagedEmittedMember> surfaceMember;
     CallSiteAbiSpec spec;
     uint64_t markerAddress = 0;
     std::string wrapperName;
@@ -172,6 +173,16 @@ std::optional<std::string> csharpMethodName(const MethodModel& method, CallSiteK
     return keywords.contains(name) ? "@" + name : name;
 }
 
+std::optional<std::string> emittedMemberName(std::string name) {
+    const bool escaped = !name.empty() && name.front() == '@';
+    if (escaped) name.erase(0, 1);
+    MethodModel method;
+    method.name = name;
+    const auto validated = csharpMethodName(method, CallSiteKind::GeneratedDirect);
+    if (!validated) return std::nullopt;
+    return escaped ? "@" + name : *validated;
+}
+
 std::string inputConversion(const AbiBinding& binding, const std::string& argument, const MetadataModel& metadata) {
     const auto type = csharpType(binding.managedType, metadata);
     if (type.empty()) return {};
@@ -284,8 +295,11 @@ std::string returnRegister(Architecture architecture) {
 bool buildWrapper(PendingCall& call, Architecture architecture, const MetadataModel& metadata) {
     const auto& model = call.output.abi;
     const auto& method = call.method;
-    const auto methodName = csharpMethodName(method, model.kind);
-    const auto declaringType = csharpType(method.declaringType, metadata);
+    const auto methodName = call.surfaceMember
+        ? emittedMemberName(call.surfaceMember->emittedName)
+        : csharpMethodName(method, model.kind);
+    const auto declaringType = csharpType(
+        call.surfaceMember ? call.surfaceMember->emittedDeclaringType : method.declaringType, metadata);
     if (!methodName || declaringType.empty()) {
         call.output.reason = "The managed method or declaring type has no unambiguous C# representation.";
         return false;
@@ -329,6 +343,26 @@ bool buildWrapper(PendingCall& call, Architecture architecture, const MetadataMo
             ? "((" + declaringType + ")" + receiverValue + ")." + *methodName
             : receiverValue + "." + *methodName;
     }
+    if (call.surfaceMember && call.surfaceMember->syntax != ManagedEmittedMemberSyntax::Method) {
+        if (!call.methodTypeArguments.empty()) {
+            call.output.reason = "A property accessor cannot take method type arguments.";
+            return false;
+        }
+        if (call.surfaceMember->syntax == ManagedEmittedMemberSyntax::PropertyGet) {
+            if (!method.name.starts_with("get_") || !arguments.empty() ||
+                model.typedReturn().valueKind == AbiValueKind::Void) {
+                call.output.reason = "The emitted property getter does not match the managed signature.";
+                return false;
+            }
+        } else {
+            if (!method.name.starts_with("set_") || arguments.size() != 1 ||
+                model.typedReturn().valueKind != AbiValueKind::Void) {
+                call.output.reason = "The emitted property setter does not match the managed signature.";
+                return false;
+            }
+            invocation += " = " + arguments.front();
+        }
+    } else {
     if (!call.methodTypeArguments.empty()) {
         invocation += '<';
         for (size_t index = 0; index < call.methodTypeArguments.size(); ++index) {
@@ -343,6 +377,7 @@ bool buildWrapper(PendingCall& call, Architecture architecture, const MetadataMo
         invocation += arguments[index];
     }
     invocation += ')';
+    }
 
     std::ostringstream output;
     output << "    public static " << nativeType(architecture) << ' ' << call.wrapperName << '(';
@@ -504,6 +539,7 @@ ManagedEmitResult ManagedEmitter::emit(
             continue;
         }
         call.method = *method;
+        const MethodModel sourceIdentity = *method;
         if (call.output.genericTarget.present) {
             const auto genericIndex = call.output.genericTarget.genericMethodIndex;
             if (genericIndex < 0) {
@@ -551,6 +587,36 @@ ManagedEmitResult ManagedEmitter::emit(
             call.output.status = ManagedPatternStatus::Placeholder;
             call.output.reason = "The MethodModel has an incomplete managed signature.";
             continue;
+        }
+        if (options.emissionSurface) {
+            if (ownedMetadata || options.emissionSurface->source != &metadata ||
+                sourceIdentity.definitionIndex < 0) {
+                call.output.status = ManagedPatternStatus::Placeholder;
+                call.output.reason = "The emitted-member surface does not validate this metadata identity.";
+                continue;
+            }
+            const auto entries = options.emissionSurface->byDefinitionIndex.find(sourceIdentity.definitionIndex);
+            const ManagedEmittedMember* selected = nullptr;
+            size_t matches = 0;
+            if (entries != options.emissionSurface->byDefinitionIndex.end()) {
+                for (const auto& entry : entries->second) {
+                    if (entry.imageName != sourceIdentity.imageName ||
+                        entry.metadataDeclaringType != sourceIdentity.declaringType ||
+                        entry.metadataMethodName != sourceIdentity.name ||
+                        entry.isStatic != sourceIdentity.isStatic) continue;
+                    selected = &entry;
+                    ++matches;
+                }
+            }
+            if (matches != 1 || !selected->bodyAvailable) {
+                call.output.status = matches > 1 ? ManagedPatternStatus::Ambiguous : ManagedPatternStatus::Placeholder;
+                call.output.reason = matches == 0
+                    ? "The managed target is absent from the generated project."
+                    : matches > 1 ? "Multiple generated members claim the same managed method."
+                                  : "The generated target has no recovered callable body.";
+                continue;
+            }
+            call.surfaceMember = *selected;
         }
         call.spec.kind = call.output.kind;
         call.spec.methodPointer = constant(call.output.method.address, ScalarType::pointer(pointerBits(function.architecture)));

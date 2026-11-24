@@ -36,6 +36,49 @@ class CorpusGateTests(unittest.TestCase):
         self.assertEqual(summary["csharp"]["supported"], 0)
         self.assertEqual(summary["csharp"]["unsupported"], 1)
         self.assertEqual(summary["csharp"]["reasons"][0]["count"], 1)
+        self.assertEqual(summary["csharp"]["attribution"], "legacy-filter")
+        self.assertEqual(summary["csharpAllImages"]["methods"], 1)
+
+    def test_full_declarations_excludes_external_image_from_target_counts(self) -> None:
+        report = self.report()
+        report["total"] = 2
+        report["exact"] = 2
+        report["partial"] = 0
+        report["methods"][1]["status"] = "exact"
+        report["options"]["fullDeclarations"] = True
+        report["projectEmission"].update({"supported": 1, "unsupported": 0, "omitted": 1})
+        report["projectEmission"]["methods"] = [
+            {"image": "Assembly-CSharp.dll", "address": "0x1000", "status": "supported", "reason": ""},
+            {"image": "Other.dll", "address": "0x1000", "status": "omitted", "reason": "body filter"},
+        ]
+        summary = summarize_cli(report, "Assembly-CSharp.dll")
+        self.assertEqual(summary["csharp"]["attribution"], "explicit-image")
+        self.assertEqual(summary["csharp"]["supported"], 1)
+        self.assertEqual(summary["csharp"]["omitted"], 0)
+        self.assertEqual(summary["csharpAllImages"]["omitted"], 1)
+        self.assertEqual(summary["csharpAllImages"]["images"][1]["name"], "Other.dll")
+        self.assertEqual(summary["csharpAllImages"]["images"][1]["omitted"], 1)
+
+        report["projectEmission"]["methods"][1].pop("image")
+        with self.assertRaisesRegex(ValueError, "nonempty image for every method"):
+            summarize_cli(report, "Assembly-CSharp.dll")
+        report["projectEmission"]["methods"][1]["image"] = "  "
+        with self.assertRaisesRegex(ValueError, "nonempty image for every method"):
+            summarize_cli(report, "Assembly-CSharp.dll")
+
+        # Shared native addresses cannot establish which assembly owns a body.
+        for method in report["projectEmission"]["methods"]:
+            method.pop("image")
+        with self.assertRaisesRegex(ValueError, "lacks per-method image"):
+            summarize_cli(report, "Assembly-CSharp.dll")
+
+    def test_emission_summary_order_is_deterministic(self) -> None:
+        report = self.report()
+        first = summarize_cli(report, "Assembly-CSharp.dll")
+        report["methods"].reverse()
+        report["projectEmission"]["methods"].reverse()
+        second = summarize_cli(report, "Assembly-CSharp.dll")
+        self.assertEqual(first, second)
 
     def test_emission_count_mismatch_is_rejected(self) -> None:
         report = self.report()

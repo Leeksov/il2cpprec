@@ -222,7 +222,7 @@ public:
                 result = namedType(reference, {}, false, "object");
                 break;
             case Il2CppTypeCode::Var:
-                result = identifier(reference.name, genericParameterName(reference.definitionIndex, "T"));
+                result = genericParameter(reference, false);
                 break;
             case Il2CppTypeCode::Array:
                 result = arrayType(element(reference, depth, "object"), reference.rank);
@@ -240,7 +240,7 @@ public:
                 result = element(reference, depth, "object") + "[]";
                 break;
             case Il2CppTypeCode::MVar:
-                result = identifier(reference.name, genericParameterName(reference.definitionIndex, "TMethod"));
+                result = genericParameter(reference, true);
                 break;
             case Il2CppTypeCode::CModReqD:
             case Il2CppTypeCode::CModOpt:
@@ -274,6 +274,63 @@ public:
 private:
     static constexpr size_t maxDepth = 64;
     static constexpr uint32_t maxArrayRank = 64;
+
+    std::string genericParameter(const TypeReferenceModel& reference, bool method) const {
+        const std::string_view raw = reference.name;
+        const std::string_view prefix = method ? "!!" : "!";
+        const auto unresolved = [&] { return raw.empty() ? std::string(method ? "!!?" : "!?") : std::string(raw); };
+        if (!raw.starts_with(prefix)) {
+            if (raw.starts_with("!")) return unresolved();
+            return identifier(raw, genericParameterName(reference.definitionIndex, method ? "TMethod" : "T"));
+        }
+        const std::string_view digits = raw.substr(prefix.size());
+        if (digits.empty()) return unresolved();
+        size_t index = 0;
+        for (const unsigned char digit : digits) {
+            if (!std::isdigit(digit) || index > (std::numeric_limits<size_t>::max() - (digit - '0')) / 10)
+                return unresolved();
+            index = index * 10 + (digit - '0');
+        }
+        if (index >= metadata_.genericParameters.size()) return unresolved();
+        const auto& parameter = metadata_.genericParameters[index];
+        if (parameter.ownerIndex < 0 || parameter.name.empty()) return unresolved();
+        const size_t owner = static_cast<size_t>(parameter.ownerIndex);
+        if (owner >= metadata_.genericContainers.size()) return unresolved();
+        const auto& container = metadata_.genericContainers[owner];
+        if ((container.isMethod != 0) != method || container.ownerIndex < 0 ||
+            container.genericParameterStart < 0 || container.typeArgumentCount <= 0) return unresolved();
+        const size_t begin = static_cast<size_t>(container.genericParameterStart);
+        const size_t count = static_cast<size_t>(container.typeArgumentCount);
+        if (begin > metadata_.genericParameters.size() ||
+            count > metadata_.genericParameters.size() - begin ||
+            index < begin || index - begin >= count) return unresolved();
+        if (!method) {
+            const size_t typeIndex = static_cast<size_t>(container.ownerIndex);
+            if (typeIndex >= metadata_.types.size() || metadata_.types[typeIndex].genericContainerIndex != parameter.ownerIndex)
+                return unresolved();
+        } else {
+            bool found = false;
+            for (const auto& type : metadata_.types) {
+                for (const auto& candidate : type.methods) {
+                    if (candidate.definitionIndex == container.ownerIndex &&
+                        candidate.genericContainerIndex == parameter.ownerIndex) {
+                        if (found) return unresolved();
+                        found = true;
+                    }
+                }
+            }
+            if (!found) return unresolved();
+        }
+        for (size_t other = 0; other < metadata_.genericContainers.size(); ++other) {
+            if (other == owner) continue;
+            const auto& candidate = metadata_.genericContainers[other];
+            if (candidate.genericParameterStart < 0 || candidate.typeArgumentCount <= 0) continue;
+            const size_t start = static_cast<size_t>(candidate.genericParameterStart);
+            const size_t length = static_cast<size_t>(candidate.typeArgumentCount);
+            if (start <= index && index - start < length) return unresolved();
+        }
+        return identifier(parameter.name, "object");
+    }
 
     static std::string genericParameterName(int32_t index, std::string_view prefix) {
         std::string result(prefix);

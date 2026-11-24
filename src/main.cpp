@@ -1,4 +1,5 @@
 #include <il2cpprec/Recovery.hpp>
+#include <il2cpprec/analysis/ManagedPatterns.hpp>
 #include <il2cpprec/diagnostics/SemanticVerifier.hpp>
 #include <il2cpprec/emit/ProjectWriter.hpp>
 #include <il2cpprec/formats/BinaryLoader.hpp>
@@ -57,6 +58,7 @@ struct Arguments {
     bool inspectModules = false;
     bool failOnPartial = false;
     bool verify = false;
+    bool fullDeclarations = false;
     bool protectedProfile = false;
     bool idaMcp = false;
     bool help = false;
@@ -238,6 +240,7 @@ void printHelp(std::ostream& output) {
            << "Other options:\n"
            << "  --output-dir DIR         Write a C# project containing exact methods\n"
            << "  --include-images LIST    Comma-separated image names to include in the project\n"
+           << "  --full-declarations     Keep metadata type declarations for other images; --include-images limits bodies\n"
            << "  --game NAME              Image preset (criticalops or none)\n"
            << "  --il2cpp-version VALUE   Unity/profile or metadata version override\n"
            << "  --layout VALUE           Layout profile, 24.0-24.5, legacy, or modern\n"
@@ -400,11 +403,13 @@ Arguments parseArguments(int argc, char** argv) {
             continue;
         }
         if (option == "--modules" || option == "--fail-on-partial" ||
-            option == "--protected-profile" || option == "--verify") {
+            option == "--protected-profile" || option == "--verify" ||
+            option == "--full-declarations") {
             if (hasInlineValue) throw std::invalid_argument("Unexpected value for " + option);
             if (option == "--modules") result.inspectModules = true;
             else if (option == "--fail-on-partial") result.failOnPartial = true;
             else if (option == "--verify") result.verify = true;
+            else if (option == "--full-declarations") result.fullDeclarations = true;
             else result.protectedProfile = true;
             continue;
         }
@@ -1190,12 +1195,23 @@ void writePartialReasonSummary(std::ostream& output, const RecoveryOutcome& outc
     output << "]}";
 }
 
-il2cpprec::ProjectWriterOptions makeProjectWriterOptions(const Arguments& arguments) {
+il2cpprec::ProjectWriterOptions makeProjectWriterOptions(
+    const Arguments& arguments,
+    const il2cpprec::BinaryImage* binary = nullptr,
+    const il2cpprec::MetadataModel* metadata = nullptr) {
     il2cpprec::ProjectWriterOptions options;
     if constexpr (requires { options.includedImages = arguments.includedImages; }) {
         options.includedImages = arguments.includedImages;
     } else if (!arguments.includedImages.empty()) {
         throw std::invalid_argument("--include-images requires ProjectWriterOptions::includedImages support");
+    }
+    options.includeExternalDeclarations = arguments.fullDeclarations;
+    if (binary && metadata && metadata->metadataRegistrationAddress != 0) {
+        auto evidence = il2cpprec::deriveEarlyArm64MethodInfoEvidence(*binary, *metadata);
+        if (!evidence.bySlotAddress.empty() && !evidence.typeReferencesByAddress.empty()) {
+            options.genericMethodInfoEvidence =
+                std::make_shared<const il2cpprec::GenericMethodInfoEvidence>(std::move(evidence));
+        }
     }
     return options;
 }
@@ -1291,6 +1307,7 @@ void writeJsonReport(
            << "    \"protectedProfile\": " << (arguments.protectedProfile ? "true" : "false") << ",\n"
            << "    \"failOnPartial\": " << (arguments.failOnPartial ? "true" : "false") << ",\n"
            << "    \"verify\": " << (arguments.verify ? "true" : "false") << ",\n"
+           << "    \"fullDeclarations\": " << (arguments.fullDeclarations ? "true" : "false") << ",\n"
            << "    \"idaMcp\": " << (arguments.idaMcp ? "true" : "false") << ",\n"
            << "    \"idaInstance\": " << jsonString(idaInstance) << ",\n"
            << "    \"il2cppVersion\": " << jsonString(arguments.il2cppVersion) << ",\n"
@@ -1320,6 +1337,7 @@ void writeJsonReport(
             const auto& method = projectReport->methods[i];
             output << "{\"address\": " << jsonString(hexAddress(method.address))
                    << ", \"name\": " << jsonString(method.name)
+                   << ", \"image\": " << jsonString(method.imageName)
                    << ", \"status\": " << jsonString(projectMethodStatusName(method.status))
                    << ", \"reason\": " << jsonString(method.reason)
                    << ", \"declarationPartial\": " << (method.declarationPartial ? "true" : "false")
@@ -1504,6 +1522,9 @@ IdaMcpSession connectIdaMcp(const Arguments& arguments) {
 }
 
 void validateArguments(const Arguments& arguments) {
+    if (arguments.fullDeclarations && arguments.outputDirectory.empty()) {
+        throw std::invalid_argument("--full-declarations requires --output-dir");
+    }
     const bool moduleMetadata = arguments.inspectModules && arguments.binaryPath.empty() &&
         !arguments.inspectPath.empty() && !arguments.metadataPath.empty();
     if (arguments.binaryPath.empty() != arguments.metadataPath.empty() && !moduleMetadata) {
@@ -1653,7 +1674,8 @@ int main(int argc, char** argv) {
             }
             std::optional<il2cpprec::ProjectWriteReport> projectWriteReport;
             if (!arguments.outputDirectory.empty()) {
-                projectWriteReport = il2cpprec::ProjectWriter{makeProjectWriterOptions(arguments)}.write(
+                projectWriteReport = il2cpprec::ProjectWriter{
+                    makeProjectWriterOptions(arguments, &binary, &resolution.metadata)}.write(
                     arguments.outputDirectory, resolution.metadata, outcome.exactFunctions);
             }
             if (!arguments.reportPath.empty()) {

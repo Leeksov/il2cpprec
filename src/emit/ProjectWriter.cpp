@@ -4,15 +4,19 @@
 #include <il2cpprec/emit/RuntimeSupport.hpp>
 #include <il2cpprec/metadata/TypeSystem.hpp>
 #include <il2cpprec/metadata/GenericMethodResolver.hpp>
+#include <il2cpprec/metadata/UniversalGenericResolver.hpp>
 
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -244,6 +248,11 @@ struct MethodEntry {
     int definitionIndex = -1;
 };
 
+std::string methodImageName(const MethodEntry& entry, const TypeModel* owner) {
+    if (entry.method && !entry.method->imageName.empty()) return entry.method->imageName;
+    return owner ? owner->imageName : std::string{};
+}
+
 struct TypeGroup {
     std::vector<const TypeModel*> metadataTypes;
     std::vector<MethodEntry> methods;
@@ -358,6 +367,185 @@ TypeDeclarationInfo typeDeclaration(const TypeModel* type, bool staticType, bool
     return result;
 }
 
+const TypeModel* emittedNestedParent(const MetadataModel& metadata, const TypeModel& child) {
+    if (child.declaringTypeIndex < 0 ||
+        static_cast<size_t>(child.declaringTypeIndex) >= metadata.types.size()) return nullptr;
+    const auto& parent = metadata.types[static_cast<size_t>(child.declaringTypeIndex)];
+    const bool simpleParent = parent.declaringTypeIndex < 0 && parent.genericContainerIndex < 0 &&
+        parent.nameSpace == child.nameSpace && parent.name.find('`') == std::string::npos;
+    if (!simpleParent || (parent.flags & 0x20) != 0 || (parent.bitfield & 0x2) != 0) return nullptr;
+    const auto duplicates = std::count_if(metadata.types.begin(), metadata.types.end(),
+        [&](const TypeModel& candidate) {
+            return candidate.declaringTypeIndex < 0 && candidate.nameSpace == parent.nameSpace &&
+                   candidate.name == parent.name;
+        });
+    return duplicates == 1 ? &parent : nullptr;
+}
+
+class TypeAccessibilityIndex {
+public:
+    explicit TypeAccessibilityIndex(const MetadataModel& metadata, bool frameworkCoreTypes)
+        : frameworkCoreTypes_(frameworkCoreTypes) {
+        for (const auto& type : metadata.types) {
+            auto name = type.name;
+            if (const auto arity = name.find('`'); arity != std::string::npos) name.resize(arity);
+            if (name.empty()) continue;
+            const auto qualify = [&](const std::string& value) {
+                return type.nameSpace.empty() ? value : type.nameSpace + '.' + value;
+            };
+            const auto recordNames = [&](std::set<std::string>& names) {
+                names.insert(name);
+                names.insert(qualify(name));
+                names.insert(safeName(name, "Type"));
+                names.insert(qualify(safeName(name, "Type")));
+            };
+            const bool generic = type.genericContainerIndex >= 0 &&
+                static_cast<size_t>(type.genericContainerIndex) < metadata.genericContainers.size() &&
+                metadata.genericContainers[static_cast<size_t>(type.genericContainerIndex)].typeArgumentCount > 0;
+            if (generic) {
+                recordNames(genericNamesByImage_[type.imageName]);
+                recordNames(globalGenericNames_);
+            }
+            if (frameworkCoreTypes && type.imageName == "mscorlib.dll") continue;
+            const bool publiclyVisible = typeDeclaration(&type, false,
+                emittedNestedParent(metadata, type) != nullptr).visibility == "public";
+            const auto record = [&](VisibilityMap& map) {
+                insert(map, qualify(name), publiclyVisible);
+                insert(map, qualify(safeName(name, "Type")), publiclyVisible);
+                insert(map, name, publiclyVisible);
+                insert(map, safeName(name, "Type"), publiclyVisible);
+            };
+            record(publiclyVisible_);
+            if (!type.imageName.empty()) record(byImage_[type.imageName]);
+        }
+    }
+
+    bool hasInternalType(std::string_view signature, std::string_view imageName = {}) const {
+        for (size_t begin = 0; begin < signature.size();) {
+            while (begin < signature.size() && !identifierCharacter(signature[begin])) ++begin;
+            if (begin == signature.size()) break;
+            size_t end = begin;
+            while (end < signature.size() && identifierCharacter(signature[end])) ++end;
+            auto token = std::string(signature.substr(begin, end - begin));
+            if (token.starts_with("global::")) token.erase(0, 8);
+            const auto* found = visibility(token, imageName);
+            if (found && *found && !**found) return true;
+            begin = end;
+        }
+        return false;
+    }
+
+    bool hasAmbiguousType(std::string_view signature, std::string_view imageName) const {
+        for (size_t begin = 0; begin < signature.size();) {
+            while (begin < signature.size() && !identifierCharacter(signature[begin])) ++begin;
+            if (begin == signature.size()) break;
+            size_t end = begin;
+            while (end < signature.size() && identifierCharacter(signature[end])) ++end;
+            auto token = std::string(signature.substr(begin, end - begin));
+            if (token.starts_with("global::")) token.erase(0, 8);
+            const auto* found = visibility(token, imageName);
+            if (found && !*found) return true;
+            begin = end;
+        }
+        return false;
+    }
+
+    bool hasInternalTypeReference(std::string_view rawType, const MetadataModel& metadata) const {
+        if (!rawType.starts_with("type[") || rawType.back() != ']') return false;
+        const auto digits = rawType.substr(5, rawType.size() - 6);
+        size_t index = 0;
+        const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), index);
+        if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size()) return false;
+        return internalReference(index, metadata, 0);
+    }
+
+    bool hasUnboundGenericName(std::string_view type, std::string_view imageName) const {
+        if (type.starts_with("type[") || type.find('<') != std::string_view::npos) return false;
+        std::string base(type);
+        for (const auto prefix : {"ref ", "out ", "in ", "global::"}) {
+            if (base.starts_with(prefix)) base.erase(0, std::char_traits<char>::length(prefix));
+        }
+        while (base.ends_with(']')) {
+            const auto open = base.find_last_of('[');
+            if (open == std::string::npos || !std::all_of(base.begin() + static_cast<std::ptrdiff_t>(open + 1),
+                                                         base.end() - 1, [](char c) { return c == ','; })) break;
+            base.resize(open);
+        }
+        while (!base.empty() && (base.back() == '*' || base.back() == '?' || base.back() == '&')) base.pop_back();
+        if (!imageName.empty()) {
+            const auto image = genericNamesByImage_.find(std::string(imageName));
+            if (image != genericNamesByImage_.end() && image->second.contains(base)) return true;
+        }
+        // A bare name shared by generic and nongeneric definitions has no
+        // trustworthy identity here. Emitting it can bind the wrong arity.
+        return globalGenericNames_.contains(base);
+    }
+
+private:
+    using VisibilityMap = std::unordered_map<std::string, std::optional<bool>>;
+    const std::optional<bool>* visibility(std::string_view token, std::string_view imageName) const {
+        if (!imageName.empty()) {
+            const auto image = byImage_.find(std::string(imageName));
+            if (image != byImage_.end()) {
+                const auto found = image->second.find(std::string(token));
+                if (found != image->second.end()) return &found->second;
+            }
+        }
+        const auto found = publiclyVisible_.find(std::string(token));
+        return found == publiclyVisible_.end() ? nullptr : &found->second;
+    }
+
+    bool internalReference(size_t index, const MetadataModel& metadata, size_t depth) const {
+        if (depth > 32 || index >= metadata.typeReferences.size()) return false;
+        const auto& reference = metadata.typeReferences[index];
+        if (reference.definitionIndex >= 0 &&
+            static_cast<size_t>(reference.definitionIndex) < metadata.types.size()) {
+            const auto& type = metadata.types[static_cast<size_t>(reference.definitionIndex)];
+            if (!(frameworkCoreTypes_ && type.imageName == "mscorlib.dll") &&
+                typeDeclaration(&type, false, emittedNestedParent(metadata, type) != nullptr).visibility != "public") {
+                return true;
+            }
+        }
+        if (reference.elementTypeIndex >= 0 &&
+            internalReference(static_cast<size_t>(reference.elementTypeIndex), metadata, depth + 1)) return true;
+        for (const auto argument : reference.genericArgumentIndices) {
+            if (argument >= 0 && internalReference(static_cast<size_t>(argument), metadata, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    static bool identifierCharacter(char value) {
+        const auto c = static_cast<unsigned char>(value);
+        return std::isalnum(c) != 0 || value == '_' || value == '.' || value == '+' || value == ':';
+    }
+
+    void insert(VisibilityMap& map, const std::string& name, bool publiclyVisible) {
+        const auto [it, inserted] = map.emplace(name, publiclyVisible);
+        if (!inserted && it->second != publiclyVisible) it->second = std::nullopt;
+    }
+
+    VisibilityMap publiclyVisible_;
+    std::unordered_map<std::string, VisibilityMap> byImage_;
+    std::unordered_map<std::string, std::set<std::string>> genericNamesByImage_;
+    std::set<std::string> globalGenericNames_;
+    bool frameworkCoreTypes_ = false;
+};
+
+std::string compilerVisibility(std::string visibility, bool internalTypeExposed) {
+    if (!internalTypeExposed) return visibility;
+    if (visibility == "public" || visibility == "protected" || visibility == "protected internal") {
+        return "internal";
+    }
+    return visibility;
+}
+
+std::string staticClassVisibility(std::string visibility, const TypeDeclarationInfo& declaringType) {
+    if (declaringType.modifiers == "static " && visibility.find("protected") != std::string::npos) {
+        return "private";
+    }
+    return visibility;
+}
+
 std::string typeKindName(ManagedTypeKind kind) {
     switch (kind) {
     case ManagedTypeKind::Class: return "class";
@@ -379,10 +567,11 @@ struct MethodBodyEmission {
     std::string source;
     std::string support;
     std::string diagnostic;
+    std::vector<CSharpBodyEmissionResult::SupportFragment> supportFragments;
 };
 
 MethodBodyEmission unsupportedBody(std::string diagnostic) {
-    return {MethodBodyStatus::Unsupported, {}, {}, std::move(diagnostic)};
+    return {MethodBodyStatus::Unsupported, {}, {}, std::move(diagnostic), {}};
 }
 
 std::string managedIdentifier(const std::string& value, const std::string& fallback) {
@@ -491,14 +680,28 @@ bool hasUnresolvedGenericArity(std::string_view type, const MetadataModel& metad
     if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size() ||
         index >= metadata.typeReferences.size()) return false;
     const auto& reference = metadata.typeReferences[index];
+    size_t requiredArity = 0;
+    if (reference.definitionIndex >= 0 &&
+        static_cast<size_t>(reference.definitionIndex) < metadata.types.size()) {
+        const auto& definition = metadata.types[static_cast<size_t>(reference.definitionIndex)];
+        if (definition.genericContainerIndex >= 0 &&
+            static_cast<size_t>(definition.genericContainerIndex) < metadata.genericContainers.size()) {
+            const auto count = metadata.genericContainers[static_cast<size_t>(definition.genericContainerIndex)].typeArgumentCount;
+            if (count > 0) requiredArity = static_cast<size_t>(count);
+        }
+    }
     const auto tick = reference.name.rfind('`');
     if (tick != std::string::npos) {
         size_t arity = 0;
         const auto arityText = std::string_view(reference.name).substr(tick + 1);
         const auto arityParsed = std::from_chars(arityText.data(), arityText.data() + arityText.size(), arity);
-        if (static_cast<Il2CppTypeCode>(reference.code) != Il2CppTypeCode::GenericInst ||
-            arityParsed.ec != std::errc{} || arityParsed.ptr != arityText.data() + arityText.size() ||
-            reference.genericArgumentIndices.size() < arity) return true;
+        if (arityParsed.ec != std::errc{} || arityParsed.ptr != arityText.data() + arityText.size()) return true;
+        requiredArity = std::max(requiredArity, arity);
+    }
+    if (requiredArity != 0 &&
+        (static_cast<Il2CppTypeCode>(reference.code) != Il2CppTypeCode::GenericInst ||
+         reference.genericArgumentIndices.size() < requiredArity)) {
+        return true;
     }
     if (reference.elementTypeIndex >= 0 &&
         hasUnresolvedGenericArity("type[" + std::to_string(reference.elementTypeIndex) + "]", metadata, depth + 1)) {
@@ -515,6 +718,7 @@ struct GenericDeclarationInfo {
     std::string parameters;
     std::string constraints;
     bool partialMetadata = false;
+    bool omittedConstraint = false;
 };
 
 bool isClassConstraint(const MetadataModel& metadata, int64_t constraintIndex) {
@@ -532,7 +736,8 @@ GenericDeclarationInfo genericDeclaration(
     const MetadataModel& metadata,
     int32_t containerIndex,
     bool method,
-    bool varianceAllowed) {
+    bool varianceAllowed,
+    const std::function<std::optional<std::string>(int32_t, std::string)>& validateConstraint = {}) {
     GenericDeclarationInfo result;
     if (containerIndex < 0) return result;
     if (static_cast<size_t>(containerIndex) >= metadata.genericContainers.size()) {
@@ -609,6 +814,15 @@ GenericDeclarationInfo genericDeclaration(
                 result.partialMetadata = true;
                 continue;
             }
+            if (validateConstraint) {
+                const auto validated = validateConstraint(referenceIndex, std::move(resolved));
+                if (!validated) {
+                    result.partialMetadata = true;
+                    result.omittedConstraint = true;
+                    continue;
+                }
+                resolved = *validated;
+            }
             if (isClassConstraint(metadata, referenceIndex)) {
                 if (!baseConstraint.empty() && baseConstraint != resolved) {
                     result.partialMetadata = true;
@@ -659,24 +873,39 @@ std::set<std::string> nativeParameterRegisters(Architecture architecture) {
     return {};
 }
 
-void collectRegisters(const ExpressionPtr& expression, std::set<std::string>& registers) {
+void collectInputRegisters(
+    const ExpressionPtr& expression,
+    const std::set<std::string>& defined,
+    std::set<std::string>& inputs) {
     if (!expression) return;
-    if (expression->kind == Expression::Kind::Register) registers.insert(expression->name);
-    for (const auto& argument : expression->arguments) collectRegisters(argument, registers);
+    if (expression->kind == Expression::Kind::Register && !defined.contains(expression->name)) {
+        inputs.insert(expression->name);
+    }
+    for (const auto& argument : expression->arguments) collectInputRegisters(argument, defined, inputs);
 }
 
-std::set<std::string> usedRegisters(const RecoveredFunction& function) {
-    std::set<std::string> result;
+std::set<std::string> requiredInputRegisters(const RecoveredFunction& function) {
+    std::set<std::string> inputs;
     for (const auto& block : function.blocks) {
+        std::set<std::string> defined;
         for (const auto& statement : block.statements) {
-            collectRegisters(statement.destination, result);
-            collectRegisters(statement.value, result);
-            collectRegisters(statement.condition, result);
-            collectRegisters(statement.target, result);
-            for (const auto& argument : statement.arguments) collectRegisters(argument, result);
+            if (statement.kind == Statement::Kind::Store ||
+                (statement.destination && statement.destination->kind != Expression::Kind::Register)) {
+                collectInputRegisters(statement.destination, defined, inputs);
+            }
+            collectInputRegisters(statement.value, defined, inputs);
+            collectInputRegisters(statement.condition, defined, inputs);
+            collectInputRegisters(statement.target, defined, inputs);
+            for (const auto& argument : statement.arguments) {
+                collectInputRegisters(argument, defined, inputs);
+            }
+            if ((statement.kind == Statement::Kind::Assign || statement.kind == Statement::Kind::Call) &&
+                statement.destination && statement.destination->kind == Expression::Kind::Register) {
+                defined.insert(statement.destination->name);
+            }
         }
     }
-    return result;
+    return inputs;
 }
 
 std::string abiDiagnostic(const AbiBindingModel& model) {
@@ -714,7 +943,14 @@ std::optional<std::string> wrapperType(const std::string& value, const MetadataM
         "float", "double", "string", "object", "nint", "nuint"
     };
     const auto resolved = TypeSystem::resolve(value.empty() ? "object" : value, &metadata);
-    if (primitives.contains(resolved)) return resolved;
+    auto base = resolved;
+    while (base.ends_with(']')) {
+        const auto open = base.find_last_of('[');
+        if (open == std::string::npos || !std::all_of(base.begin() + static_cast<std::ptrdiff_t>(open + 1),
+                                                     base.end() - 1, [](char c) { return c == ','; })) break;
+        base.resize(open);
+    }
+    if (primitives.contains(base)) return resolved;
     if (resolved.empty() || resolved.find('`') != std::string::npos || resolved.find('<') != std::string::npos ||
         resolved.find('>') != std::string::npos || resolved.find('&') != std::string::npos) {
         return std::nullopt;
@@ -996,17 +1232,134 @@ std::string indentCSharpSource(const std::string& source, std::string_view inden
     return output.str();
 }
 
+std::string stringLiteralContent(const std::string& value);
+class EmittedNamePlan;
+std::string managedReturnType(const MethodModel& method, const MetadataModel& metadata,
+                             const EmittedNamePlan* emittedNames = nullptr);
+
+bool integralPrimitiveType(std::string_view type) {
+    return type == "bool" || type == "char" || type == "sbyte" || type == "byte" ||
+        type == "short" || type == "ushort" || type == "int" || type == "uint" ||
+        type == "long" || type == "ulong" || type == "nint" || type == "nuint" ||
+        type == "System.Boolean" || type == "System.Char" ||
+        type == "System.SByte" || type == "System.Byte" ||
+        type == "System.Int16" || type == "System.UInt16" ||
+        type == "System.Int32" || type == "System.UInt32" ||
+        type == "System.Int64" || type == "System.UInt64";
+}
+
+bool enumUnderlyingMatches(const TypeModel& type, const MetadataModel& metadata, ScalarType nativeType) {
+    if ((type.bitfield & 0x2) == 0 || type.genericContainerIndex >= 0) return false;
+    const auto value = std::find_if(type.fields.begin(), type.fields.end(), [](const auto& field) {
+        return field.name == "value__";
+    });
+    if (value == type.fields.end()) return false;
+    const auto underlying = TypeSystem::resolve(value->type, &metadata);
+    const auto match = [&](ScalarKind kind, uint16_t bits) {
+        return nativeType.kind == kind && nativeType.bits == bits;
+    };
+    if (underlying == "sbyte" || underlying == "System.SByte") return match(ScalarKind::SignedInteger, 8);
+    if (underlying == "byte" || underlying == "System.Byte") return match(ScalarKind::UnsignedInteger, 8);
+    if (underlying == "short" || underlying == "System.Int16") return match(ScalarKind::SignedInteger, 16);
+    if (underlying == "ushort" || underlying == "System.UInt16") return match(ScalarKind::UnsignedInteger, 16);
+    if (underlying == "int" || underlying == "System.Int32") return match(ScalarKind::SignedInteger, 32);
+    if (underlying == "uint" || underlying == "System.UInt32") return match(ScalarKind::UnsignedInteger, 32);
+    if (underlying == "long" || underlying == "System.Int64") return match(ScalarKind::SignedInteger, 64);
+    if (underlying == "ulong" || underlying == "System.UInt64") return match(ScalarKind::UnsignedInteger, 64);
+    return false;
+}
+
+std::optional<std::string> enumReturnCast(
+    const MethodModel& method, const MetadataModel& metadata, const TypeModel* owner,
+    ScalarType nativeType, std::string_view emittedReturnType) {
+    const TypeModel* definition = nullptr;
+    const auto& raw = method.returnType;
+    if (integralPrimitiveType(raw)) return std::nullopt;
+    if (raw.starts_with("type[") && raw.back() == ']') {
+        const auto digits = std::string_view(raw).substr(5, raw.size() - 6);
+        size_t index = 0;
+        const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), index);
+        if (parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size() &&
+            index < metadata.typeReferences.size()) {
+            const auto typeIndex = metadata.typeReferences[index].definitionIndex;
+            if (typeIndex >= 0 && static_cast<size_t>(typeIndex) < metadata.types.size()) {
+                definition = &metadata.types[static_cast<size_t>(typeIndex)];
+            }
+        }
+    } else {
+        // Older metadata may have lost the TypeIndex while resolving a short
+        // managed name. A nested enum is still identifiable when its parent
+        // reference resolves back to this exact declaring type in the image.
+        std::optional<size_t> ownerIndex;
+        if (owner) {
+            for (size_t index = 0; index < metadata.types.size(); ++index) {
+                if (&metadata.types[index] == owner) { ownerIndex = index; break; }
+            }
+        }
+        const TypeModel* nested = nullptr;
+        for (const auto& type : metadata.types) {
+            if (type.name != raw || !enumUnderlyingMatches(type, metadata, nativeType) ||
+                !ownerIndex || type.imageName != method.imageName) continue;
+            const auto parent = type.declaringTypeIndex;
+            const bool sameParent = parent >= 0 &&
+                (static_cast<size_t>(parent) == *ownerIndex ||
+                 (static_cast<size_t>(parent) < metadata.typeReferences.size() &&
+                  metadata.typeReferences[static_cast<size_t>(parent)].definitionIndex ==
+                      static_cast<int32_t>(*ownerIndex)));
+            if (!sameParent) continue;
+            if (nested && nested != &type) return std::nullopt;
+            nested = &type;
+        }
+        if (nested) definition = nested;
+        if (!definition) {
+            const TypeModel* match = nullptr;
+            for (const auto& type : metadata.types) {
+                const auto qualified = type.nameSpace.empty() ? type.name : type.nameSpace + "." + type.name;
+                if (raw != qualified && raw != type.name) continue;
+                if (match && match != &type) return std::nullopt;
+                match = &type;
+            }
+            definition = match;
+        }
+    }
+    if (!definition || !enumUnderlyingMatches(*definition, metadata, nativeType)) {
+        return std::nullopt;
+    }
+    return !emittedReturnType.empty()
+        ? std::optional<std::string>(emittedReturnType) : std::nullopt;
+}
+
 class MethodBodyAdapter {
 public:
-    explicit MethodBodyAdapter(const MetadataModel& metadata)
-        : abi_({}, metadata), genericResolver_(metadata), metadataIndex_(metadata) {}
+    explicit MethodBodyAdapter(
+        const MetadataModel& metadata,
+        const GenericMethodInfoEvidence* genericEvidence,
+        const ManagedEmissionSurface* emissionSurface = nullptr)
+        : abi_({}, metadata), genericResolver_(metadata), metadataIndex_(metadata),
+          metadataSource_(&metadata), genericEvidence_(genericEvidence), emissionSurface_(emissionSurface) {
+        if (genericEvidence && !genericEvidence->typeReferencesByAddress.empty()) {
+            UniversalGenericResolverOptions resolverOptions;
+            resolverOptions.typeReferencesByAddress = genericEvidence->typeReferencesByAddress;
+            universalGenerics_ = std::make_unique<UniversalGenericResolver>(metadata, std::move(resolverOptions));
+        }
+        for (const auto& type : metadata.types) {
+            for (const auto& method : type.methods) {
+                const auto& image = method.imageName.empty() ? type.imageName : method.imageName;
+                if (!image.empty() && (method.token & 0xFF000000U) == 0x06000000U &&
+                    (method.token & 0x00FFFFFFU) != 0) {
+                    ++methodTokenCounts_[{image, method.token}];
+                }
+            }
+        }
+    }
 
     MethodBodyEmission emit(
         const RecoveredFunction& function,
         const MethodModel* method,
         const MetadataModel& metadata,
         const TypeModel* owner,
-        const std::string& generatedTypeName) const {
+        const std::string& generatedTypeName,
+        const std::string& emittedReturnType) const {
         if (!method) return unsupportedBody("managed method metadata is unavailable");
         if (function.blocks.empty()) return unsupportedBody("typed IR body is empty");
 
@@ -1015,8 +1368,11 @@ public:
 
         const bool constructor = method->name == ".ctor" || method->name == ".cctor";
         const bool voidReturn = constructor || model.returnValue.valueKind == AbiValueKind::Void;
-        if (!voidReturn && (model.returnValue.valueKind != AbiValueKind::Integer ||
-                            model.returnValue.conversion != AbiConversion::None)) {
+        const bool referenceReturn = model.returnValue.valueKind == AbiValueKind::ObjectReference &&
+            model.returnValue.conversion == AbiConversion::NativePointerToObject;
+        if (!voidReturn && ((model.returnValue.valueKind != AbiValueKind::Integer &&
+                             model.returnValue.valueKind != AbiValueKind::FloatingPoint && !referenceReturn) ||
+                            (!referenceReturn && model.returnValue.conversion != AbiConversion::None))) {
             return unsupportedBody("managed return value requires an unsupported ABI conversion");
         }
 
@@ -1024,11 +1380,34 @@ public:
         const auto pointerType = function.architecture == Architecture::Arm64 || function.architecture == Architecture::X64
             ? "ulong" : "uint";
         std::map<std::string, std::string> nativeDeclarations;
+        struct FloatParameterBinding {
+            std::string storage;
+            std::string view;
+            std::string managedName;
+            uint16_t bits = 0;
+        };
+        std::vector<FloatParameterBinding> floatBindings;
+        std::vector<std::pair<std::string, std::string>> referenceParameterBindings;
         std::optional<std::pair<std::string, std::string>> thisDeclaration;
+        std::optional<std::pair<std::string, std::string>> managedThisDeclaration;
+        std::optional<std::pair<std::string, std::string>> methodInfoDeclaration;
         const auto thisBias = method->isStatic ? std::nullopt :
             unmanagedThisPointerBias(owner, metadata, function.architecture);
         for (const auto& binding : model.bindings) {
-            if (binding.role == AbiValueRole::MethodInfo) continue;
+            if (binding.role == AbiValueRole::MethodInfo) {
+                const auto& image = method->imageName.empty() && owner ? owner->imageName : method->imageName;
+                const auto token = methodTokenCounts_.find({image, method->token});
+                if (token != methodTokenCounts_.end() && token->second == 1 &&
+                    method->genericContainerIndex < 0 && owner && owner->genericContainerIndex < 0 &&
+                    binding.location.kind == AbiLocationKind::Register &&
+                    parameterRegisters.contains(binding.location.registerName)) {
+                    methodInfoDeclaration = {binding.location.registerName,
+                        "    " + std::string(pointerType) + " " + binding.location.registerName +
+                        " = RuntimeAbi.ResolveMethodInfo(\"" + stringLiteralContent(image) + "\", " +
+                        std::to_string(method->token) + "U);\n"};
+                }
+                continue;
+            }
             if (binding.role == AbiValueRole::This) {
                 if (thisBias && binding.location.kind == AbiLocationKind::Register &&
                     !binding.location.registerName.empty()) {
@@ -1037,7 +1416,34 @@ public:
                     if (*thisBias != 0) declaration += " - " + std::to_string(*thisBias) + "UL";
                     declaration += ");\n";
                     thisDeclaration = {binding.location.registerName, std::move(declaration)};
+                } else if (!method->isStatic && owner && owner->flags != 0 &&
+                           (owner->flags & 0x20) == 0 && (owner->bitfield & 0x3) == 0 &&
+                           binding.location.kind == AbiLocationKind::Register &&
+                           parameterRegisters.contains(binding.location.registerName)) {
+                    managedThisDeclaration = {binding.location.registerName,
+                        "    " + std::string(pointerType) + " " + binding.location.registerName +
+                        " = RuntimeAbi.ToNative(this);\n"};
                 }
+                continue;
+            }
+            if (binding.valueKind == AbiValueKind::FloatingPoint &&
+                binding.conversion == AbiConversion::None && function.architecture == Architecture::Arm64 &&
+                binding.location.kind == AbiLocationKind::Register &&
+                binding.registerView && (binding.scalarType.bits == 32 || binding.scalarType.bits == 64)) {
+                const auto index = binding.parameterIndex.value_or(0);
+                floatBindings.push_back({binding.location.registerName, binding.registerView->viewName,
+                    managedIdentifier(binding.managedName, "param" + std::to_string(index)), binding.scalarType.bits});
+                continue;
+            }
+            if (binding.valueKind == AbiValueKind::ObjectReference &&
+                binding.conversion == AbiConversion::ObjectToNativePointer &&
+                binding.location.kind == AbiLocationKind::Register &&
+                parameterRegisters.contains(binding.location.registerName)) {
+                const auto index = binding.parameterIndex.value_or(0);
+                const auto managedName = managedIdentifier(binding.managedName, "param" + std::to_string(index));
+                referenceParameterBindings.push_back({binding.location.registerName,
+                    "    " + std::string(pointerType) + " " + binding.location.registerName +
+                    " = RuntimeAbi.ToNativeArgument(" + managedName + ");\n"});
                 continue;
             }
             if (binding.valueKind != AbiValueKind::Integer || binding.conversion != AbiConversion::None) {
@@ -1063,6 +1469,16 @@ public:
         ManagedEmitterOptions managedOptions;
         managedOptions.patterns.genericResolver = &genericResolver_;
         managedOptions.patterns.metadataIndex = &metadataIndex_;
+        managedOptions.patterns.collectAmbiguousFieldCandidates = false;
+        managedOptions.dispatch.metadataIndex = &metadataIndex_;
+        managedOptions.abiAdapter = &abi_;
+        managedOptions.abiAdapterSource = &metadata;
+        if (metadataSource_ == &metadata) managedOptions.emissionSurface = emissionSurface_;
+        if (genericEvidence_ && metadataSource_ == &metadata) {
+            managedOptions.patterns.genericMethodInfoByAddressView = &genericEvidence_->bySlotAddress;
+            managedOptions.universalGenerics = universalGenerics_.get();
+            managedOptions.universalGenericsSource = metadataSource_;
+        }
         auto managed = ManagedEmitter{}.emit(function, metadata, managedOptions);
         auto managedSupport = applyManagedCallSites(adapted, managed.callSites, metadata);
         std::vector<uint64_t> unresolvedNativeCalls;
@@ -1086,26 +1502,103 @@ public:
         }
         if (!voidReturn && !hasReturnValue) return unsupportedBody("value-returning method has no typed return statement");
 
-        const auto registers = usedRegisters(adapted);
+        const auto registers = requiredInputRegisters(adapted);
         const bool useThisPointer = thisDeclaration && registers.contains(thisDeclaration->first);
+        const bool useManagedThisHandler = managedThisDeclaration && registers.contains(managedThisDeclaration->first);
+        const bool useMethodInfoHandler = methodInfoDeclaration && registers.contains(methodInfoDeclaration->first);
         if (useThisPointer) nativeDeclarations.emplace(thisDeclaration->first, thisDeclaration->second);
+        if (useManagedThisHandler) nativeDeclarations.emplace(managedThisDeclaration->first, managedThisDeclaration->second);
+        if (useMethodInfoHandler) nativeDeclarations.emplace(methodInfoDeclaration->first, methodInfoDeclaration->second);
+        bool useReferenceParameterHandler = false;
+        for (const auto& [name, declaration] : referenceParameterBindings) {
+            if (registers.contains(name)) {
+                nativeDeclarations.emplace(name, declaration);
+                useReferenceParameterHandler = true;
+            }
+        }
         for (const auto& name : parameterRegisters) {
             if (registers.contains(name) && !nativeDeclarations.contains(name)) {
                 return unsupportedBody("native register '" + name + "' has no managed ABI value");
+            }
+        }
+        std::set<std::string> boundFloatInputs;
+        for (const auto& binding : floatBindings) {
+            const bool storageUsed = registers.contains(binding.storage);
+            const bool viewUsed = registers.contains(binding.view);
+            if (storageUsed && viewUsed) {
+                return unsupportedBody("floating parameter register has mixed storage and scalar views");
+            }
+            if (storageUsed) boundFloatInputs.insert(binding.storage);
+            if (viewUsed) boundFloatInputs.insert(binding.view);
+        }
+        if (function.architecture == Architecture::Arm64) {
+            for (size_t index = 0; index < 8; ++index) {
+                const auto name = "v" + std::to_string(index);
+                if (registers.contains(name) && !boundFloatInputs.contains(name)) {
+                    return unsupportedBody("native floating register '" + name + "' has no managed ABI value");
+                }
             }
         }
 
         CSharpBodyOptions options;
         options.voidReturn = voidReturn;
         options.declareNativeParameters = false;
+        for (const auto& [name, declaration] : nativeDeclarations) {
+            (void)declaration;
+            options.externalNativeRegisters.insert(name);
+        }
+        if (!voidReturn && model.returnValue.valueKind == AbiValueKind::Integer) {
+            if (emittedReturnType == "char" || emittedReturnType == "System.Char") {
+                if (model.returnValue.scalarType.kind != ScalarKind::UnsignedInteger ||
+                    model.returnValue.scalarType.bits != 16) {
+                    return unsupportedBody("char return has no verified 16-bit ABI value");
+                }
+                options.managedReturnCast = emittedReturnType;
+            } else if (const auto enumType = enumReturnCast(*method, metadata, owner,
+                                                            model.returnValue.scalarType, emittedReturnType)) {
+                options.managedReturnCast = *enumType;
+            } else if (!integralPrimitiveType(emittedReturnType)) {
+                return unsupportedBody("integral return type has no verified enum identity");
+            }
+        }
+        if (referenceReturn) {
+            options.managedReturnReferenceType = emittedReturnType;
+            if (!supportedCSharpType(options.managedReturnReferenceType)) {
+                return unsupportedBody("managed reference return type has unresolved C# syntax");
+            }
+        }
         auto emitted = adapted.emitCSharpBody(options);
+        std::vector<std::string> floatingInitializers;
+        for (const auto& binding : floatBindings) {
+            if (boundFloatInputs.contains(binding.storage)) {
+                if (emitted.declarations.find("RuntimeVector128 " + binding.storage) == std::string::npos) {
+                    return unsupportedBody("floating parameter has no vector storage declaration");
+                }
+                floatingInitializers.push_back("    " + binding.storage + " = RuntimeVector128.Zero.With" +
+                    (binding.bits == 32 ? std::string("Single") : std::string("Double")) +
+                    "(0, " + binding.managedName + ");\n");
+            } else if (boundFloatInputs.contains(binding.view)) {
+                const auto type = binding.bits == 32 ? "float" : "double";
+                if (emitted.declarations.find(std::string(type) + " " + binding.view) == std::string::npos) {
+                    return unsupportedBody("floating parameter has no scalar view declaration");
+                }
+                floatingInitializers.push_back("    " + binding.view + " = " + binding.managedName + ";\n");
+            }
+        }
         MethodBodyEmission result;
         result.status = emitted.partial ? MethodBodyStatus::Partial : MethodBodyStatus::Supported;
         result.support = managedSupport.source + emitted.support;
+        if (!managedSupport.source.empty()) {
+            result.supportFragments.push_back({"managed-callsite-" + hexAddress(function.address) + '-' +
+                                               function.name, managedSupport.source});
+        }
+        result.supportFragments.insert(result.supportFragments.end(),
+                                       emitted.supportFragments.begin(), emitted.supportFragments.end());
         result.source = managedSupport.prelude;
         std::string nativeBody;
         for (const auto& [name, declaration] : nativeDeclarations) nativeBody += declaration;
         nativeBody += emitted.declarations;
+        for (const auto& initializer : floatingInitializers) nativeBody += initializer;
         nativeBody += emitted.body;
         if (useThisPointer) {
             result.source += "    fixed (" + generatedTypeName + "* __il2cpp_this = &this)\n    {\n";
@@ -1127,6 +1620,20 @@ public:
             result.diagnostic += "native direct call at 0x" + hexAddress(unresolvedNativeCalls.front()) +
                 " requires a RuntimeCalls handler";
         }
+        if (useManagedThisHandler || useMethodInfoHandler) {
+            result.status = MethodBodyStatus::Partial;
+            if (!result.diagnostic.empty()) result.diagnostic += "; ";
+            if (useManagedThisHandler) result.diagnostic += "class receiver requires RuntimeAbi.ManagedToNativeHandler";
+            if (useManagedThisHandler && useMethodInfoHandler) result.diagnostic += "; ";
+            if (useMethodInfoHandler) result.diagnostic += "MethodInfo requires RuntimeAbi.MethodInfoResolver";
+        }
+        if (useReferenceParameterHandler || referenceReturn) {
+            result.status = MethodBodyStatus::Partial;
+            if (!result.diagnostic.empty()) result.diagnostic += "; ";
+            if (useReferenceParameterHandler) result.diagnostic += "reference parameter requires RuntimeAbi.ManagedToNativeHandler";
+            if (useReferenceParameterHandler && referenceReturn) result.diagnostic += "; ";
+            if (referenceReturn) result.diagnostic += "reference return requires RuntimeAbi.NativeToManagedHandler";
+        }
         return result;
     }
 
@@ -1134,6 +1641,11 @@ private:
     AbiAdapter abi_;
     GenericMethodResolver genericResolver_;
     ManagedMetadataIndex metadataIndex_;
+    const MetadataModel* metadataSource_ = nullptr;
+    const GenericMethodInfoEvidence* genericEvidence_ = nullptr;
+    const ManagedEmissionSurface* emissionSurface_ = nullptr;
+    std::unique_ptr<UniversalGenericResolver> universalGenerics_;
+    std::map<std::pair<std::string, uint32_t>, size_t> methodTokenCounts_;
 };
 
 bool isConstructor(const MethodModel* method) {
@@ -1158,11 +1670,52 @@ std::string trim(std::string value) {
     return std::string(first, last);
 }
 
+class EmittedNamePlan {
+public:
+    struct Entry {
+        std::string nameSpace;
+        std::string typeName;
+        GenericDeclarationInfo generic;
+        std::string qualifiedName;
+        bool renamed = false;
+        bool publiclyVisible = true;
+    };
+
+    EmittedNamePlan(const MetadataModel& metadata, const std::map<size_t, TypeGroup>& groups);
+    const Entry& at(size_t key) const { return entries_.at(key); }
+    std::optional<std::string> render(std::string_view raw, std::string_view resolved,
+                                      std::string_view imageName, const MetadataModel& metadata) const;
+    bool isInternal(std::string_view raw, std::string_view imageName,
+                    const MetadataModel& metadata) const;
+    bool isInternalEmitted(std::string_view resolved, std::string_view imageName) const;
+    std::optional<std::string> validateConstraint(int32_t referenceIndex, std::string resolved,
+                                                  std::string_view imageName,
+                                                  const MetadataModel& metadata) const;
+
+private:
+    static std::string key(std::string_view imageName, std::string_view rawName) {
+        return std::string(imageName) + '\x1f' + std::string(rawName);
+    }
+    void indexName(std::string_view imageName, std::string_view rawName, size_t definitionIndex);
+    std::optional<size_t> definitionFromRaw(std::string_view raw, std::string_view imageName,
+                                            const MetadataModel& metadata) const;
+    std::optional<size_t> definitionFromTypeRef(size_t index, const MetadataModel& metadata,
+                                                size_t depth = 0) const;
+
+    std::map<size_t, Entry> entries_;
+    std::unordered_map<std::string, std::optional<size_t>> byImageName_;
+    std::unordered_map<std::string, std::optional<size_t>> byEmittedName_;
+};
+
 std::string managedTypeName(
     const std::string& type,
     const MetadataModel& metadata,
-    std::string_view imageName = {}) {
+    std::string_view imageName = {},
+    const EmittedNamePlan* emittedNames = nullptr) {
     const auto resolved = TypeSystem::resolve(type.empty() ? "object" : type, &metadata);
+    if (emittedNames) {
+        if (const auto mapped = emittedNames->render(type, resolved, imageName, metadata)) return *mapped;
+    }
     if (supportedCSharpType(resolved) || imageName.empty() || type.starts_with("type[")) return resolved;
 
     // Compiler-generated metadata names such as `<MoveNext>c__AnonStorey0`
@@ -1185,10 +1738,36 @@ std::string managedTypeName(
     return unique.value_or(resolved);
 }
 
-std::string managedReturnType(const MethodModel& method, const MetadataModel& metadata) {
+std::string qualifyShadowedType(
+    std::string resolved,
+    std::string_view /*ownerTypeName*/,
+    std::string_view imageName,
+    const MetadataModel& metadata) {
+    if (resolved.starts_with("global::") || resolved.find('.') == std::string::npos) return resolved;
+    auto named = resolved;
+    if (const auto generic = named.find('<'); generic != std::string::npos) named.resize(generic);
+    if (const auto array = named.find('['); array != std::string::npos) named.resize(array);
+    size_t matches = 0;
+    for (const auto& candidate : metadata.types) {
+        if (!imageName.empty() && candidate.imageName != imageName) continue;
+        const auto qualified = candidate.nameSpace.empty()
+            ? candidate.name : candidate.nameSpace + '.' + candidate.name;
+        if (qualified == named) ++matches;
+        if (matches > 1) return resolved;
+    }
+    return matches == 1 ? "global::" + resolved : resolved;
+}
+
+std::string managedReturnType(const MethodModel& method, const MetadataModel& metadata,
+                             const EmittedNamePlan* emittedNames) {
     const auto resolved = TypeSystem::returnType(method, &metadata);
-    if (supportedCSharpType(resolved) || method.returnType.empty()) return resolved;
-    return managedTypeName(method.returnType, metadata, method.imageName);
+    if (method.returnType.empty()) return resolved;
+    if (emittedNames) {
+        if (const auto mapped = emittedNames->render(method.returnType, resolved,
+                                                    method.imageName, metadata)) return *mapped;
+    }
+    if (supportedCSharpType(resolved)) return resolved;
+    return managedTypeName(method.returnType, metadata, method.imageName, emittedNames);
 }
 
 void appendIndented(std::ostringstream& output, const std::string& source, const std::string& indentation) {
@@ -1213,6 +1792,174 @@ std::string uniqueTypeName(const std::string& nameSpace, const std::string& requ
     return candidate;
 }
 
+EmittedNamePlan::EmittedNamePlan(const MetadataModel& metadata, const std::map<size_t, TypeGroup>& groups) {
+    std::set<std::pair<std::string, std::string>> used;
+    for (const auto& [key, group] : groups) {
+        const bool unmatched = key == metadata.types.size();
+        const auto* type = unmatched ? nullptr : &metadata.types[key];
+        const auto sourceNamespace = unmatched ? std::string("Il2CppRecovered") : type->nameSpace;
+        const auto sourceName = unmatched ? std::string("UnmatchedMethods") : type->name;
+        const auto nestedParent = type && group.metadataTypes.size() == 1
+            ? emittedNestedParent(metadata, *type) : nullptr;
+        const auto declaringType = typeDeclaration(type, false, nestedParent != nullptr);
+        auto generic = type ? genericDeclaration(metadata, type->genericContainerIndex, false,
+                                                 declaringType.kind == ManagedTypeKind::Interface)
+                            : GenericDeclarationInfo{};
+        const auto nameSpace = join(namespaceParts(sourceNamespace), ".");
+        const auto requested = safeName(genericTypeBaseName(sourceName, generic), "UnnamedType");
+        const auto typeName = uniqueTypeName(nameSpace, requested, used);
+        std::string qualified = nameSpace.empty() ? std::string{} : nameSpace + '.';
+        if (nestedParent) qualified += safeName(nestedParent->name, "OuterType") + '.';
+        qualified += typeName;
+        if (qualified.find('.') != std::string::npos) qualified.insert(0, "global::");
+        entries_.emplace(key, Entry{nameSpace, typeName, std::move(generic), qualified,
+                                    typeName != requested || nestedParent != nullptr,
+                                    declaringType.visibility == "public"});
+        if (!type) continue;
+        const auto indexEmitted = [&](const std::string& name) {
+            const auto [it, inserted] = byEmittedName_.emplace(EmittedNamePlan::key(type->imageName, name), key);
+            if (!inserted && it->second != key) it->second = std::nullopt;
+        };
+        indexEmitted(typeName);
+        indexEmitted(qualified);
+        const auto rawQualified = type->nameSpace.empty() ? type->name : type->nameSpace + '.' + type->name;
+        indexName(type->imageName, type->name, key);
+        indexName(type->imageName, rawQualified, key);
+        if (type->name.find('`') != std::string::npos) {
+            auto base = type->name.substr(0, type->name.find('`'));
+            indexName(type->imageName, base, key);
+            if (!type->nameSpace.empty()) indexName(type->imageName, type->nameSpace + '.' + base, key);
+        }
+    }
+    for (const auto& [index, group] : groups) {
+        if (index >= metadata.types.size()) continue;
+        const auto& type = metadata.types[index];
+        auto& entry = entries_.at(index);
+        const auto declaringType = typeDeclaration(&type, false,
+            group.metadataTypes.size() == 1 && emittedNestedParent(metadata, type) != nullptr);
+        entry.generic = genericDeclaration(metadata, type.genericContainerIndex, false,
+            declaringType.kind == ManagedTypeKind::Interface,
+            [this, &type, &metadata](int32_t ref, std::string resolved) {
+                return validateConstraint(ref, std::move(resolved), type.imageName, metadata);
+            });
+    }
+}
+
+void EmittedNamePlan::indexName(std::string_view imageName, std::string_view rawName, size_t definitionIndex) {
+    if (imageName.empty() || rawName.empty()) return;
+    const auto [it, inserted] = byImageName_.emplace(key(imageName, rawName), definitionIndex);
+    if (!inserted && it->second != definitionIndex) it->second = std::nullopt;
+}
+
+std::optional<size_t> EmittedNamePlan::definitionFromTypeRef(
+    size_t index, const MetadataModel& metadata, size_t depth) const {
+    if (depth > 32 || index >= metadata.typeReferences.size()) return std::nullopt;
+    const auto& reference = metadata.typeReferences[index];
+    if (reference.definitionIndex >= 0 &&
+        static_cast<size_t>(reference.definitionIndex) < metadata.types.size()) {
+        return static_cast<size_t>(reference.definitionIndex);
+    }
+    if (reference.elementTypeIndex >= 0) {
+        return definitionFromTypeRef(static_cast<size_t>(reference.elementTypeIndex), metadata, depth + 1);
+    }
+    return std::nullopt;
+}
+
+std::optional<size_t> EmittedNamePlan::definitionFromRaw(
+    std::string_view raw, std::string_view imageName, const MetadataModel& metadata) const {
+    if (raw.starts_with("type[") && raw.ends_with(']')) {
+        const auto digits = raw.substr(5, raw.size() - 6);
+        size_t index = 0;
+        const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), index);
+        if (parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size()) {
+            return definitionFromTypeRef(index, metadata);
+        }
+        return std::nullopt;
+    }
+    if (imageName.empty()) return std::nullopt;
+    auto name = std::string(raw);
+    if (name.starts_with("global::")) name.erase(0, 8);
+    if (const auto generic = name.find('<'); generic != std::string::npos) name.resize(generic);
+    if (const auto array = name.find('['); array != std::string::npos) name.resize(array);
+    while (!name.empty() && (name.back() == '*' || name.back() == '?' || name.back() == '&')) name.pop_back();
+    const auto found = byImageName_.find(key(imageName, name));
+    return found == byImageName_.end() ? std::nullopt : found->second;
+}
+
+std::optional<std::string> EmittedNamePlan::render(
+    std::string_view raw, std::string_view resolved, std::string_view imageName,
+    const MetadataModel& metadata) const {
+    const auto definition = definitionFromRaw(raw, imageName, metadata);
+    if (!definition) return std::nullopt;
+    const auto planned = entries_.find(*definition);
+    if (planned == entries_.end() || !planned->second.renamed) return std::nullopt;
+    std::string value(resolved);
+    std::string prefix;
+    for (const auto lead : {"ref ", "out ", "in "}) {
+        if (value.starts_with(lead)) {
+            prefix = lead;
+            value.erase(0, std::char_traits<char>::length(lead));
+            break;
+        }
+    }
+    const auto suffixStart = value.find_first_of("<[*?&");
+    const auto suffix = suffixStart == std::string::npos ? std::string{} : value.substr(suffixStart);
+    return prefix + planned->second.qualifiedName + suffix;
+}
+
+bool EmittedNamePlan::isInternal(std::string_view raw, std::string_view imageName,
+                                const MetadataModel& metadata) const {
+    const auto definition = definitionFromRaw(raw, imageName, metadata);
+    if (!definition) return false;
+    const auto planned = entries_.find(*definition);
+    return planned != entries_.end() && !planned->second.publiclyVisible;
+}
+
+bool EmittedNamePlan::isInternalEmitted(std::string_view resolved, std::string_view imageName) const {
+    std::string name(resolved);
+    if (const auto suffix = name.find_first_of("<[?*&"); suffix != std::string::npos) name.resize(suffix);
+    const auto found = byEmittedName_.find(key(imageName, name));
+    if (found == byEmittedName_.end() || !found->second) return false;
+    const auto planned = entries_.find(*found->second);
+    return planned != entries_.end() && !planned->second.publiclyVisible;
+}
+
+std::optional<std::string> EmittedNamePlan::validateConstraint(
+    int32_t referenceIndex, std::string resolved, std::string_view imageName,
+    const MetadataModel& metadata) const {
+    if (referenceIndex < 0 || static_cast<size_t>(referenceIndex) >= metadata.typeReferences.size()) return std::nullopt;
+    const auto open = resolved.find('<');
+    if (open == std::string::npos) return resolved;
+    size_t depth = 0;
+    size_t argumentCount = 1;
+    size_t close = std::string::npos;
+    for (size_t position = open; position < resolved.size(); ++position) {
+        if (resolved[position] == '<') ++depth;
+        else if (resolved[position] == '>') {
+            if (--depth == 0) { close = position; break; }
+        } else if (resolved[position] == ',' && depth == 1) ++argumentCount;
+    }
+    if (close == std::string::npos) return std::nullopt;
+    const auto raw = "type[" + std::to_string(referenceIndex) + "]";
+    const auto definition = definitionFromRaw(raw, imageName, metadata);
+    std::optional<size_t> target = definition;
+    if (!target) {
+        const auto found = byEmittedName_.find(key(imageName, resolved.substr(0, open)));
+        if (found != byEmittedName_.end()) target = found->second;
+    }
+    if (!target) return resolved;
+    const auto planned = entries_.find(*target);
+    if (planned == entries_.end()) return resolved;
+    const auto& parameters = planned->second.generic.parameters;
+    size_t emittedArity = 0;
+    if (!parameters.empty()) {
+        emittedArity = 1 + static_cast<size_t>(std::count(parameters.begin(), parameters.end(), ','));
+    }
+    if (argumentCount != emittedArity) return std::nullopt;
+    if (planned->second.renamed) return planned->second.qualifiedName + resolved.substr(open);
+    return resolved;
+}
+
 std::filesystem::path uniqueTypePath(
     const std::filesystem::path& directory,
     const std::string& requested,
@@ -1230,18 +1977,11 @@ std::filesystem::path uniqueTypePath(
 
 bool isStaticType(const TypeGroup& group, bool unmatched) {
     if (unmatched) return true;
-    bool hasMember = false;
-    for (const auto* type : group.metadataTypes) {
-        for (const auto& field : type->fields) {
-            hasMember = true;
-            if (!field.isStatic) return false;
-        }
-        for (const auto& method : type->methods) {
-            hasMember = true;
-            if (method.name == ".ctor" || (!method.isStatic && method.name != ".cctor")) return false;
-        }
-    }
-    return hasMember;
+    if (group.metadataTypes.empty()) return false;
+    return std::all_of(group.metadataTypes.begin(), group.metadataTypes.end(), [](const TypeModel* type) {
+        const auto flags = nativeFlags(*type);
+        return flags && (*flags & (0x80U | 0x100U)) == (0x80U | 0x100U);
+    });
 }
 
 std::string uniqueFieldName(
@@ -1302,17 +2042,13 @@ std::string quotedChar(uint16_t value) {
     case '\0': return "'\\0'";
     default: break;
     }
-    if (value < 0x20 || value == 0x7f) {
+    if (value < 0x20 || value >= 0x7f) {
         std::ostringstream output;
         output << "'\\u" << std::hex << std::setw(4) << std::setfill('0') << value << "'";
         return output.str();
     }
     std::string result = "'";
-    if (value < 0x80) result.push_back(static_cast<char>(value));
-    else {
-        result.push_back(static_cast<char>(0xC0 | (value >> 6)));
-        result.push_back(static_cast<char>(0x80 | (value & 0x3F)));
-    }
+    result.push_back(static_cast<char>(value));
     result.push_back('\'');
     return result;
 }
@@ -1442,6 +2178,24 @@ std::optional<std::string> fieldDefaultValue(const FieldModel& field, const Meta
     return literal;
 }
 
+std::optional<std::string> enumMemberLiteral(
+    const FieldModel& field,
+    std::string_view underlyingType,
+    const MetadataModel& metadata) {
+    if (field.defaultValueIndex < 0 ||
+        static_cast<size_t>(field.defaultValueIndex) >= metadata.fieldDefaultValues.size()) return std::nullopt;
+    size_t width = 0;
+    if (underlyingType == "byte" || underlyingType == "sbyte") width = 1;
+    else if (underlyingType == "short" || underlyingType == "ushort") width = 2;
+    else if (underlyingType == "int" || underlyingType == "uint") width = 4;
+    else if (underlyingType == "long" || underlyingType == "ulong") width = 8;
+    if (width == 0) return std::nullopt;
+    const auto& value = metadata.fieldDefaultValues[static_cast<size_t>(field.defaultValueIndex)];
+    const auto raw = defaultValueWord(metadata, value.dataIndex, width);
+    if (!raw) return std::nullopt;
+    return "unchecked((" + std::string(underlyingType) + ")0x" + hexAddress(*raw) + "UL)";
+}
+
 std::optional<std::string> parameterDefaultValue(const ParameterModel& parameter, const MetadataModel& metadata) {
     if (parameter.defaultValueIndex < 0 || static_cast<size_t>(parameter.defaultValueIndex) >= metadata.parameterDefaultValues.size()) {
         return std::nullopt;
@@ -1510,7 +2264,8 @@ std::string parameterDeclaration(
     size_t index,
     const MetadataModel& metadata,
     std::string_view imageName,
-    bool includeDefault) {
+    bool includeDefault,
+    const EmittedNamePlan* emittedNames) {
     std::string direction;
     std::string type = trim(parameter.type);
     for (const std::string_view candidate : {std::string_view("ref "), std::string_view("out "), std::string_view("in ")}) {
@@ -1520,7 +2275,8 @@ std::string parameterDeclaration(
             break;
         }
     }
-    std::string resolved = managedTypeName(type.empty() ? "object" : type, metadata, imageName);
+    std::string resolved = managedTypeName(type.empty() ? "object" : type, metadata,
+                                           imageName, emittedNames);
     if (direction.empty() && type.starts_with("type[") && type.back() == ']') {
         const auto digits = std::string_view(type).substr(5, type.size() - 6);
         if (!digits.empty() && std::all_of(digits.begin(), digits.end(), [](unsigned char c) {
@@ -1561,12 +2317,13 @@ bool hasUnresolvedParameterDefaults(const MethodModel& method, const MetadataMod
     });
 }
 
-std::string parameterList(const MethodModel& method, const MetadataModel& metadata, bool includeDefaults = true) {
+std::string parameterList(const MethodModel& method, const MetadataModel& metadata,
+                          bool includeDefaults = true, const EmittedNamePlan* emittedNames = nullptr) {
     std::vector<std::string> declarations;
     declarations.reserve(method.parameters.size());
     for (size_t index = 0; index < method.parameters.size(); ++index) {
         declarations.push_back(parameterDeclaration(method.parameters[index], index, metadata,
-                                                    method.imageName, includeDefaults));
+                                                    method.imageName, includeDefaults, emittedNames));
     }
     if (includeDefaults) {
         // Native metadata can mark a parameter optional before a later required
@@ -1629,6 +2386,7 @@ struct MethodDeclarationInfo {
     bool partialMetadata = false;
     bool signatureSupported = true;
     std::string signatureReason;
+    std::string visibilityReason;
 };
 
 MethodDeclarationInfo methodDeclaration(
@@ -1637,30 +2395,61 @@ MethodDeclarationInfo methodDeclaration(
     const std::string& typeName,
     const std::string& parameters,
     const MetadataModel& metadata,
-    const TypeDeclarationInfo& declaringType) {
+    const TypeDeclarationInfo& declaringType,
+    const TypeAccessibilityIndex* accessibilityIndex,
+    const EmittedNamePlan* emittedNames) {
     MethodDeclarationInfo result;
     if (!entry.method) {
         result.signature = "public static void " + name + parameters;
         result.partialMetadata = true;
         return result;
     }
+    bool exposesInternalType = false;
     for (const auto& parameter : entry.method->parameters) {
-        const auto resolved = managedTypeName(parameter.type, metadata, entry.method->imageName);
-        if (hasUnresolvedGenericArity(parameter.type, metadata) || !supportedCSharpType(resolved)) {
+        const auto resolved = managedTypeName(parameter.type, metadata, entry.method->imageName, emittedNames);
+        if (hasUnresolvedGenericArity(parameter.type, metadata) ||
+            (accessibilityIndex && accessibilityIndex->hasUnboundGenericName(
+                parameter.type, entry.method->imageName)) || !supportedCSharpType(resolved)) {
             result.signatureSupported = false;
             result.signatureReason = "parameter type '" + resolved + "' has unresolved C# type syntax";
             return result;
         }
+        if (accessibilityIndex && !parameter.type.starts_with("type[") &&
+            accessibilityIndex->hasAmbiguousType(resolved, entry.method->imageName)) {
+            result.signatureSupported = false;
+            result.signatureReason = "parameter type '" + resolved + "' has ambiguous metadata identity";
+            return result;
+        }
+        exposesInternalType = exposesInternalType ||
+            (accessibilityIndex && (accessibilityIndex->hasInternalTypeReference(parameter.type, metadata) ||
+                                    accessibilityIndex->hasInternalType(resolved, entry.method->imageName))) ||
+            (emittedNames && (emittedNames->isInternal(parameter.type, entry.method->imageName, metadata) ||
+                              emittedNames->isInternalEmitted(resolved, entry.method->imageName)));
     }
     if (entry.method->name != ".ctor" && entry.method->name != ".cctor") {
-        const auto resolved = managedReturnType(*entry.method, metadata);
+        const auto resolved = managedReturnType(*entry.method, metadata, emittedNames);
         if (hasUnresolvedGenericArity(entry.method->returnType, metadata) ||
+            (accessibilityIndex && accessibilityIndex->hasUnboundGenericName(
+                entry.method->returnType, entry.method->imageName)) ||
             !supportedCSharpType(resolved)) {
             result.signatureSupported = false;
             result.signatureReason = "return type '" + resolved + "' has unresolved C# type syntax";
             return result;
         }
+        if (accessibilityIndex && !entry.method->returnType.starts_with("type[") &&
+            accessibilityIndex->hasAmbiguousType(resolved, entry.method->imageName)) {
+            result.signatureSupported = false;
+            result.signatureReason = "return type '" + resolved + "' has ambiguous metadata identity";
+            return result;
+        }
+        exposesInternalType = exposesInternalType ||
+            (accessibilityIndex && (accessibilityIndex->hasInternalTypeReference(entry.method->returnType, metadata) ||
+                                    accessibilityIndex->hasInternalType(resolved, entry.method->imageName))) ||
+            (emittedNames && (emittedNames->isInternal(entry.method->returnType,
+                                                       entry.method->imageName, metadata) ||
+                              emittedNames->isInternalEmitted(resolved, entry.method->imageName)));
     }
+    exposesInternalType = exposesInternalType && declaringType.visibility == "public";
     const auto generic = genericDeclaration(metadata, entry.method->genericContainerIndex, true, false);
     result.partialMetadata = generic.partialMetadata || hasUnresolvedParameterDefaults(*entry.method, metadata);
     const auto flags = nativeFlags(*entry.method);
@@ -1669,12 +2458,27 @@ MethodDeclarationInfo methodDeclaration(
         return result;
     }
     if (entry.method->name == ".ctor") {
-        result.signature = (flags ? memberVisibility(*flags) : "public") + " " + typeName + parameters;
+        const auto nativeVisibility = flags ? memberVisibility(*flags) : std::string("public");
+        const auto visibility = staticClassVisibility(
+            compilerVisibility(nativeVisibility, exposesInternalType), declaringType);
+        if (visibility != nativeVisibility) {
+            result.partialMetadata = true;
+            result.visibilityReason = declaringType.modifiers == "static " &&
+                nativeVisibility.find("protected") != std::string::npos
+                    ? "protected constructor visibility is invalid in a static class"
+                    : "C# visibility narrowed because a parameter type is internal";
+        }
+        result.signature = visibility + " " + typeName + parameters;
         result.partialMetadata = result.partialMetadata || !flags.has_value() || !generic.parameters.empty();
         return result;
     }
 
     if (declaringType.kind == ManagedTypeKind::Interface) {
+        if (exposesInternalType) {
+            result.signatureSupported = false;
+            result.signatureReason = "public interface method exposes an internal type";
+            return result;
+        }
         result.signature = managedReturnType(*entry.method, metadata) + " " + name +
             generic.parameters + parameters + generic.constraints;
         result.bodyAllowed = false;
@@ -1682,7 +2486,17 @@ MethodDeclarationInfo methodDeclaration(
         return result;
     }
 
-    std::string modifiers = (flags ? memberVisibility(*flags) : "public") + " ";
+    const auto nativeVisibility = flags ? memberVisibility(*flags) : std::string("public");
+    const auto visibility = staticClassVisibility(
+        compilerVisibility(nativeVisibility, exposesInternalType), declaringType);
+    if (visibility != nativeVisibility) {
+        result.partialMetadata = true;
+        result.visibilityReason = declaringType.modifiers == "static " &&
+            nativeVisibility.find("protected") != std::string::npos
+                ? "protected member visibility is invalid in a static class"
+                : "C# visibility narrowed because the signature exposes an internal type";
+    }
+    std::string modifiers = visibility + " ";
     const bool isStatic = flags ? (*flags & 0x10) != 0 : entry.method->isStatic;
     if (isStatic) modifiers += "static ";
     if (flags) {
@@ -1712,7 +2526,9 @@ MethodDeclarationInfo methodDeclaration(
     } else {
         result.partialMetadata = true;
     }
-    result.signature = modifiers + managedReturnType(*entry.method, metadata) + " " + name +
+    result.signature = modifiers + qualifyShadowedType(
+        managedReturnType(*entry.method, metadata, emittedNames),
+        typeName, entry.method->imageName, metadata) + " " + name +
         generic.parameters + parameters + generic.constraints;
     return result;
 }
@@ -1783,6 +2599,8 @@ bool appendProperty(
     const PropertyModel& property,
     const MetadataModel& metadata,
     const TypeDeclarationInfo& declaringType,
+    const TypeAccessibilityIndex* accessibilityIndex,
+    const EmittedNamePlan* emittedNames,
     const std::string& name,
     const std::string& indentation,
     std::set<int>& reservedMethods) {
@@ -1791,18 +2609,50 @@ bool appendProperty(
     if (!getter && !setter) return false;
     if (getter && !getter->parameters.empty()) return false; // Indexers need parameterized C# syntax.
     if (setter && setter->parameters.size() != 1) return false;
-    const std::string propertyType = getter
-        ? managedReturnType(*getter, metadata)
-        : managedTypeName(setter->parameters.front().type, metadata, type.imageName);
+    const std::string rawPropertyType = getter
+        ? managedReturnType(*getter, metadata, emittedNames)
+        : managedTypeName(setter->parameters.front().type, metadata, type.imageName, emittedNames);
+    const std::string propertyType = qualifyShadowedType(
+        rawPropertyType, type.name, type.imageName, metadata);
     if (propertyType.empty() || propertyType == "void" || !supportedCSharpType(propertyType) ||
-        (getter && hasUnresolvedGenericArity(getter->returnType, metadata)) ||
-        (setter && hasUnresolvedGenericArity(setter->parameters.front().type, metadata))) return false;
-    if (getter && setter && managedTypeName(setter->parameters.front().type, metadata,
-                                            type.imageName) != propertyType) return false;
+        (getter && (hasUnresolvedGenericArity(getter->returnType, metadata) ||
+                    (accessibilityIndex && accessibilityIndex->hasUnboundGenericName(
+                        getter->returnType, type.imageName)))) ||
+        (setter && (hasUnresolvedGenericArity(setter->parameters.front().type, metadata) ||
+                    (accessibilityIndex && accessibilityIndex->hasUnboundGenericName(
+                        setter->parameters.front().type, type.imageName))))) return false;
+    if (accessibilityIndex &&
+        ((getter && !getter->returnType.starts_with("type[") &&
+          accessibilityIndex->hasAmbiguousType(propertyType, type.imageName)) ||
+         (setter && !setter->parameters.front().type.starts_with("type[") &&
+          accessibilityIndex->hasAmbiguousType(propertyType, type.imageName)))) return false;
+    if (getter && setter && qualifyShadowedType(
+            managedTypeName(setter->parameters.front().type, metadata, type.imageName, emittedNames),
+            type.name, type.imageName, metadata) != propertyType) return false;
     if (getter && setter && getter->isStatic != setter->isStatic) return false;
     const MethodModel* principal = getter ? getter : setter;
+    const bool internalTypeExposed = accessibilityIndex && declaringType.visibility == "public" &&
+        (accessibilityIndex->hasInternalType(propertyType, type.imageName) ||
+         (getter && accessibilityIndex->hasInternalTypeReference(getter->returnType, metadata)) ||
+         (setter && accessibilityIndex->hasInternalTypeReference(setter->parameters.front().type, metadata)) ||
+         (emittedNames && (emittedNames->isInternalEmitted(propertyType, type.imageName) ||
+                           (getter && emittedNames->isInternal(getter->returnType, type.imageName, metadata)) ||
+                           (setter && emittedNames->isInternal(setter->parameters.front().type,
+                                                                type.imageName, metadata)))));
+    if (internalTypeExposed && declaringType.kind == ManagedTypeKind::Interface) return false;
     if (declaringType.kind != ManagedTypeKind::Interface) {
-        output << indentation << memberVisibility(principal->flags) << ' ';
+        const auto originalVisibility = memberVisibility(principal->flags);
+        const auto visibility = staticClassVisibility(
+            compilerVisibility(originalVisibility, internalTypeExposed), declaringType);
+        if (visibility != originalVisibility) {
+            output << indentation << "// Partial recovery: C# visibility narrowed from "
+                   << originalVisibility << " to " << visibility
+                   << (declaringType.modifiers == "static " &&
+                       originalVisibility.find("protected") != std::string::npos
+                           ? " because protected members are invalid in a static class.\n"
+                           : " because the property type is internal.\n");
+        }
+        output << indentation << visibility << ' ';
         if (principal->isStatic || declaringType.modifiers == "static ") output << "static ";
     }
     output << propertyType << ' ' << name << "\n" << indentation << "{\n";
@@ -1828,12 +2678,15 @@ bool appendEvent(
     const EventModel& event,
     const MetadataModel& metadata,
     const TypeDeclarationInfo& declaringType,
+    const TypeAccessibilityIndex* accessibilityIndex,
+    const EmittedNamePlan* emittedNames,
     const std::string& name,
     const std::string& indentation,
     std::set<int>& reservedMethods) {
     if (event.typeIndex < 0 || static_cast<size_t>(event.typeIndex) >= metadata.typeReferences.size()) return false;
     const auto& reference = metadata.typeReferences[static_cast<size_t>(event.typeIndex)];
-    const std::string eventType = TypeSystem::resolve(static_cast<size_t>(event.typeIndex), metadata);
+    const auto rawEventType = "type[" + std::to_string(event.typeIndex) + "]";
+    const std::string eventType = managedTypeName(rawEventType, metadata, type.imageName, emittedNames);
     // Only the framework delegate families are known to be legal C# event
     // types here. Other metadata references need a proven delegate definition.
     const bool frameworkDelegate = reference.definitionIndex < 0 &&
@@ -1845,8 +2698,22 @@ bool appendEvent(
     const MethodModel* remove = accessorMethod(type, event.remove, "remove_" + event.name);
     if (!add || !remove || add->parameters.size() != 1 || remove->parameters.size() != 1 ||
         add->isStatic != remove->isStatic) return false;
+    const bool internalTypeExposed = accessibilityIndex && declaringType.visibility == "public" &&
+        accessibilityIndex->hasInternalType(eventType, type.imageName);
+    if (internalTypeExposed && declaringType.kind == ManagedTypeKind::Interface) return false;
     if (declaringType.kind != ManagedTypeKind::Interface) {
-        output << indentation << memberVisibility(add->flags) << ' ';
+        const auto originalVisibility = memberVisibility(add->flags);
+        const auto visibility = staticClassVisibility(
+            compilerVisibility(originalVisibility, internalTypeExposed), declaringType);
+        if (visibility != originalVisibility) {
+            output << indentation << "// Partial recovery: C# visibility narrowed from "
+                   << originalVisibility << " to " << visibility
+                   << (declaringType.modifiers == "static " &&
+                       originalVisibility.find("protected") != std::string::npos
+                           ? " because protected members are invalid in a static class.\n"
+                           : " because the event type is internal.\n");
+        }
+        output << indentation << visibility << ' ';
         if (add->isStatic || declaringType.modifiers == "static ") output << "static ";
     }
     if (declaringType.kind == ManagedTypeKind::Interface) {
@@ -1871,14 +2738,21 @@ ProjectMethodEmission appendMethod(
     const MetadataModel& metadata,
     const TypeModel* owner,
     const TypeDeclarationInfo& declaringType,
+    const TypeAccessibilityIndex* accessibilityIndex,
+    const EmittedNamePlan* emittedNames,
     const MethodBodyAdapter& bodyAdapter,
-    std::set<std::string>& emittedSupport,
+    std::map<std::string, std::string>& emittedSupport,
     const std::string& indentation) {
-    const auto declaration = methodDeclaration(entry, name, typeName, parameters, metadata, declaringType);
+    const auto declaration = methodDeclaration(entry, name, typeName, parameters, metadata,
+                                               declaringType, accessibilityIndex, emittedNames);
     ProjectMethodEmission emission;
     emission.address = entry.function->address;
     emission.name = name;
+    emission.imageName = methodImageName(entry, owner);
     emission.declarationPartial = declaration.partialMetadata;
+    if (!declaration.visibilityReason.empty()) {
+        output << indentation << "// Partial recovery: " << declaration.visibilityReason << ".\n";
+    }
     if (!declaration.signatureSupported) {
         output << indentation << "// Partial recovery: " << singleLine(declaration.signatureReason)
                << "; method at 0x" << hexAddress(entry.function->address) << " was not emitted.\n";
@@ -1896,15 +2770,30 @@ ProjectMethodEmission appendMethod(
         emission.reason = "managed declaration has no body";
         return emission;
     }
-    const auto body = bodyAdapter.emit(*entry.function, entry.method, metadata, owner, typeName);
+    const auto emittedReturnType = entry.method
+        ? qualifyShadowedType(managedReturnType(*entry.method, metadata, emittedNames),
+                              typeName, entry.method->imageName, metadata)
+        : std::string{};
+    auto body = bodyAdapter.emit(*entry.function, entry.method, metadata, owner, typeName,
+                                 emittedReturnType);
+    for (const auto& fragment : body.supportFragments) {
+        const auto existing = emittedSupport.find(fragment.key);
+        if (existing != emittedSupport.end() && existing->second != fragment.source) {
+            body = unsupportedBody("conflicting C# support helper for '" + fragment.key + "'");
+            break;
+        }
+    }
     emission.reason = body.diagnostic;
     emission.status = body.status == MethodBodyStatus::Supported ? ProjectMethodBodyStatus::Supported :
         body.status == MethodBodyStatus::Partial ? ProjectMethodBodyStatus::Partial :
         ProjectMethodBodyStatus::Unsupported;
     if (body.source.empty()) emission.status = ProjectMethodBodyStatus::Unsupported;
-    if (!body.support.empty() && emittedSupport.insert(body.support).second) {
-        appendIndented(output, body.support, indentation);
-        output << '\n';
+    for (const auto& fragment : body.supportFragments) {
+        if (fragment.source.empty()) continue;
+        if (emittedSupport.emplace(fragment.key, fragment.source).second) {
+            appendIndented(output, fragment.source, indentation);
+            output << '\n';
+        }
     }
     output << indentation << declaration.signature << '\n';
     output << indentation << "{\n";
@@ -2005,8 +2894,16 @@ ProjectWriteReport ProjectWriter::write(
     const MetadataIndex index(metadata);
     const auto attributeBlobs = indexAttributeBlobs(metadata);
     const std::set<std::string> includedImages(options_.includedImages.begin(), options_.includedImages.end());
+    // netstandard2.1 supplies the core System types and compiler-required
+    // attributes. Re-emitting old mscorlib declarations into that project
+    // shadows those real framework types with incomplete metadata shells.
+    const bool frameworkCoreTypes = options_.includeExternalDeclarations &&
+        !includedImages.empty() && !includedImages.contains("mscorlib.dll") &&
+        (options_.targetFramework.empty() || options_.targetFramework == "netstandard2.1");
+    std::optional<TypeAccessibilityIndex> accessibilityIndex;
+    if (options_.includeExternalDeclarations) accessibilityIndex.emplace(metadata, frameworkCoreTypes);
     std::vector<bool> includedTypes(metadata.types.size(), true);
-    if (!includedImages.empty()) {
+    if (!includedImages.empty() && !options_.includeExternalDeclarations) {
         for (size_t index = 0; index < metadata.types.size(); ++index) {
             const auto& type = metadata.types[index];
             bool hasImageEvidence = !type.imageName.empty();
@@ -2020,6 +2917,10 @@ ProjectWriteReport ProjectWriter::write(
             }
             includedTypes[index] = included || !hasImageEvidence;
         }
+    } else if (frameworkCoreTypes) {
+        for (size_t index = 0; index < metadata.types.size(); ++index) {
+            if (metadata.types[index].imageName == "mscorlib.dll") includedTypes[index] = false;
+        }
     }
 
     // A single metadata corpus can contain assemblies declaring different
@@ -2031,9 +2932,30 @@ ProjectWriteReport ProjectWriter::write(
         const auto& type = metadata.types[index];
         groups[index].metadataTypes.push_back(&type);
     }
+    std::vector<ProjectMethodEmission> filteredBodies;
     for (const auto& function : functions) {
         const auto location = index.find(function);
-        if (location && !includedTypes[location->first]) continue;
+        if (options_.includeExternalDeclarations && !includedImages.empty()) {
+            const MethodModel* matchedMethod = nullptr;
+            const TypeModel* matchedType = nullptr;
+            if (location) {
+                matchedType = &metadata.types[location->first];
+                matchedMethod = &matchedType->methods[location->second];
+            }
+            const std::string image = matchedMethod && !matchedMethod->imageName.empty()
+                ? matchedMethod->imageName
+                : matchedType ? matchedType->imageName : std::string{};
+            if (!includedImages.contains(image)) {
+                filteredBodies.push_back({function.address, function.name, ProjectMethodBodyStatus::Omitted,
+                    frameworkCoreTypes && image == "mscorlib.dll"
+                        ? "native body filtered; core type supplied by target framework"
+                        : "native body filtered; metadata declaration retained when available",
+                    true, image});
+                continue;
+            }
+        } else if (location && !includedTypes[location->first]) {
+            continue;
+        }
         size_t key = metadata.types.size();
         const MethodModel* method = nullptr;
         if (location) {
@@ -2050,13 +2972,21 @@ ProjectWriteReport ProjectWriter::write(
         entry.definitionIndex = method ? method->definitionIndex : -1;
         groups[key].methods.push_back(std::move(entry));
     }
+    const EmittedNamePlan emittedNames(metadata, groups);
 
     std::vector<std::filesystem::path> sourceFiles;
     const auto runtimePath = outputDirectory / "RuntimeSupport.cs";
     sourceFiles.push_back(runtimePath);
     writeFile(runtimePath, generateRuntimeSupport(functions.empty() ? Architecture::X64 : functions.front().architecture));
 
-    const MethodBodyAdapter bodyAdapter(metadata);
+    // In full-declarations mode, an emitted managed call needs an exact,
+    // callable member in this project's output. Until a member has been
+    // validated against its final declaration and body, the surface is empty
+    // and the native call remains partial instead of binding a guessed name.
+    ManagedEmissionSurface emissionSurface;
+    emissionSurface.source = &metadata;
+    const MethodBodyAdapter bodyAdapter(metadata, options_.genericMethodInfoEvidence.get(),
+        options_.includeExternalDeclarations ? &emissionSurface : nullptr);
     ProjectWriteReport report;
     const auto record = [&report](ProjectMethodEmission emission) {
         switch (emission.status) {
@@ -2068,42 +2998,24 @@ ProjectWriteReport ProjectWriter::write(
         }
         report.methods.push_back(std::move(emission));
     };
-    std::set<std::pair<std::string, std::string>> usedTypeNames;
+    for (auto& filtered : filteredBodies) record(std::move(filtered));
     std::set<std::string> usedFilePaths;
     for (auto& [key, group] : groups) {
         const bool unmatched = key == metadata.types.size();
         const std::string sourceNamespace = unmatched ? "Il2CppRecovered" : metadata.types[key].nameSpace;
-        const std::string sourceName = unmatched ? "UnmatchedMethods" : metadata.types[key].name;
         auto& methods = group.methods;
         std::sort(methods.begin(), methods.end(), [](const MethodEntry& left, const MethodEntry& right) {
             return std::tie(left.metadataName, left.baseName, left.token, left.definitionIndex, left.function->address, left.function->name) <
                    std::tie(right.metadataName, right.baseName, right.token, right.definitionIndex, right.function->address, right.function->name);
         });
 
-        const TypeModel* nestedParent = nullptr;
-        if (group.metadataTypes.size() == 1) {
-            const auto* child = group.metadataTypes.front();
-            if (child->declaringTypeIndex >= 0 &&
-                static_cast<size_t>(child->declaringTypeIndex) < metadata.types.size()) {
-                const auto& parent = metadata.types[static_cast<size_t>(child->declaringTypeIndex)];
-                const bool simpleParent = parent.declaringTypeIndex < 0 && parent.genericContainerIndex < 0 &&
-                    parent.nameSpace == child->nameSpace && parent.name.find('`') == std::string::npos;
-                const auto duplicates = std::count_if(metadata.types.begin(), metadata.types.end(), [&](const TypeModel& candidate) {
-                    return candidate.declaringTypeIndex < 0 && candidate.nameSpace == parent.nameSpace &&
-                           candidate.name == parent.name;
-                });
-                if (simpleParent && duplicates == 1 &&
-                    (parent.flags & 0x20) == 0 && (parent.bitfield & 0x2) == 0) nestedParent = &parent;
-            }
-        }
+        const TypeModel* nestedParent = group.metadataTypes.size() == 1
+            ? emittedNestedParent(metadata, *group.metadataTypes.front()) : nullptr;
+        const auto& namePlan = emittedNames.at(key);
         const bool staticType = isStaticType(group, unmatched);
         auto declaringType = typeDeclaration(group.metadataTypes.empty() ? nullptr : group.metadataTypes.front(),
                                              staticType, nestedParent != nullptr);
-        const auto generic = group.metadataTypes.empty() ? GenericDeclarationInfo{} : genericDeclaration(
-            metadata,
-            group.metadataTypes.front()->genericContainerIndex,
-            false,
-            declaringType.kind == ManagedTypeKind::Interface);
+        const auto& generic = namePlan.generic;
         declaringType.partialMetadata = declaringType.partialMetadata || generic.partialMetadata;
         if (declaringType.kind == ManagedTypeKind::Enum && !generic.parameters.empty()) {
             // CLR/C# enums cannot be generic. Conflicting metadata still has a
@@ -2116,11 +3028,8 @@ ProjectWriteReport ProjectWriter::write(
         }
 
         const auto parts = namespaceParts(sourceNamespace);
-        const auto nameSpace = join(parts, ".");
-        const auto typeName = uniqueTypeName(
-            nameSpace,
-            safeName(genericTypeBaseName(sourceName, generic), "UnnamedType"),
-            usedTypeNames);
+        const auto& nameSpace = namePlan.nameSpace;
+        const auto& typeName = namePlan.typeName;
         std::filesystem::path directory = outputDirectory;
         for (const auto& part : parts) directory /= part;
         std::filesystem::create_directories(directory);
@@ -2151,6 +3060,7 @@ ProjectWriteReport ProjectWriter::write(
         output << typeIndent << declaringType.visibility << " " << declaringType.modifiers;
         if (declaringType.kind != ManagedTypeKind::Enum) output << "unsafe partial ";
         output << typeKindName(declaringType.kind) << " " << typeName << generic.parameters;
+        std::optional<std::string> enumUnderlyingType;
         if (declaringType.kind == ManagedTypeKind::Enum) {
             const auto valueField = std::find_if(group.metadataTypes.front()->fields.begin(), group.metadataTypes.front()->fields.end(), [](const FieldModel& field) {
                 return field.name == "value__";
@@ -2162,6 +3072,7 @@ ProjectWriteReport ProjectWriter::write(
                 };
                 if (integralTypes.contains(underlying)) {
                     output << " : " << underlying;
+                    enumUnderlyingType = underlying;
                 } else {
                     declaringType.partialMetadata = true;
                 }
@@ -2172,6 +3083,9 @@ ProjectWriteReport ProjectWriter::write(
         output << "\n" << typeIndent << "{\n";
         if (declaringType.partialMetadata) {
             output << bodyIndent << "// Partial recovery: native type flags or layout are unavailable or unsupported.\n";
+        }
+        if (generic.omittedConstraint) {
+            output << bodyIndent << "// Partial recovery: generic constraint omitted because its emitted type arity does not match metadata.\n";
         }
         if (!group.metadataTypes.empty()) {
             if (const auto blobSize = attributeBlobSize(attributeBlobs,
@@ -2189,8 +3103,18 @@ ProjectWriteReport ProjectWriter::write(
                 if (!first) output << '\n';
                 first = false;
                 const auto fieldName = uniqueFieldName(field, typeName, fieldNames);
-                const auto fieldType = managedTypeName(field.type, metadata, type->imageName);
-                if (hasUnresolvedGenericArity(field.type, metadata) || !supportedCSharpType(fieldType)) {
+                const auto fieldType = qualifyShadowedType(
+                    managedTypeName(field.type, metadata, type->imageName, &emittedNames),
+                    typeName, type->imageName, metadata);
+                if (accessibilityIndex && !field.type.starts_with("type[") &&
+                    accessibilityIndex->hasAmbiguousType(fieldType, type->imageName)) {
+                    output << bodyIndent << "// Partial recovery: field '" << fieldName
+                           << "' has ambiguous metadata type identity; member was not emitted.\n";
+                    continue;
+                }
+                if (hasUnresolvedGenericArity(field.type, metadata) ||
+                    (accessibilityIndex && accessibilityIndex->hasUnboundGenericName(field.type, type->imageName)) ||
+                    !supportedCSharpType(fieldType)) {
                     output << bodyIndent << "// Partial recovery: field '" << fieldName
                            << "' has unresolved C# type syntax; member was not emitted.\n";
                     continue;
@@ -2200,6 +3124,31 @@ ProjectWriteReport ProjectWriter::write(
                            << " bytes; constructor and arguments are not decoded.\n";
                 }
                 auto declaration = fieldDeclaration(field);
+                if (accessibilityIndex && declaringType.visibility == "public" &&
+                    (accessibilityIndex->hasInternalType(fieldType, type->imageName) ||
+                     accessibilityIndex->hasInternalTypeReference(field.type, metadata) ||
+                     emittedNames.isInternal(field.type, type->imageName, metadata) ||
+                     emittedNames.isInternalEmitted(fieldType, type->imageName))) {
+                    const auto originalVisibility = memberVisibility(field.flags);
+                    const auto narrowed = compilerVisibility(originalVisibility, true);
+                    const auto prefix = originalVisibility + " ";
+                    if (narrowed != originalVisibility && declaration.modifiers.starts_with(prefix)) {
+                        declaration.modifiers.replace(0, prefix.size(), narrowed + " ");
+                        output << bodyIndent << "// Partial recovery: C# visibility narrowed from "
+                               << originalVisibility << " to " << narrowed
+                               << " because the field type is internal.\n";
+                    }
+                }
+                if (declaringType.modifiers == "static ") {
+                    const auto originalVisibility = memberVisibility(field.flags);
+                    const auto narrowed = staticClassVisibility(originalVisibility, declaringType);
+                    const auto prefix = originalVisibility + " ";
+                    if (narrowed != originalVisibility && declaration.modifiers.starts_with(prefix)) {
+                        declaration.modifiers.replace(0, prefix.size(), narrowed + " ");
+                        output << bodyIndent << "// Partial recovery: protected field visibility narrowed to "
+                               << narrowed << " because the containing class is static.\n";
+                    }
+                }
                 if (declaringType.kind == ManagedTypeKind::Class && declaringType.modifiers == "static " &&
                     !declaration.isStatic && !declaration.literal) {
                     declaration.isStatic = true;
@@ -2209,8 +3158,10 @@ ProjectWriteReport ProjectWriter::write(
                 const auto defaultValue = fieldDefaultValue(field, metadata);
                 if (declaringType.kind == ManagedTypeKind::Enum) {
                     if (field.name == "value__") continue;
-                    if (defaultValue) {
-                        output << bodyIndent << fieldName << " = " << *defaultValue << ",\n";
+                    const auto enumValue = enumUnderlyingType
+                        ? enumMemberLiteral(field, *enumUnderlyingType, metadata) : std::nullopt;
+                    if (enumValue) {
+                        output << bodyIndent << fieldName << " = " << *enumValue << ",\n";
                     } else {
                         output << bodyIndent << "// Partial recovery: constant value for '" << fieldName
                                << "' is unavailable; the member was not emitted.\n";
@@ -2263,7 +3214,9 @@ ProjectWriteReport ProjectWriter::write(
                         output << bodyIndent << "// Custom attribute blob: " << *blobSize
                                << " bytes; constructor and arguments are not decoded.\n";
                     }
-                    if (appendProperty(output, *type, property, metadata, declaringType, name, bodyIndent,
+                    if (appendProperty(output, *type, property, metadata, declaringType,
+                                       accessibilityIndex ? &*accessibilityIndex : nullptr, &emittedNames,
+                                       name, bodyIndent,
                                        reservedMethodDefinitions)) {
                         fieldNames.insert(name);
                         if (property.get >= 0) reservedAccessorNames.insert("get_" + property.name);
@@ -2298,7 +3251,9 @@ ProjectWriteReport ProjectWriter::write(
                         output << bodyIndent << "// Custom attribute blob: " << *blobSize
                                << " bytes; constructor and arguments are not decoded.\n";
                     }
-                    if (appendEvent(output, *type, event, metadata, declaringType, name, bodyIndent,
+                    if (appendEvent(output, *type, event, metadata, declaringType,
+                                    accessibilityIndex ? &*accessibilityIndex : nullptr, &emittedNames,
+                                    name, bodyIndent,
                                     reservedMethodDefinitions)) {
                         fieldNames.insert(name);
                         reservedAccessorNames.insert("add_" + event.name);
@@ -2313,9 +3268,10 @@ ProjectWriteReport ProjectWriter::write(
 
         std::set<std::string> usedMethodSignatures;
         std::set<std::string> usedConstructors;
-        std::set<std::string> emittedSupport;
+        std::map<std::string, std::string> emittedSupport;
         for (const auto& entry : methods) {
-            const auto parameters = entry.method ? parameterList(*entry.method, metadata) : "()";
+            const auto parameters = entry.method
+                ? parameterList(*entry.method, metadata, true, &emittedNames) : "()";
             const auto signatureKey = parameterSignatureKey(entry.method, metadata);
             if (isConstructor(entry.method)) {
                 const auto constructorKey = entry.method->name + signatureKey;
@@ -2325,7 +3281,8 @@ ProjectWriteReport ProjectWriter::write(
                     output << bodyIndent << "// Unsupported duplicate constructor at 0x"
                            << hexAddress(entry.function->address) << ".\n";
                     record({entry.function->address, typeName, ProjectMethodBodyStatus::Omitted,
-                            "duplicate constructor signature", true});
+                            "duplicate constructor signature", true,
+                            methodImageName(entry, group.metadataTypes.empty() ? nullptr : group.metadataTypes.front())});
                     continue;
                 }
                 if (!first) output << '\n';
@@ -2334,12 +3291,14 @@ ProjectWriteReport ProjectWriter::write(
                     output << bodyIndent << "// Unsupported static constructor parameters at 0x"
                            << hexAddress(entry.function->address) << ".\n";
                     record({entry.function->address, typeName, ProjectMethodBodyStatus::Omitted,
-                            "static constructor has parameters", true});
+                            "static constructor has parameters", true,
+                            methodImageName(entry, group.metadataTypes.empty() ? nullptr : group.metadataTypes.front())});
                     continue;
                 }
                 record(appendMethod(output, entry, typeName, typeName, parameters, metadata,
                                     group.metadataTypes.empty() ? nullptr : group.metadataTypes.front(),
-                                    declaringType, bodyAdapter, emittedSupport, bodyIndent));
+                                    declaringType, accessibilityIndex ? &*accessibilityIndex : nullptr,
+                                    &emittedNames, bodyAdapter, emittedSupport, bodyIndent));
                 continue;
             }
 
@@ -2365,9 +3324,38 @@ ProjectWriteReport ProjectWriter::write(
                 output << bodyIndent << "// Generated method metadata token: 0x"
                        << hexAddress(entry.token) << ".\n";
             }
-            record(appendMethod(output, entry, functionName, typeName, parameters, metadata,
-                                group.metadataTypes.empty() ? nullptr : group.metadataTypes.front(),
-                                declaringType, bodyAdapter, emittedSupport, bodyIndent));
+            auto emitted = appendMethod(output, entry, functionName, typeName, parameters, metadata,
+                                        group.metadataTypes.empty() ? nullptr : group.metadataTypes.front(),
+                                        declaringType, accessibilityIndex ? &*accessibilityIndex : nullptr,
+                                        &emittedNames, bodyAdapter, emittedSupport, bodyIndent);
+            // Only a completed, accessible declaration already written to
+            // this project's source can become a managed-call target for
+            // later methods. Forward calls and uncertain signatures stay
+            // native; the surface grows monotonically in emission order.
+            if (options_.includeExternalDeclarations && entry.method && !unmatched && !nestedParent &&
+                emitted.status == ProjectMethodBodyStatus::Supported && !emitted.declarationPartial &&
+                !declaringType.partialMetadata && generic.parameters.empty() &&
+                entry.method->genericContainerIndex < 0 &&
+                (declaringType.visibility == "public" || declaringType.visibility == "internal")) {
+                const auto flags = nativeFlags(*entry.method);
+                if (flags && ((*flags & 0x7) == 3 || (*flags & 0x7) == 6) &&
+                    ((*flags & 0x10) != 0) == entry.method->isStatic) {
+                    const auto& sourceType = metadata.types[key];
+                    ManagedEmittedMember member;
+                    member.imageName = entry.method->imageName;
+                    member.metadataDeclaringType = entry.method->declaringType.empty()
+                        ? (sourceType.nameSpace.empty() ? sourceType.name
+                           : sourceType.nameSpace + "." + sourceType.name)
+                        : entry.method->declaringType;
+                    member.metadataMethodName = entry.method->name;
+                    member.emittedDeclaringType = nameSpace.empty() ? typeName : nameSpace + "." + typeName;
+                    member.emittedName = functionName;
+                    member.isStatic = entry.method->isStatic;
+                    member.bodyAvailable = true;
+                    emissionSurface.byDefinitionIndex[entry.definitionIndex].push_back(std::move(member));
+                }
+            }
+            record(std::move(emitted));
         }
         output << typeIndent << "}\n";
         if (nestedParent) output << outerIndent << "}\n";

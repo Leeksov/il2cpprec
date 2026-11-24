@@ -282,14 +282,16 @@ public:
         prepare();
         std::ostringstream declarations;
         std::ostringstream body;
-        emitDeclarations(declarations, 1, options_.declareNativeParameters);
+        emitDeclarations(declarations, 1, options_.declareNativeParameters,
+                         options_.declareNativeParameters ? nullptr : &options_.externalNativeRegisters);
         emitStructured(body, 1);
         emitFinalReturn(body, 1);
 
         CSharpBodyEmissionResult result;
         result.declarations = declarations.str();
         result.body = body.str();
-        result.support = emitSupport();
+        result.supportFragments = emitSupportFragments();
+        for (const auto& fragment : result.supportFragments) result.support += fragment.source;
         result.diagnostics = diagnostics_;
         result.partial = partial_;
         return result;
@@ -1236,7 +1238,18 @@ private:
             output << indentation(level) << "return;\n";
             return;
         }
-        output << indentation(level) << "return " << convert(value, type, returnType_) << ";\n";
+        const auto converted = convert(value, type, returnType_);
+        if (!options_.managedReturnReferenceType.empty()) {
+            output << indentation(level) << "return RuntimeAbi.FromNativeReturn<"
+                   << options_.managedReturnReferenceType << ">(unchecked(("
+                   << typeName(nativePointerType_, pointerBits_) << ") ("
+                   << converted << ")));\n";
+        } else if (!options_.managedReturnCast.empty()) {
+            output << indentation(level) << "return unchecked((" << options_.managedReturnCast
+                   << ")(" << converted << "));\n";
+        } else {
+            output << indentation(level) << "return " << converted << ";\n";
+        }
     }
 
     void emitReturn(std::ostringstream& output, const Statement& statement, int level) {
@@ -1246,7 +1259,10 @@ private:
             output << indentation(level) << "return;\n";
         } else {
             diagnose(statement.address, "Return without a value in a value-returning function");
-            output << indentation(level) << "return default(" << typeName(returnType_, pointerBits_) << ");\n";
+            output << indentation(level) << "return default("
+                   << (!options_.managedReturnReferenceType.empty() ? options_.managedReturnReferenceType :
+                       options_.managedReturnCast.empty() ? typeName(returnType_, pointerBits_) : options_.managedReturnCast)
+                   << ");\n";
         }
     }
 
@@ -1401,15 +1417,26 @@ private:
         return false;
     }
 
-    void emitDeclarations(std::ostringstream& output, int level, bool includeNativeParameters) {
+    void emitDeclarations(std::ostringstream& output, int level, bool includeNativeParameters,
+                          const std::set<std::string>* externalNativeRegisters = nullptr) {
         std::set<std::string> parameters;
-        if (!includeNativeParameters) {
+        if (!includeNativeParameters && !externalNativeRegisters) {
             for (const auto& name : parameterRegisters()) parameters.insert(identifier(name));
+        }
+        std::set<std::string> nativeParameters;
+        if (externalNativeRegisters) {
+            for (const auto& name : parameterRegisters()) nativeParameters.insert(identifier(name));
+            for (const auto& name : *externalNativeRegisters) parameters.insert(identifier(name));
         }
         for (const auto& [name, info] : registers_) {
             if (parameters.contains(name)) continue;
             const auto type = info.conflict ? "__UnsupportedValue" : typeName(info.type, pointerBits_);
-            output << indentation(level) << type << ' ' << name << " = default(" << type << ");\n";
+            output << indentation(level) << type << ' ' << name;
+            if (externalNativeRegisters && nativeParameters.contains(name)) {
+                output << ";\n";
+            } else {
+                output << " = default(" << type << ");\n";
+            }
         }
     }
 
@@ -1480,7 +1507,10 @@ private:
         if (voidReturn_) {
             output << indentation(level) << "return;\n";
         } else {
-            output << indentation(level) << "return default(" << typeName(returnType_, pointerBits_) << ");\n";
+            output << indentation(level) << "return default("
+                   << (!options_.managedReturnReferenceType.empty() ? options_.managedReturnReferenceType :
+                       options_.managedReturnCast.empty() ? typeName(returnType_, pointerBits_) : options_.managedReturnCast)
+                   << ");\n";
         }
     }
 
@@ -1644,33 +1674,40 @@ private:
         return output.str();
     }
 
-    std::string emitSupport() const {
-        std::ostringstream output;
-        if (usesRuntimeVector128_) output << emitVectorSupport();
-        if (usesRuntimeVector128_ && !partial_ && !voidReturn_ && function_.exceptionRegions.empty()) return output.str();
-        output << "    public readonly struct __UnsupportedValue\n"
-               << "    {\n"
-               << "    }\n\n";
+    std::vector<CSharpBodyEmissionResult::SupportFragment> emitSupportFragments() const {
+        std::vector<CSharpBodyEmissionResult::SupportFragment> fragments;
+        if (usesRuntimeVector128_) fragments.push_back({"vector128", emitVectorSupport()});
+        if (usesRuntimeVector128_ && !partial_ && !voidReturn_ && function_.exceptionRegions.empty()) return fragments;
+        fragments.push_back({"unsupported-value", "    public readonly struct __UnsupportedValue\n"
+                                                  "    {\n"
+                                                  "    }\n\n"});
         if (!usesRuntimeVector128_) {
-            output << "    public readonly struct __UnsupportedVector128\n"
-                   << "    {\n"
-                   << "        public const int Bits = 128;\n"
-                   << "    }\n\n";
+            fragments.push_back({"unsupported-vector", "    public readonly struct __UnsupportedVector128\n"
+                                                        "    {\n"
+                                                        "        public const int Bits = 128;\n"
+                                                        "    }\n\n"});
         }
-        output << "    private sealed class __RecoveryUnsupportedException : global::System.Exception\n"
-               << "    {\n"
-               << "        public __RecoveryUnsupportedException(string message) : base(message)\n"
-               << "        {\n"
-               << "        }\n"
-               << "    }\n\n"
-               << "    private static T __Unsupported<T>(string operation, params object[] arguments)\n"
-               << "    {\n"
-               << "        throw new __RecoveryUnsupportedException(operation);\n"
-               << "    }\n\n"
-               << "    private static void __Discard<T>(T value)\n"
-               << "    {\n"
-               << "    }\n\n";
-        return output.str();
+        fragments.push_back({"unsupported-core",
+            "    private sealed class __RecoveryUnsupportedException : global::System.Exception\n"
+            "    {\n"
+            "        public __RecoveryUnsupportedException(string message) : base(message)\n"
+            "        {\n"
+            "        }\n"
+            "    }\n\n"
+            "    private static T __Unsupported<T>(string operation, params object[] arguments)\n"
+            "    {\n"
+            "        throw new __RecoveryUnsupportedException(operation);\n"
+            "    }\n\n"
+            "    private static void __Discard<T>(T value)\n"
+            "    {\n"
+            "    }\n\n"});
+        return fragments;
+    }
+
+    std::string emitSupport() const {
+        std::string result;
+        for (const auto& fragment : emitSupportFragments()) result += fragment.source;
+        return result;
     }
 };
 

@@ -104,22 +104,54 @@ def summarize_cli(report: dict[str, Any], image: str) -> dict[str, Any]:
     emitted = emission.get("methods")
     if not isinstance(emitted, list):
         raise ValueError("project emission has no method list")
-    emission_counts = Counter()
+    emission_counts: Counter[str] = Counter()
     emission_reasons: Counter[str] = Counter()
+    image_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    image_reasons: dict[str, Counter[str]] = defaultdict(Counter)
+    explicit_images = any(isinstance(method, dict) and "image" in method for method in emitted)
     for method in emitted:
         if not isinstance(method, dict) or method.get("status") not in EMISSION_STATUSES:
             raise ValueError("project emission contains an invalid method status")
         status = method["status"]
         emission_counts[status] += 1
+        if explicit_images:
+            emitted_image = method.get("image")
+            if not isinstance(emitted_image, str) or not emitted_image.strip():
+                raise ValueError("project emission requires a nonempty image for every method")
+            image_counts[emitted_image][status] += 1
         reason = method.get("reason")
         if status != "supported" and isinstance(reason, str) and reason:
-            emission_reasons[f"{status}: {reason_group(reason)}"] += 1
+            grouped = f"{status}: {reason_group(reason)}"
+            emission_reasons[grouped] += 1
+            if explicit_images:
+                image_reasons[emitted_image][grouped] += 1
     for status in EMISSION_STATUSES:
         field = "declarationOnly" if status == "declaration-only" else status
         if nonnegative(emission.get(field), f"projectEmission.{field}") != emission_counts[status]:
             raise ValueError(f"project emission {status} count disagrees with method list")
-    if len(emitted) != target["exact"]:
-        raise ValueError("project emission does not cover each native-exact method of target image")
+    if explicit_images:
+        attribution = "explicit-image"
+        target_emission = image_counts.get(image, Counter())
+        target_reasons = image_reasons.get(image, Counter())
+    else:
+        # Older reports are attributable only when the writer emitted exactly
+        # the native-exact methods in the sole requested image. Address reuse
+        # across assemblies is never used as a substitute for image identity.
+        if report.get("options", {}).get("fullDeclarations") or len(emitted) != target["exact"]:
+            raise ValueError("project emission lacks per-method image identity for this scope")
+        attribution = "legacy-filter"
+        target_emission = emission_counts
+        target_reasons = emission_reasons
+        image_counts[image] = emission_counts
+        image_reasons[image] = emission_reasons
+    if sum(target_emission.values()) != target["exact"]:
+        raise ValueError("target-image project emission does not cover each native-exact method")
+
+    def emitted_summary(counts: Counter[str], reasons: Counter[str]) -> dict[str, Any]:
+        return {"methods": sum(counts.values()), "supported": counts["supported"],
+                "partial": counts["partial"], "unsupported": counts["unsupported"],
+                "declarationOnly": counts["declaration-only"], "omitted": counts["omitted"],
+                "reasons": counted_rows(reasons)}
 
     return {
         "allMethods": {"total": len(methods), "exact": totals["exact"],
@@ -131,12 +163,11 @@ def summarize_cli(report: dict[str, Any], image: str) -> dict[str, Any]:
                     "exact": counts["exact"], "partial": counts["partial"],
                     "errors": counts["error"]}
                    for name, counts in sorted(by_image.items())],
-        "csharp": {"scope": "native-exact-inputs", "methods": len(emitted),
-                   "supported": emission_counts["supported"], "partial": emission_counts["partial"],
-                   "unsupported": emission_counts["unsupported"],
-                   "declarationOnly": emission_counts["declaration-only"],
-                   "omitted": emission_counts["omitted"],
-                   "reasons": counted_rows(emission_reasons)},
+        "csharp": {"scope": "target-image", "attribution": attribution,
+                   **emitted_summary(target_emission, target_reasons)},
+        "csharpAllImages": {"scope": "native-exact-inputs", **emitted_summary(emission_counts, emission_reasons),
+                             "images": [{"name": name, **emitted_summary(counts, image_reasons.get(name, Counter()))}
+                                        for name, counts in sorted(image_counts.items())]},
         "profile": {key: report.get("sourceProfile", {}).get(key)
                     for key in ("id", "variant", "confidence", "selectionMode")},
     }

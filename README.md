@@ -21,7 +21,10 @@ If CMake cannot find Capstone, set `CAPSTONE_ROOT` or both `CAPSTONE_INCLUDE_DIR
 ```sh
 ./build/il2cpprec_cli --inspect path/to/libil2cpp.so --metadata path/to/global-metadata.dat
 ./build/il2cpprec_cli --binary path/to/libil2cpp.so --metadata path/to/global-metadata.dat --output-dir build/recovered --report build/recovery.json
+./build/il2cpprec_cli --binary path/to/libil2cpp.so --metadata path/to/global-metadata.dat --include-images Assembly-CSharp.dll --full-declarations --output-dir build/game-recovered --report build/game-recovery.json --verify
 ```
+
+`--full-declarations` retains metadata declarations from other assemblies so a filtered game's C# project can resolve cross-assembly types. `--include-images` selects which assemblies receive recovered method bodies; without it, bodies from all assemblies are considered. The JSON report distinguishes native `exact` recovery from C# emission status (`supported`, `partial`, `unsupported`, or `omitted`). A compiler pass and `--verify` findings are useful checks, but do not establish semantic equivalence.
 
 Run `./build/il2cpprec_cli --help` for architecture, filtering, version, and recovery options.
 
@@ -29,7 +32,7 @@ Run `./build/il2cpprec_cli --help` for architecture, filtering, version, and rec
 
 `ctest` runs the core suite. Additional acceptance and differential runners are in `tests/acceptance` and `tests/differential`; some scenarios need .NET or user-supplied game binaries. Those binaries, local analysis, generated projects, and build outputs are excluded from this repository.
 
-Known issue: the synthetic acceptance scenario currently fails while reading its generated metadata fixture. It is not part of `ctest`.
+The synthetic acceptance scenario is provisional: it checks method resolution and metadata handling, not native behavioral equivalence.
 
 ## Status
 

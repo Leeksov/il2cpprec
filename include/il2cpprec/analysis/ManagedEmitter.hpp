@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <il2cpprec/abi/AbiAdapter.hpp>
@@ -13,6 +14,29 @@ namespace il2cpprec {
 
 class UniversalGenericResolver;
 
+enum class ManagedEmittedMemberSyntax {
+    Method,
+    PropertyGet,
+    PropertySet
+};
+
+struct ManagedEmittedMember {
+    std::string imageName;
+    std::string metadataDeclaringType;
+    std::string metadataMethodName;
+    std::string emittedDeclaringType;
+    std::string emittedName;
+    ManagedEmittedMemberSyntax syntax = ManagedEmittedMemberSyntax::Method;
+    bool isStatic = false;
+    // False for an omitted declaration or an emitted diagnostic stub.
+    bool bodyAvailable = false;
+};
+
+struct ManagedEmissionSurface {
+    const MetadataModel* source = nullptr;
+    std::unordered_map<int, std::vector<ManagedEmittedMember>> byDefinitionIndex;
+};
+
 struct ManagedEmitterOptions {
     ManagedTargetProfile profile;
     ManagedPatternOptions patterns;
@@ -22,6 +46,9 @@ struct ManagedEmitterOptions {
     // A metadata clone or changed ABI policy uses a local adapter instead.
     const AbiAdapter* abiAdapter = nullptr;
     const MetadataModel* abiAdapterSource = nullptr;
+    // When supplied, only uniquely matching, callable emitted members may
+    // replace native calls. Null preserves standalone analyzer behavior.
+    const ManagedEmissionSurface* emissionSurface = nullptr;
     // Optional resolver built for exactly this MetadataModel. An emitter that
     // clones metadata for discovery ignores it and builds a local resolver.
     const UniversalGenericResolver* universalGenerics = nullptr;
