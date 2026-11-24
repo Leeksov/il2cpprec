@@ -8,9 +8,18 @@
 #include <charconv>
 #include <cmath>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 namespace il2cpprec {
+struct AbiTypeNameIndex {
+    std::unordered_map<std::string, size_t> qualified;
+    std::unordered_map<std::string, std::optional<size_t>> unqualified;
+
+    explicit AbiTypeNameIndex(const MetadataModel& metadata);
+    const TypeModel* find(std::string_view name, const MetadataModel& metadata) const;
+};
+
 namespace {
 
 constexpr const char* unsupportedAbiHelper = "RuntimeCalls.UnsupportedAbi";
@@ -93,7 +102,9 @@ std::string normalizedTypeName(std::string_view type) {
     return trim(result);
 }
 
-const TypeModel* findTypeDefinition(std::string_view name, const MetadataModel& metadata) {
+const TypeModel* findTypeDefinition(
+    std::string_view name, const MetadataModel& metadata, const AbiTypeNameIndex* index) {
+    if (index) return index->find(name, metadata);
     const auto normalized = normalizedTypeName(name);
     const TypeModel* unqualifiedMatch = nullptr;
     bool ambiguous = false;
@@ -111,7 +122,8 @@ ClassifiedType classifyType(
     std::string type,
     const MetadataModel& metadata,
     uint16_t pointerBits,
-    bool emptyIsVoid);
+    bool emptyIsVoid,
+    const AbiTypeNameIndex* typeIndex);
 
 ClassifiedType classifyDefinition(const TypeModel& definition, uint16_t pointerBits) {
     const auto name = normalizedTypeName(qualifiedName(definition));
@@ -128,20 +140,21 @@ ClassifiedType classifyTypeReference(
     const MetadataModel& metadata,
     uint16_t pointerBits,
     bool emptyIsVoid,
+    const AbiTypeNameIndex* typeIndex,
     size_t depth = 0) {
     if (index >= metadata.typeReferences.size() || depth > 64) return {};
     const auto& reference = metadata.typeReferences[index];
     if (reference.byRef) return {AbiValueKind::Pointer, ScalarType::pointer(pointerBits), pointerBits};
     const auto code = static_cast<Il2CppTypeCode>(reference.code);
     if (auto primitive = TypeSystem::primitiveType(code)) {
-        return classifyType(*primitive, metadata, pointerBits, emptyIsVoid);
+        return classifyType(*primitive, metadata, pointerBits, emptyIsVoid, typeIndex);
     }
 
     const auto definition = [&]() -> const TypeModel* {
         if (reference.definitionIndex >= 0 && static_cast<size_t>(reference.definitionIndex) < metadata.types.size()) {
             return &metadata.types[static_cast<size_t>(reference.definitionIndex)];
         }
-        return findTypeDefinition(reference.name, metadata);
+        return findTypeDefinition(reference.name, metadata, typeIndex);
     };
     switch (code) {
     case Il2CppTypeCode::Ptr:
@@ -162,7 +175,7 @@ ClassifiedType classifyTypeReference(
         return {};
     case Il2CppTypeCode::ValueType: {
         const auto* type = definition();
-        return classifyType(type ? qualifiedName(*type) : reference.name, metadata, pointerBits, emptyIsVoid);
+        return classifyType(type ? qualifiedName(*type) : reference.name, metadata, pointerBits, emptyIsVoid, typeIndex);
     }
     case Il2CppTypeCode::Var:
     case Il2CppTypeCode::MVar: {
@@ -182,7 +195,7 @@ ClassifiedType classifyTypeReference(
     case Il2CppTypeCode::Pinned:
     case Il2CppTypeCode::TypeIndex:
         if (reference.elementTypeIndex < 0) return {};
-        return classifyTypeReference(static_cast<size_t>(reference.elementTypeIndex), metadata, pointerBits, emptyIsVoid, depth + 1);
+        return classifyTypeReference(static_cast<size_t>(reference.elementTypeIndex), metadata, pointerBits, emptyIsVoid, typeIndex, depth + 1);
     default:
         return {};
     }
@@ -217,7 +230,8 @@ ClassifiedType classifyType(
     std::string type,
     const MetadataModel& metadata,
     uint16_t pointerBits,
-    bool emptyIsVoid) {
+    bool emptyIsVoid,
+    const AbiTypeNameIndex* typeIndex) {
     type = trim(type);
     if (type.empty()) {
         if (emptyIsVoid) return {AbiValueKind::Void, {}, 0};
@@ -226,7 +240,7 @@ ClassifiedType classifyType(
 
     if (type.starts_with("global::")) type.erase(0, 8);
     if (const auto index = typeReferenceIndex(type); index && !metadata.typeReferences.empty()) {
-        return classifyTypeReference(*index, metadata, pointerBits, emptyIsVoid);
+        return classifyTypeReference(*index, metadata, pointerBits, emptyIsVoid, typeIndex);
     }
     for (const std::string_view prefix : {std::string_view("ref "), std::string_view("out "), std::string_view("in ")}) {
         if (type.starts_with(prefix)) {
@@ -298,7 +312,7 @@ ClassifiedType classifyType(
     if (type == "string" || type == "System.String" || type == "object" || type == "System.Object") {
         return {AbiValueKind::ObjectReference, ScalarType::pointer(pointerBits), pointerBits};
     }
-    if (const auto* definition = findTypeDefinition(type, metadata)) {
+    if (const auto* definition = findTypeDefinition(type, metadata, typeIndex)) {
         return classifyDefinition(*definition, pointerBits);
     }
     return {};
@@ -339,10 +353,11 @@ public:
         Architecture architecture,
         const AbiAdapterOptions& options,
         AbiBindingModel& output,
-        bool requireBlittable = false)
+        bool requireBlittable = false,
+        const AbiTypeNameIndex* typeIndex = nullptr)
         : method_(method), metadata_(metadata), architecture_(architecture), options_(options), output_(output),
           pointerBits_(pointerBitsFor(architecture)), pointerType_(ScalarType::pointer(pointerBits_)),
-          requireBlittable_(requireBlittable) {
+          requireBlittable_(requireBlittable), typeIndex_(typeIndex) {
         switch (architecture_) {
         case Architecture::Arm64:
         case Architecture::Arm32:
@@ -364,7 +379,7 @@ public:
 
     void addParameter(size_t index) {
         const auto& parameter = method_.parameters[index];
-        const auto type = classifyType(parameter.type, metadata_, pointerBits_, false);
+        const auto type = classifyType(parameter.type, metadata_, pointerBits_, false, typeIndex_);
         const auto managedName = parameter.name.empty() ? "param" + std::to_string(index) : parameter.name;
         addBinding(
             AbiValueRole::Parameter,
@@ -388,7 +403,7 @@ public:
     void setReturn() {
         auto& result = output_.returnValue;
         result.managedType = method_.returnType.empty() ? "void" : method_.returnType;
-        const auto type = classifyType(method_.returnType, metadata_, pointerBits_, true);
+        const auto type = classifyType(method_.returnType, metadata_, pointerBits_, true, typeIndex_);
         result.valueKind = type.kind;
         result.scalarType = type.scalar;
         result.genericParameter = type.genericParameter;
@@ -432,6 +447,7 @@ private:
     uint16_t pointerBits_;
     ScalarType pointerType_;
     bool requireBlittable_ = false;
+    const AbiTypeNameIndex* typeIndex_ = nullptr;
     size_t gpIndex_ = 0;
     size_t fpIndex_ = 0;
     size_t vfpIndex_ = 0;
@@ -817,6 +833,32 @@ void setUnsupportedReturn(AbiBindingModel& model) {
 
 } // namespace
 
+AbiTypeNameIndex::AbiTypeNameIndex(const MetadataModel& metadata) {
+    qualified.reserve(metadata.types.size());
+    unqualified.reserve(metadata.types.size());
+    for (size_t index = 0; index < metadata.types.size(); ++index) {
+        const auto& type = metadata.types[index];
+        qualified.try_emplace(normalizedTypeName(qualifiedName(type)), index);
+        auto [entry, inserted] = unqualified.try_emplace(normalizedTypeName(type.name), index);
+        if (!inserted) entry->second.reset();
+    }
+}
+
+const TypeModel* AbiTypeNameIndex::find(std::string_view name, const MetadataModel& metadata) const {
+    const auto normalized = normalizedTypeName(name);
+    if (const auto found = qualified.find(normalized); found != qualified.end() &&
+        found->second < metadata.types.size()) {
+        const auto& type = metadata.types[found->second];
+        if (normalizedTypeName(qualifiedName(type)) == normalized) return &type;
+    }
+    if (const auto found = unqualified.find(normalized); found != unqualified.end() &&
+        found->second && *found->second < metadata.types.size()) {
+        const auto& type = metadata.types[*found->second];
+        if (normalizedTypeName(type.name) == normalized) return &type;
+    }
+    return nullptr;
+}
+
 AbiRuntimeProfile AbiRuntimeProfile::automatic() {
     return {};
 }
@@ -924,6 +966,10 @@ bool CallSiteAbiModel::supported() const {
 
 AbiAdapter::AbiAdapter(AbiAdapterOptions options) : options_(options) {}
 
+AbiAdapter::AbiAdapter(AbiAdapterOptions options, const MetadataModel& indexedMetadata)
+    : options_(std::move(options)), typeNameIndex_(std::make_shared<AbiTypeNameIndex>(indexedMetadata)),
+      indexedMetadata_(&indexedMetadata) {}
+
 AbiBindingModel AbiAdapter::bind(
     const MethodModel& method,
     const MetadataModel& metadata,
@@ -954,7 +1000,8 @@ AbiBindingModel AbiAdapter::bind(
         return result;
     }
 
-    BindingBuilder builder(method, metadata, architecture, options_, result);
+    const auto* typeIndex = indexedMetadata_ == &metadata ? typeNameIndex_.get() : nullptr;
+    BindingBuilder builder(method, metadata, architecture, options_, result, false, typeIndex);
     if (!method.isStatic) builder.addThis();
     for (size_t index = 0; index < method.parameters.size(); ++index) builder.addParameter(index);
     if (options_.methodInfo == MethodInfoArgumentPolicy::Append) builder.addMethodInfo();
@@ -1140,6 +1187,7 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
     auto callOptions = result.targetOptions;
     callOptions.methodInfo = result.methodInfoPolicy;
     result.targetOptions.methodInfo = result.methodInfoPolicy;
+    const auto* typeIndex = indexedMetadata_ == &metadata ? typeNameIndex_.get() : nullptr;
     if (reduced) {
         if (!result.runtimeProfile.unresolvedReducedSignatures) {
             addError(AbiDiagnosticCode::ProfileConflict, "The runtime profile does not permit reduced unresolved signatures");
@@ -1148,7 +1196,7 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
         }
         result.signature.reducedSignature = true;
         result.signature.omittedParameterCount = signatureMethod.parameters.size();
-        BindingBuilder builder(signatureMethod, metadata, architecture, callOptions, result.signature);
+        BindingBuilder builder(signatureMethod, metadata, architecture, callOptions, result.signature, false, typeIndex);
         if (!signatureMethod.isStatic) builder.addThis();
         if (result.methodInfoPolicy == MethodInfoArgumentPolicy::Append) builder.addMethodInfo();
         if (spec.returnType) {
@@ -1171,7 +1219,7 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
         invokerMethod.address = method.address;
         invokerMethod.isStatic = true;
         invokerMethod.returnType = result.runtimeProfile.invoker == AbiInvokerSignature::FiveArguments ? "void" : "void*";
-        BindingBuilder builder(invokerMethod, metadata, architecture, callOptions, result.signature);
+        BindingBuilder builder(invokerMethod, metadata, architecture, callOptions, result.signature, false, typeIndex);
         if (result.runtimeProfile.invoker != AbiInvokerSignature::LegacyThreeArguments) {
             builder.addPointer(AbiValueRole::MethodPointer, "__abi_method_pointer", "methodPointer", "Il2CppMethodPointer");
         }
@@ -1184,7 +1232,7 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
         builder.setReturn();
         if (!result.target) result.targetRuntimeHelper = "RuntimeCalls.GetInvokerMethod";
     } else {
-        BindingBuilder builder(signatureMethod, metadata, architecture, callOptions, result.signature, requireBlittable);
+        BindingBuilder builder(signatureMethod, metadata, architecture, callOptions, result.signature, requireBlittable, typeIndex);
         if (!signatureMethod.isStatic) builder.addThis();
         for (size_t index = 0; index < signatureMethod.parameters.size(); ++index) builder.addParameter(index);
         if (result.methodInfoPolicy == MethodInfoArgumentPolicy::Append) builder.addMethodInfo();

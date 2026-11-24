@@ -376,19 +376,30 @@ ManagedEmitResult ManagedEmitter::emit(
     const MetadataModel& metadata,
     const ManagedEmitterOptions& options) const {
     ManagedEmitResult result;
-    auto resolvedMetadata = metadata;
-    if (resolvedMetadata.version == 0 && resolvedMetadata.versionInfo.preciseVersion != 0) {
-        resolvedMetadata.version = resolvedMetadata.versionInfo.preciseVersion;
-    }
     const auto* binary = options.patterns.binary ? options.patterns.binary : options.dispatch.binary;
-    if (binary && resolvedMetadata.methodPointersByImage.empty()) discoverCodeGenModules(*binary, resolvedMetadata);
-    if (binary && resolvedMetadata.typeReferences.empty() && resolvedMetadata.metadataRegistrationAddress != 0) {
-        try {
-            MetadataRegistrationReader{}.read(*binary, resolvedMetadata);
-        } catch (const std::exception&) {
+    const bool needsVersion = metadata.version == 0 && metadata.versionInfo.preciseVersion != 0;
+    const bool needsModules = binary && metadata.methodPointersByImage.empty();
+    const bool needsRegistration = binary && metadata.typeReferences.empty() && metadata.metadataRegistrationAddress != 0;
+    std::optional<MetadataModel> ownedMetadata;
+    if (needsVersion || needsModules || needsRegistration) {
+        ownedMetadata.emplace(metadata);
+        if (needsVersion) ownedMetadata->version = ownedMetadata->versionInfo.preciseVersion;
+        if (needsModules) discoverCodeGenModules(*binary, *ownedMetadata);
+        if (needsRegistration) {
+            try {
+                MetadataRegistrationReader{}.read(*binary, *ownedMetadata);
+            } catch (const std::exception&) {
+            }
         }
     }
+    const MetadataModel& resolvedMetadata = ownedMetadata ? *ownedMetadata : metadata;
     auto patternOptions = options.patterns;
+    // A resolver supplied by the caller indexes the original MetadataModel.
+    // Discovery may change the clone's generic tables, so it must build its own.
+    if (ownedMetadata) {
+        patternOptions.genericResolver = nullptr;
+        patternOptions.metadataIndex = nullptr;
+    }
     auto dispatchOptions = options.dispatch;
     patternOptions.profile.genericAdjustorTargets.insert(options.profile.genericAdjustorTargets.begin(), options.profile.genericAdjustorTargets.end());
     patternOptions.profile.unresolvedVirtualCallStubs.insert(options.profile.unresolvedVirtualCallStubs.begin(), options.profile.unresolvedVirtualCallStubs.end());

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -12,6 +13,8 @@
 #include <il2cpprec/Model.hpp>
 
 namespace il2cpprec {
+
+class GenericMethodResolver;
 
 enum class ManagedOperationKind {
     StringLiteralReference,
@@ -78,6 +81,22 @@ struct ManagedTargetProfile {
     std::unordered_map<uint64_t, uint32_t> genericTypeAddresses;
 };
 
+struct ManagedGenericCandidate {
+    int32_t index = -1;
+    GenericMethodPointerModel mapping;
+    bool adjustor = false;
+};
+
+class ManagedMetadataIndex {
+public:
+    explicit ManagedMetadataIndex(const MetadataModel& metadata);
+
+    const MetadataModel* source = nullptr;
+    std::map<uint64_t, std::vector<ManagedMethodReference>> methodsByAddress;
+    std::map<uint64_t, std::vector<ManagedGenericCandidate>> genericsByAddress;
+    std::map<int64_t, std::vector<ManagedFieldReference>> fieldsByOffset;
+};
+
 struct ManagedOperation {
     ManagedOperationKind kind = ManagedOperationKind::DirectMethodCall;
     ManagedPatternStatus status = ManagedPatternStatus::Unresolved;
@@ -114,6 +133,8 @@ struct ManagedOperation {
 
 struct ManagedPatternOptions {
     const BinaryImage* binary = nullptr;
+    const GenericMethodResolver* genericResolver = nullptr;
+    const ManagedMetadataIndex* metadataIndex = nullptr;
     ManagedTargetProfile profile;
     std::unordered_map<uint32_t, uint64_t> stringLiteralAddresses;
     std::unordered_map<uint64_t, std::string> runtimeTypeAddresses;

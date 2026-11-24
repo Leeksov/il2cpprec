@@ -1091,6 +1091,18 @@ void printVerificationSummary(const RecoveryOutcome& outcome, std::ostream& outp
            << " (unmapped is informational; no semantic-equivalence claim)\n";
 }
 
+void printProjectEmissionSummary(
+    const std::optional<il2cpprec::ProjectWriteReport>& report,
+    std::ostream& output) {
+    if (!report) return;
+    output << "C# emission: supported=" << report->supported
+           << " partial=" << report->partial
+           << " unsupported=" << report->unsupported
+           << " declaration-only=" << report->declarationOnly
+           << " omitted=" << report->omitted
+           << " (native exact is a separate IR status)\n";
+}
+
 std::string partialReasonCategory(const std::string& reason) {
     if (reason.starts_with("Unsupported instruction")) return "unsupported-instruction";
     if (reason.starts_with("Unsupported") && reason.find("load") != std::string::npos) return "unsupported-load";
@@ -1188,13 +1200,25 @@ il2cpprec::ProjectWriterOptions makeProjectWriterOptions(const Arguments& argume
     return options;
 }
 
+const char* projectMethodStatusName(il2cpprec::ProjectMethodBodyStatus status) {
+    switch (status) {
+    case il2cpprec::ProjectMethodBodyStatus::Supported: return "supported";
+    case il2cpprec::ProjectMethodBodyStatus::Partial: return "partial";
+    case il2cpprec::ProjectMethodBodyStatus::Unsupported: return "unsupported";
+    case il2cpprec::ProjectMethodBodyStatus::DeclarationOnly: return "declaration-only";
+    case il2cpprec::ProjectMethodBodyStatus::Omitted: return "omitted";
+    }
+    return "unsupported";
+}
+
 void writeJsonReport(
     const std::string& path,
     const RecoveryOutcome& outcome,
     const Arguments& arguments,
     const std::string& idaInstance,
     const RegistrationSummary& registration = {},
-    const SourceProfileReport& sourceProfile = {}) {
+    const SourceProfileReport& sourceProfile = {},
+    const il2cpprec::ProjectWriteReport* projectReport = nullptr) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) throw std::runtime_error("Cannot open JSON report: " + path);
 
@@ -1281,6 +1305,28 @@ void writeJsonReport(
            << "  },\n"
            << "  \"partialReasons\": ";
     writePartialReasonSummary(output, outcome);
+    output << ",\n  \"projectEmission\": ";
+    if (!projectReport) {
+        output << "null";
+    } else {
+        output << "{\"scope\": \"native-exact-inputs\", \"supported\": " << projectReport->supported
+               << ", \"partial\": " << projectReport->partial
+               << ", \"unsupported\": " << projectReport->unsupported
+               << ", \"declarationOnly\": " << projectReport->declarationOnly
+               << ", \"omitted\": " << projectReport->omitted
+               << ", \"methods\": [";
+        for (size_t i = 0; i < projectReport->methods.size(); ++i) {
+            if (i != 0) output << ", ";
+            const auto& method = projectReport->methods[i];
+            output << "{\"address\": " << jsonString(hexAddress(method.address))
+                   << ", \"name\": " << jsonString(method.name)
+                   << ", \"status\": " << jsonString(projectMethodStatusName(method.status))
+                   << ", \"reason\": " << jsonString(method.reason)
+                   << ", \"declarationPartial\": " << (method.declarationPartial ? "true" : "false")
+                   << "}";
+        }
+        output << "]}";
+    }
     output << ",\n"
            << "  \"methods\": [\n";
     for (size_t i = 0; i < outcome.methods.size(); ++i) {
@@ -1605,8 +1651,9 @@ int main(int argc, char** argv) {
                 outcome.functions.push_back(std::nullopt);
                 ++outcome.errors;
             }
+            std::optional<il2cpprec::ProjectWriteReport> projectWriteReport;
             if (!arguments.outputDirectory.empty()) {
-                il2cpprec::ProjectWriter{makeProjectWriterOptions(arguments)}.write(
+                projectWriteReport = il2cpprec::ProjectWriter{makeProjectWriterOptions(arguments)}.write(
                     arguments.outputDirectory, resolution.metadata, outcome.exactFunctions);
             }
             if (!arguments.reportPath.empty()) {
@@ -1668,10 +1715,12 @@ int main(int argc, char** argv) {
                     std::unique(registration.reasons.begin(), registration.reasons.end()),
                     registration.reasons.end());
                 writeJsonReport(
-                    arguments.reportPath, outcome, arguments, idaSession.instanceId, registration, sourceProfile);
+                    arguments.reportPath, outcome, arguments, idaSession.instanceId, registration, sourceProfile,
+                    projectWriteReport ? &*projectWriteReport : nullptr);
             }
             printDiagnostics(outcome, std::cout);
             printSummary(outcome, std::cout);
+            printProjectEmissionSummary(projectWriteReport, std::cout);
             if (arguments.verify) printVerificationSummary(outcome, std::cout);
             return recoveryExitCode(outcome, arguments.failOnPartial);
         }
@@ -1705,17 +1754,20 @@ int main(int argc, char** argv) {
 
         auto idaSession = connectIdaMcp(arguments);
         auto outcome = recoverMethods({image}, arguments);
+        std::optional<il2cpprec::ProjectWriteReport> projectWriteReport;
         if (!arguments.outputDirectory.empty()) {
-            il2cpprec::ProjectWriter{makeProjectWriterOptions(arguments)}.write(
+            projectWriteReport = il2cpprec::ProjectWriter{makeProjectWriterOptions(arguments)}.write(
                 arguments.outputDirectory,
                 il2cpprec::MetadataModel{},
                 outcome.exactFunctions);
         }
         if (!arguments.reportPath.empty()) {
-            writeJsonReport(arguments.reportPath, outcome, arguments, idaSession.instanceId);
+            writeJsonReport(arguments.reportPath, outcome, arguments, idaSession.instanceId,
+                            {}, {}, projectWriteReport ? &*projectWriteReport : nullptr);
         }
         printDiagnostics(outcome, std::cerr);
         printSummary(outcome, std::cerr);
+        printProjectEmissionSummary(projectWriteReport, std::cerr);
         if (arguments.verify) printVerificationSummary(outcome, std::cerr);
 
         if (outcome.functions.size() == 1 && outcome.functions.front() && arguments.outputDirectory.empty()) {

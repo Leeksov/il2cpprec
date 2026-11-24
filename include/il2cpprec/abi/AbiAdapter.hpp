@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -10,6 +11,7 @@
 #include <il2cpprec/Model.hpp>
 
 namespace il2cpprec {
+struct AbiTypeNameIndex;
 namespace ida {
 struct SourceLayoutSelection;
 }
@@ -302,6 +304,7 @@ struct CallSiteAbiModel {
 class AbiAdapter {
 public:
     explicit AbiAdapter(AbiAdapterOptions options = {});
+    AbiAdapter(AbiAdapterOptions options, const MetadataModel& indexedMetadata);
 
     AbiBindingModel bind(
         const MethodModel& method,
@@ -327,6 +330,8 @@ public:
 
 private:
     AbiAdapterOptions options_;
+    std::shared_ptr<const AbiTypeNameIndex> typeNameIndex_;
+    const MetadataModel* indexedMetadata_ = nullptr;
 };
 
 AbiBindingModel adaptMethodAbi(

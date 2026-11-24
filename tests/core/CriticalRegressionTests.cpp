@@ -214,7 +214,13 @@ TEST_CASE("generic and virtual methods emit declared type parameters and modifie
     };
     OutputDirectory output(
         std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/generic-virtual-emission");
-    ProjectWriter::write(output.path, metadata, functions, {"RegressionChecks", "net8.0", {}, {}});
+    const auto emission = ProjectWriter::write(output.path, metadata, functions,
+                                               {"RegressionChecks", "net8.0", {}, {}});
+    CHECK_EQ(emission.methods.size(), functions.size());
+    CHECK_EQ(emission.supported + emission.partial + emission.unsupported +
+             emission.declarationOnly + emission.omitted, functions.size());
+    CHECK_EQ(emission.methods[0].address, 0x1000);
+    CHECK_EQ(emission.methods[1].address, 0x2000);
     const auto source = readSources(output.path);
     if (source.find("unsafe partial class Box<T>") == std::string::npos ||
         source.find("public virtual TMethod Identity<TMethod>(TMethod value)") == std::string::npos ||
@@ -427,6 +433,218 @@ TEST_CASE("simple nested type is emitted inside its declaring type") {
     if (source.find("public unsafe partial class Outer\n    {\n        public unsafe partial class Inner") == std::string::npos) {
         fail("Generated sources:\n" + source, __FILE__, __LINE__);
     }
+}
+
+TEST_CASE("same named types from different images do not merge declarations") {
+    MetadataModel metadata;
+    TypeModel enumeration;
+    enumeration.name = "Key";
+    enumeration.imageName = "One.dll";
+    enumeration.flags = 1;
+    enumeration.bitfield = 0x2;
+    enumeration.fields.push_back({"value__", "int", 0, false, 0, 0, -1});
+    metadata.types.push_back(enumeration);
+    TypeModel classType;
+    classType.name = "Key";
+    classType.imageName = "Two.dll";
+    classType.flags = 1;
+    MethodModel constructor;
+    constructor.name = ".ctor";
+    constructor.address = 0x1000;
+    constructor.definitionIndex = 0;
+    constructor.imageName = "Two.dll";
+    constructor.flags = 0x6;
+    classType.methods.push_back(constructor);
+    metadata.types.push_back(classType);
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/duplicate-type-emission");
+    ProjectWriter::write(output.path, metadata, {namedBody(".ctor", 0x1000)},
+                         {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    if (source.find("enum Key") == std::string::npos ||
+        source.find("partial class Key_2") == std::string::npos ||
+        source.find("public Key_2()") == std::string::npos ||
+        source.find("enum Key\n{\n    public Key") != std::string::npos) {
+        fail("Generated sources:\n" + source, __FILE__, __LINE__);
+    }
+}
+
+TEST_CASE("conflicting generic enum metadata uses compilable value type placeholder") {
+    MetadataModel metadata;
+    metadata.genericContainers.push_back({0, 1, 0, 0});
+    metadata.genericParameters.push_back({0, "T", -1, 0, 0, 0});
+    TypeModel type;
+    type.name = "RequesterType`1";
+    type.flags = 1;
+    type.bitfield = 0x2;
+    type.genericContainerIndex = 0;
+    metadata.types.push_back(type);
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/generic-enum-emission");
+    ProjectWriter::write(output.path, metadata, {}, {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    if (source.find("partial struct RequesterType<T>") == std::string::npos ||
+        source.find("enum RequesterType<") != std::string::npos) {
+        fail("Generated sources:\n" + source, __FILE__, __LINE__);
+    }
+}
+
+TEST_CASE("unmanaged struct this uses proven pinned native field layout") {
+    const auto makeMetadata = [](bool managedReference) {
+        MetadataModel metadata;
+        TypeModel type;
+        type.name = "PinnedValue";
+        type.flags = 1;
+        type.bitfield = 1;
+        type.fields.push_back({"key", "byte", 16, false, 0x04000001, 0x6, -1});
+        type.fields.push_back({"hidden", "int", 20, false, 0x04000002, 0x6, -1});
+        metadata.fieldOffsetsByToken[0x04000001] = 16;
+        metadata.fieldOffsetsByToken[0x04000002] = 20;
+        if (managedReference) {
+            type.fields.push_back({"name", "string", 24, false, 0x04000003, 0x6, -1});
+            metadata.fieldOffsetsByToken[0x04000003] = 24;
+        }
+        MethodModel method;
+        method.name = "GetHidden";
+        method.returnType = "int";
+        method.address = 0x1000;
+        method.definitionIndex = 0;
+        method.flags = 0x6;
+        method.declaringType = "PinnedValue";
+        type.methods.push_back(method);
+        metadata.types.push_back(type);
+        return metadata;
+    };
+    const auto pointer = ScalarType::pointer(64);
+    const auto function = functionWithStatements("GetHidden", {
+        returnValue(load(binary("+", reg("x0", pointer), constant(20, pointer), pointer),
+                         ScalarType::intBits(32)))
+    });
+    for (const bool managedReference : {false, true}) {
+        const auto metadata = makeMetadata(managedReference);
+        OutputDirectory output(
+            std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() /
+            (managedReference ? "build/tests/managed-this-emission" : "build/tests/unmanaged-this-emission"));
+        const auto report = ProjectWriter::write(output.path, metadata, {function},
+                                                 {"RegressionChecks", "net8.0", {}, {}});
+        const auto source = readSources(output.path);
+        if (managedReference) {
+            CHECK_EQ(report.unsupported, 1);
+            CHECK(source.find("fixed (PinnedValue*") == std::string::npos);
+        } else {
+            CHECK_EQ(report.supported, 1);
+            CHECK(source.find("fixed (PinnedValue* __il2cpp_this = &this)") != std::string::npos);
+            CHECK(source.find("(ulong)__il2cpp_this - 16UL") != std::string::npos);
+        }
+    }
+
+    auto withNativeCall = function;
+    Statement call;
+    call.kind = Statement::Kind::Call;
+    call.address = 0x1000;
+    call.target = constant(0x9000, pointer);
+    withNativeCall.blocks[0].statements.insert(withNativeCall.blocks[0].statements.begin(), call);
+    OutputDirectory unresolvedOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() /
+        "build/tests/unresolved-call-emission");
+    const auto unresolvedReport = ProjectWriter::write(unresolvedOutput.path, makeMetadata(false),
+                                                       {withNativeCall}, {"RegressionChecks", "net8.0", {}, {}});
+    CHECK_EQ(unresolvedReport.partial, 1);
+    CHECK(unresolvedReport.methods[0].reason.find("requires a RuntimeCalls handler") != std::string::npos);
+}
+
+TEST_CASE("open generic arity omits invalid CSharp member declarations") {
+    MetadataModel metadata;
+    metadata.typeReferences.resize(1);
+    metadata.typeReferences[0].code = static_cast<uint8_t>(Il2CppTypeCode::Class);
+    metadata.typeReferences[0].name = "System.Collections.Generic.List`1";
+    TypeModel type;
+    type.name = "OpenGenericUsers";
+    type.flags = 1;
+    type.fields.push_back({"items", "type[0]", 0, false, 0, 0x6, -1});
+    type.propertyStart = 0;
+    type.propertyCount = 1;
+    MethodModel getter;
+    getter.name = "get_Items";
+    getter.returnType = "type[0]";
+    getter.address = 0x1000;
+    getter.definitionIndex = 0;
+    getter.flags = 0x6;
+    type.methods.push_back(getter);
+    MethodModel use;
+    use.name = "Use";
+    use.returnType = "void";
+    use.address = 0x2000;
+    use.definitionIndex = 1;
+    use.flags = 0x16;
+    use.isStatic = true;
+    use.parameters.push_back({"value", "type[0]", -1});
+    type.methods.push_back(use);
+    metadata.types.push_back(type);
+    metadata.properties.push_back({"Items", 0, -1, 0, 0x17000001});
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/open-generic-arity-emission");
+    const auto report = ProjectWriter::write(output.path, metadata,
+                                             {namedBody("get_Items", 0x1000), namedBody("Use", 0x2000)},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    CHECK_EQ(report.omitted, 2);
+    CHECK(source.find("List`1 items") == std::string::npos);
+    CHECK(source.find("List`1 Items") == std::string::npos);
+    CHECK(source.find("List`1 Use") == std::string::npos);
+    CHECK(source.find("List`1 value") == std::string::npos);
+    CHECK(source.find("unresolved C# type syntax") != std::string::npos);
+
+    auto closedMetadata = metadata;
+    closedMetadata.typeReferences.resize(2);
+    closedMetadata.typeReferences[0].code = static_cast<uint8_t>(Il2CppTypeCode::GenericInst);
+    closedMetadata.typeReferences[0].genericArgumentIndices = {1};
+    closedMetadata.typeReferences[1].code = static_cast<uint8_t>(Il2CppTypeCode::I4);
+    OutputDirectory closedOutput(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/closed-generic-arity-emission");
+    const auto closedReport = ProjectWriter::write(closedOutput.path, closedMetadata,
+                                                   {namedBody("get_Items", 0x1000), namedBody("Use", 0x2000)},
+                                                   {"RegressionChecks", "net8.0", {}, {}});
+    CHECK_EQ(closedReport.omitted, 0);
+    CHECK(readSources(closedOutput.path).find("System.Collections.Generic.List<int> items") != std::string::npos);
+}
+
+TEST_CASE("unresolved generic token is omitted and unique generated type name is mapped") {
+    MetadataModel metadata;
+    TypeModel holder;
+    holder.name = "Holder";
+    holder.imageName = "A.dll";
+    holder.flags = 1;
+    holder.fields.push_back({"value", "!703", 0, false, 0, 0x6, -1});
+    holder.fields.push_back({"target", "<MoveNext>c__AnonStorey0", 0, false, 0, 0x6, -1});
+    holder.propertyStart = 0;
+    holder.propertyCount = 1;
+    MethodModel getter;
+    getter.name = "get_Value";
+    getter.returnType = "!703";
+    getter.address = 0x1000;
+    getter.definitionIndex = 0;
+    getter.imageName = "A.dll";
+    getter.flags = 0x6;
+    holder.methods.push_back(getter);
+    metadata.types.push_back(holder);
+    TypeModel generated;
+    generated.name = "<MoveNext>c__AnonStorey0";
+    generated.imageName = "A.dll";
+    generated.flags = 1;
+    metadata.types.push_back(generated);
+    metadata.properties.push_back({"Value", 0, -1, 0, 0x17000001});
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/generated-type-name-emission");
+    const auto report = ProjectWriter::write(output.path, metadata, {namedBody("get_Value", 0x1000)},
+                                             {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    CHECK_EQ(report.omitted, 1);
+    CHECK(source.find("_MoveNext_c__AnonStorey0 target") != std::string::npos);
+    CHECK(source.find("private !703") == std::string::npos);
+    CHECK(source.find("public !703") == std::string::npos);
 }
 
 } // namespace il2cpprec::tests

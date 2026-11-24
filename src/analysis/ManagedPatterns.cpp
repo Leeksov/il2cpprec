@@ -7,6 +7,7 @@
 #include <bit>
 #include <limits>
 #include <map>
+#include <memory>
 #include <tuple>
 #include <utility>
 
@@ -61,6 +62,74 @@ bool addOffset(int64_t left, int64_t right, int64_t& result) {
     return true;
 }
 
+} // namespace
+
+ManagedMetadataIndex::ManagedMetadataIndex(const MetadataModel& metadata) : source(&metadata) {
+    std::unordered_map<std::string, int> firstDefinitionByImage;
+    for (const auto& type : metadata.types) {
+        for (const auto& method : type.methods) {
+            if (method.definitionIndex < 0) continue;
+            auto [it, inserted] = firstDefinitionByImage.emplace(method.imageName, method.definitionIndex);
+            if (!inserted) it->second = std::min(it->second, method.definitionIndex);
+        }
+    }
+    for (const auto& type : metadata.types) {
+        const auto declaringType = qualifiedTypeName(type);
+        for (const auto& method : type.methods) {
+            const uint64_t address = methodAddress(method, metadata, firstDefinitionByImage);
+            if (address == 0) continue;
+            ManagedMethodReference reference;
+            reference.token = method.token;
+            reference.definitionIndex = method.definitionIndex;
+            reference.address = address;
+            reference.imageName = method.imageName;
+            reference.declaringType = method.declaringType.empty() ? declaringType : method.declaringType;
+            reference.name = method.name;
+            reference.isStatic = method.isStatic;
+            methodsByAddress[address].push_back(std::move(reference));
+        }
+        for (const auto& field : type.fields) {
+            ManagedFieldReference reference;
+            reference.declaringType = declaringType;
+            reference.name = field.name;
+            reference.type = field.type;
+            reference.offset = field.offset;
+            reference.isStatic = field.isStatic;
+            fieldsByOffset[field.offset].push_back(std::move(reference));
+        }
+    }
+    for (const auto& mapping : metadata.genericMethodTable) {
+        if (mapping.genericMethodIndex >= 0 && mapping.methodPointer != 0) {
+            genericsByAddress[mapping.methodPointer].push_back({mapping.genericMethodIndex, mapping, false});
+        }
+        if (mapping.genericMethodIndex >= 0 && mapping.adjustorThunk != 0) {
+            genericsByAddress[mapping.adjustorThunk].push_back({mapping.genericMethodIndex, mapping, true});
+        }
+    }
+    for (auto& [address, candidates] : genericsByAddress) {
+        std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+            return std::tie(left.index, left.adjustor) < std::tie(right.index, right.adjustor);
+        });
+        candidates.erase(std::unique(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+            return left.index == right.index && left.adjustor == right.adjustor;
+        }), candidates.end());
+    }
+    for (auto& [address, methods] : methodsByAddress) {
+        std::sort(methods.begin(), methods.end(), [](const auto& left, const auto& right) {
+            return std::tie(left.address, left.imageName, left.declaringType, left.name, left.token, left.definitionIndex) <
+                std::tie(right.address, right.imageName, right.declaringType, right.name, right.token, right.definitionIndex);
+        });
+    }
+    for (auto& [offset, fields] : fieldsByOffset) {
+        std::sort(fields.begin(), fields.end(), [](const auto& left, const auto& right) {
+            return std::tie(left.declaringType, left.name, left.type, left.offset) <
+                std::tie(right.declaringType, right.name, right.type, right.offset);
+        });
+    }
+}
+
+namespace {
+
 struct AddressParts {
     std::vector<ExpressionPtr> terms;
     int64_t displacement = 0;
@@ -73,11 +142,7 @@ struct AllocationState {
     ExpressionPtr destination;
 };
 
-struct GenericCandidate {
-    int32_t index = -1;
-    GenericMethodPointerModel mapping;
-    bool adjustor = false;
-};
+using GenericCandidate = ManagedGenericCandidate;
 
 class AnalysisContext {
 public:
@@ -87,15 +152,22 @@ public:
         const ManagedPatternOptions& options,
         ManagedAnalysisResult& result)
         : function_(function), metadata_(metadata), options_(options), result_(result),
+          genericResolver_(options.genericResolver),
           pointerBits_(function.architecture == Architecture::Arm64 || function.architecture == Architecture::X64 ? 64 : 32) {
-        buildMetadataIndex();
+        if (options.metadataIndex && options.metadataIndex->source == &metadata) {
+            metadataIndex_ = options.metadataIndex;
+        } else {
+            ownedMetadataIndex_ = std::make_unique<ManagedMetadataIndex>(metadata);
+            metadataIndex_ = ownedMetadataIndex_.get();
+        }
+        buildOptionOverlays();
     }
 
     void run() {
         for (const auto& evidence : RuntimeHelpers{}.infer(function_)) {
             if (evidence.role == RuntimeHelperRole::ClassInit &&
-                !methodsByAddress_.contains(evidence.targetAddress) &&
-                !genericsByAddress_.contains(evidence.targetAddress)) {
+                !methodsByAddress().contains(evidence.targetAddress) &&
+                !hasGenericAddress(evidence.targetAddress)) {
                 inferredClassInitSites_.insert({evidence.blockIndex, evidence.statementIndex});
             }
         }
@@ -116,12 +188,14 @@ private:
     const MetadataModel& metadata_;
     const ManagedPatternOptions& options_;
     ManagedAnalysisResult& result_;
+    const GenericMethodResolver* genericResolver_ = nullptr;
+    std::unique_ptr<GenericMethodResolver> ownedGenericResolver_;
     uint16_t pointerBits_;
     bool memoryMayHaveChanged_ = false;
 
-    std::map<uint64_t, std::vector<ManagedMethodReference>> methodsByAddress_;
-    std::map<uint64_t, std::vector<GenericCandidate>> genericsByAddress_;
-    std::map<int64_t, std::vector<ManagedFieldReference>> fieldsByOffset_;
+    const ManagedMetadataIndex* metadataIndex_ = nullptr;
+    std::unique_ptr<ManagedMetadataIndex> ownedMetadataIndex_;
+    std::map<uint64_t, std::vector<GenericCandidate>> additionalGenericsByAddress_;
     std::map<uint64_t, std::vector<uint32_t>> stringsByAddress_;
     std::unordered_map<std::string, uint64_t> constants_;
     std::unordered_map<std::string, ExpressionPtr> symbolic_;
@@ -132,86 +206,48 @@ private:
         return ScalarType::pointer(pointerBits_);
     }
 
-    void buildMetadataIndex() {
-        std::unordered_map<std::string, int> firstDefinitionByImage;
-        for (const auto& type : metadata_.types) {
-            for (const auto& method : type.methods) {
-                if (method.definitionIndex < 0) continue;
-                auto [it, inserted] = firstDefinitionByImage.emplace(method.imageName, method.definitionIndex);
-                if (!inserted) it->second = std::min(it->second, method.definitionIndex);
-            }
-        }
+    const std::map<uint64_t, std::vector<ManagedMethodReference>>& methodsByAddress() const {
+        return metadataIndex_->methodsByAddress;
+    }
+    const std::map<int64_t, std::vector<ManagedFieldReference>>& fieldsByOffset() const {
+        return metadataIndex_->fieldsByOffset;
+    }
 
-        for (const auto& type : metadata_.types) {
-            const auto declaringType = qualifiedTypeName(type);
-            for (const auto& method : type.methods) {
-                const uint64_t address = methodAddress(method, metadata_, firstDefinitionByImage);
-                if (address == 0) continue;
-                ManagedMethodReference reference;
-                reference.token = method.token;
-                reference.definitionIndex = method.definitionIndex;
-                reference.address = address;
-                reference.imageName = method.imageName;
-                reference.declaringType = method.declaringType.empty() ? declaringType : method.declaringType;
-                reference.name = method.name;
-                reference.isStatic = method.isStatic;
-                methodsByAddress_[address].push_back(std::move(reference));
-            }
-
-            for (const auto& field : type.fields) {
-                ManagedFieldReference reference;
-                reference.declaringType = declaringType;
-                reference.name = field.name;
-                reference.type = field.type;
-                reference.offset = field.offset;
-                reference.isStatic = field.isStatic;
-                fieldsByOffset_[field.offset].push_back(std::move(reference));
-            }
+    std::vector<GenericCandidate> genericCandidates(uint64_t address) const {
+        std::vector<GenericCandidate> result;
+        const auto base = metadataIndex_->genericsByAddress.find(address);
+        if (base != metadataIndex_->genericsByAddress.end()) result = base->second;
+        const auto extra = additionalGenericsByAddress_.find(address);
+        if (extra != additionalGenericsByAddress_.end()) {
+            result.insert(result.end(), extra->second.begin(), extra->second.end());
+            std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+                return std::tie(left.index, left.adjustor) < std::tie(right.index, right.adjustor);
+            });
+            result.erase(std::unique(result.begin(), result.end(), [](const auto& left, const auto& right) {
+                return left.index == right.index && left.adjustor == right.adjustor;
+            }), result.end());
         }
+        return result;
+    }
 
-        for (const auto& mapping : metadata_.genericMethodTable) {
-            if (mapping.genericMethodIndex >= 0 && mapping.methodPointer != 0) {
-                genericsByAddress_[mapping.methodPointer].push_back({mapping.genericMethodIndex, mapping, false});
-            }
-            if (mapping.genericMethodIndex >= 0 && mapping.adjustorThunk != 0) {
-                genericsByAddress_[mapping.adjustorThunk].push_back({mapping.genericMethodIndex, mapping, true});
-            }
-        }
+    bool hasGenericAddress(uint64_t address) const {
+        return metadataIndex_->genericsByAddress.contains(address) || additionalGenericsByAddress_.contains(address);
+    }
+
+    void buildOptionOverlays() {
         for (const auto& [address, genericIndex] : options_.profile.genericAdjustorTargets) {
             if (genericIndex > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) continue;
             const auto mapping = std::find_if(metadata_.genericMethodTable.begin(), metadata_.genericMethodTable.end(), [&](const auto& candidate) {
                 return candidate.genericMethodIndex == static_cast<int32_t>(genericIndex);
             });
             if (mapping != metadata_.genericMethodTable.end()) {
-                genericsByAddress_[address].push_back({static_cast<int32_t>(genericIndex), *mapping, true});
+                additionalGenericsByAddress_[address].push_back({static_cast<int32_t>(genericIndex), *mapping, true});
             }
-        }
-        for (auto& [address, candidates] : genericsByAddress_) {
-            std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
-                return std::tie(left.index, left.adjustor) < std::tie(right.index, right.adjustor);
-            });
-            candidates.erase(std::unique(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
-                return left.index == right.index && left.adjustor == right.adjustor;
-            }), candidates.end());
-        }
-        for (auto& [address, methods] : methodsByAddress_) {
-            std::sort(methods.begin(), methods.end(), [](const auto& left, const auto& right) {
-                return std::tie(left.address, left.imageName, left.declaringType, left.name, left.token, left.definitionIndex) <
-                    std::tie(right.address, right.imageName, right.declaringType, right.name, right.token, right.definitionIndex);
-            });
-        }
-        for (auto& [offset, fields] : fieldsByOffset_) {
-            std::sort(fields.begin(), fields.end(), [](const auto& left, const auto& right) {
-                return std::tie(left.declaringType, left.name, left.type, left.offset) <
-                    std::tie(right.declaringType, right.name, right.type, right.offset);
-            });
         }
         for (const auto& [token, address] : options_.stringLiteralAddresses) {
             stringsByAddress_[address].push_back(token);
         }
-        for (auto& [address, tokens] : stringsByAddress_) {
-            std::sort(tokens.begin(), tokens.end());
-        }
+        for (auto& [address, tokens] : stringsByAddress_) std::sort(tokens.begin(), tokens.end());
     }
 
     std::optional<uint64_t> readPointer(uint64_t address) const {
@@ -405,8 +441,12 @@ private:
         return true;
     }
 
-    bool resolveGeneric(ManagedOperation& result, const GenericCandidate& candidate, uint64_t targetAddress) const {
-        const auto resolved = GenericMethodResolver(metadata_).resolve(static_cast<uint32_t>(candidate.index));
+    bool resolveGeneric(ManagedOperation& result, const GenericCandidate& candidate, uint64_t targetAddress) {
+        if (!genericResolver_) {
+            ownedGenericResolver_ = std::make_unique<GenericMethodResolver>(metadata_);
+            genericResolver_ = ownedGenericResolver_.get();
+        }
+        const auto resolved = genericResolver_->resolve(static_cast<uint32_t>(candidate.index));
         if (resolved.status != MetadataUsageStatus::Resolved || !resolved.method || !resolved.mapping) return false;
         const auto& method = *resolved.method;
         result.method.token = method.token;
@@ -447,11 +487,11 @@ private:
             result_.operations.push_back(std::move(result));
             return;
         }
-        const auto methods = methodsByAddress_.find(targetAddress);
-        const auto generics = genericsByAddress_.find(targetAddress);
+        const auto methods = methodsByAddress().find(targetAddress);
+        const auto generics = genericCandidates(targetAddress);
         size_t resolvedGenerics = 0;
-        if (methods == methodsByAddress_.end() && generics != genericsByAddress_.end()) {
-            for (const auto& candidate : generics->second) {
+        if (methods == methodsByAddress().end() && !generics.empty()) {
+            for (const auto& candidate : generics) {
                 ManagedOperation generic = result;
                 if (resolveGeneric(generic, candidate, targetAddress)) {
                     ++resolvedGenerics;
@@ -459,19 +499,19 @@ private:
                 }
             }
         }
-        if (methods == methodsByAddress_.end() && resolvedGenerics == 1 && (generics == genericsByAddress_.end() || generics->second.size() == 1)) {
+        if (methods == methodsByAddress().end() && resolvedGenerics == 1 && generics.size() == 1) {
             result.status = ManagedPatternStatus::Resolved;
             result.confidence = ManagedPatternConfidence::High;
-        } else if (methods == methodsByAddress_.end() && resolvedGenerics == 0) {
+        } else if (methods == methodsByAddress().end() && resolvedGenerics == 0) {
             result.status = ManagedPatternStatus::Unresolved;
             result.reason = "The direct target has no unique managed or generic method mapping.";
-        } else if (methods == methodsByAddress_.end() && resolvedGenerics > 0) {
+        } else if (methods == methodsByAddress().end() && resolvedGenerics > 0) {
             result.status = ManagedPatternStatus::Ambiguous;
             result.confidence = ManagedPatternConfidence::Low;
             result.reason = "Multiple generic instantiations share the native target.";
-        } else if (methods != methodsByAddress_.end()) {
+        } else if (methods != methodsByAddress().end()) {
             result.methodCandidates = methods->second;
-            if (methods->second.size() == 1 && generics == genericsByAddress_.end()) {
+            if (methods->second.size() == 1 && generics.empty()) {
                 result.status = ManagedPatternStatus::Resolved;
                 result.confidence = ManagedPatternConfidence::High;
                 result.method = methods->second.front();
@@ -577,9 +617,9 @@ private:
         if (!address.valid) return;
 
         const auto fields = address.terms.size() == 1
-            ? fieldsByOffset_.find(address.displacement)
-            : fieldsByOffset_.end();
-        if (fields != fieldsByOffset_.end()) {
+            ? fieldsByOffset().find(address.displacement)
+            : fieldsByOffset().end();
+        if (fields != fieldsByOffset().end()) {
             auto result = operation(ManagedOperationKind::FieldLoad, blockIndex, statementIndex, statement);
             result.destination = statement.destination;
             result.object = address.terms.front();
@@ -627,9 +667,9 @@ private:
         if (!address.valid) return;
 
         const auto fields = address.terms.size() == 1
-            ? fieldsByOffset_.find(address.displacement)
-            : fieldsByOffset_.end();
-        if (fields != fieldsByOffset_.end()) {
+            ? fieldsByOffset().find(address.displacement)
+            : fieldsByOffset().end();
+        if (fields != fieldsByOffset().end()) {
             auto result = operation(ManagedOperationKind::FieldStore, blockIndex, statementIndex, statement);
             result.object = address.terms.front();
             result.value = statement.value;
@@ -666,8 +706,8 @@ private:
         if (name.empty()) return;
         const auto allocation = allocations_.find(name);
         if (allocation == allocations_.end()) return;
-        const auto methods = methodsByAddress_.find(targetAddress);
-        if (methods == methodsByAddress_.end() || methods->second.size() != 1) return;
+        const auto methods = methodsByAddress().find(targetAddress);
+        if (methods == methodsByAddress().end() || methods->second.size() != 1) return;
         const auto& constructor = methods->second.front();
         if (constructor.name != ".ctor" || constructor.isStatic) return;
 

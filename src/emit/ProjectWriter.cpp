@@ -3,6 +3,7 @@
 #include <il2cpprec/analysis/ManagedEmitter.hpp>
 #include <il2cpprec/emit/RuntimeSupport.hpp>
 #include <il2cpprec/metadata/TypeSystem.hpp>
+#include <il2cpprec/metadata/GenericMethodResolver.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -24,7 +25,6 @@ namespace il2cpprec {
 namespace {
 
 using Location = std::pair<size_t, size_t>;
-using TypeKey = std::pair<std::string, std::string>;
 
 std::string hexAddress(uint64_t value) {
     std::ostringstream output;
@@ -217,10 +217,7 @@ private:
 
     std::optional<Location> selectInOneType(std::vector<Location> candidates) const {
         if (candidates.empty()) return std::nullopt;
-        const auto keyFor = [this](const Location& location) {
-            const auto& type = metadata_.types[location.first];
-            return TypeKey{type.nameSpace, type.name};
-        };
+        const auto keyFor = [](const Location& location) { return location.first; };
         const auto firstKey = keyFor(candidates.front());
         if (!std::all_of(candidates.begin(), candidates.end(), [&](const Location& location) {
             return keyFor(location) == firstKey;
@@ -401,6 +398,119 @@ std::string managedIdentifier(const std::string& value, const std::string& fallb
     return result;
 }
 
+bool hasUnresolvedGenericArity(std::string_view type) {
+    return type.find('`') != std::string_view::npos;
+}
+
+class CSharpTypeSyntax {
+public:
+    explicit CSharpTypeSyntax(std::string_view text) : text_(text) {}
+
+    bool valid() {
+        return parseType() && (skipSpace(), position_ == text_.size());
+    }
+
+private:
+    void skipSpace() {
+        while (position_ < text_.size() && (text_[position_] == ' ' || text_[position_] == '\t')) ++position_;
+    }
+
+    bool consume(std::string_view token) {
+        if (text_.substr(position_).starts_with(token)) {
+            position_ += token.size();
+            return true;
+        }
+        return false;
+    }
+
+    bool identifier() {
+        if (position_ < text_.size() && text_[position_] == '@') ++position_;
+        if (position_ >= text_.size()) return false;
+        const auto first = text_[position_];
+        if (!((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_')) return false;
+        ++position_;
+        while (position_ < text_.size()) {
+            const auto c = text_[position_];
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '_')) break;
+            ++position_;
+        }
+        return true;
+    }
+
+    bool segment() {
+        if (!identifier()) return false;
+        if (!consume("<")) return true;
+        if (!parseType()) return false;
+        while (consume(",")) {
+            skipSpace();
+            if (!parseType()) return false;
+        }
+        return consume(">");
+    }
+
+    bool parseType() {
+        if (++depth_ > 32) return false;
+        skipSpace();
+        if (depth_ == 1) {
+            for (const auto prefix : {"ref ", "out ", "in "}) {
+                if (consume(prefix)) break;
+            }
+        }
+        consume("global::");
+        if (!segment()) return false;
+        while (consume(".")) {
+            if (!segment()) return false;
+        }
+        while (position_ < text_.size()) {
+            if (consume("*") || consume("?")) continue;
+            if (!consume("[")) break;
+            while (consume(",")) {}
+            if (!consume("]")) return false;
+        }
+        skipSpace();
+        --depth_;
+        return true;
+    }
+
+    std::string_view text_;
+    size_t position_ = 0;
+    size_t depth_ = 0;
+};
+
+bool supportedCSharpType(std::string_view type) {
+    return CSharpTypeSyntax(type).valid();
+}
+
+bool hasUnresolvedGenericArity(std::string_view type, const MetadataModel& metadata, size_t depth = 0) {
+    if (hasUnresolvedGenericArity(type)) return true;
+    if (depth > 32 || !type.starts_with("type[") || type.back() != ']') return false;
+    size_t index = 0;
+    const auto digits = type.substr(5, type.size() - 6);
+    const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), index);
+    if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size() ||
+        index >= metadata.typeReferences.size()) return false;
+    const auto& reference = metadata.typeReferences[index];
+    const auto tick = reference.name.rfind('`');
+    if (tick != std::string::npos) {
+        size_t arity = 0;
+        const auto arityText = std::string_view(reference.name).substr(tick + 1);
+        const auto arityParsed = std::from_chars(arityText.data(), arityText.data() + arityText.size(), arity);
+        if (static_cast<Il2CppTypeCode>(reference.code) != Il2CppTypeCode::GenericInst ||
+            arityParsed.ec != std::errc{} || arityParsed.ptr != arityText.data() + arityText.size() ||
+            reference.genericArgumentIndices.size() < arity) return true;
+    }
+    if (reference.elementTypeIndex >= 0 &&
+        hasUnresolvedGenericArity("type[" + std::to_string(reference.elementTypeIndex) + "]", metadata, depth + 1)) {
+        return true;
+    }
+    for (const int32_t argument : reference.genericArgumentIndices) {
+        if (argument >= 0 && hasUnresolvedGenericArity(
+            "type[" + std::to_string(argument) + "]", metadata, depth + 1)) return true;
+    }
+    return false;
+}
+
 struct GenericDeclarationInfo {
     std::string parameters;
     std::string constraints;
@@ -486,7 +596,15 @@ GenericDeclarationInfo genericDeclaration(
                 result.partialMetadata = true;
                 continue;
             }
+            if (hasUnresolvedGenericArity("type[" + std::to_string(referenceIndex) + "]", metadata)) {
+                result.partialMetadata = true;
+                continue;
+            }
             auto resolved = TypeSystem::resolve(static_cast<size_t>(referenceIndex), metadata);
+            if (hasUnresolvedGenericArity(resolved) || !supportedCSharpType(resolved)) {
+                result.partialMetadata = true;
+                continue;
+            }
             if (resolved == "object" || resolved == "System.Object" || resolved == "System.ValueType") {
                 result.partialMetadata = true;
                 continue;
@@ -665,6 +783,7 @@ uint64_t managedTarget(const RecoveredFunction& function, size_t index, Architec
 struct ManagedSupport {
     std::string source;
     std::string prelude;
+    std::set<uint64_t> handledTargets;
 };
 
 ManagedSupport applyManagedCallSites(
@@ -754,6 +873,7 @@ ManagedSupport applyManagedCallSites(
         wrappers << "    }\n\n";
 
         const auto target = managedTarget(function, index, function.architecture);
+        result.handledTargets.insert(target);
         registrations << "                case " << nativeLiteral(target, function.architecture) << ":\n";
         registrations << "                    return " << wrapperName << "(";
         for (size_t input = 0; input < inputs.size(); ++input) {
@@ -824,17 +944,73 @@ ManagedSupport applyManagedCallSites(
     return result;
 }
 
+std::optional<size_t> unmanagedThisPointerBias(const TypeModel* owner, const MetadataModel& metadata,
+                                                Architecture architecture) {
+    if (!owner || (architecture != Architecture::Arm64 && architecture != Architecture::X64) ||
+        (owner->bitfield & 0x1) == 0 || (owner->bitfield & 0x2) != 0 ||
+        owner->genericContainerIndex >= 0) return std::nullopt;
+
+    size_t offset = 0;
+    std::optional<size_t> bias;
+    for (const auto& field : owner->fields) {
+        if (field.isStatic || (field.flags & 0x10) != 0 || (field.flags & 0x40) != 0) continue;
+        const auto type = TypeSystem::resolve(field.type, &metadata);
+        size_t size = 0;
+        if (type == "bool" || type == "byte" || type == "sbyte") size = 1;
+        else if (type == "char" || type == "short" || type == "ushort") size = 2;
+        else if (type == "int" || type == "uint" || type == "float") size = 4;
+        else if (type == "long" || type == "ulong" || type == "double" ||
+                 type == "nint" || type == "nuint" || type == "System.IntPtr" ||
+                 type == "System.UIntPtr") size = 8;
+        else return std::nullopt; // A managed reference makes fixed T* illegal.
+        if (field.token == 0) return std::nullopt;
+        const auto observed = metadata.fieldOffsetsByToken.find(field.token);
+        if (observed == metadata.fieldOffsetsByToken.end() || observed->second != field.offset ||
+            field.offset < 0) return std::nullopt;
+        const size_t alignment = std::min(size, size_t{8});
+        offset = (offset + alignment - 1) & ~(alignment - 1);
+        const auto nativeOffset = static_cast<size_t>(field.offset);
+        if (nativeOffset < offset) return std::nullopt;
+        const auto observedBias = nativeOffset - offset;
+        if (bias && *bias != observedBias) return std::nullopt;
+        bias = observedBias;
+        offset += size;
+    }
+    if (!bias || (*bias != 0 && *bias != 16)) return std::nullopt;
+    return bias;
+}
+
+std::string indentCSharpSource(const std::string& source, std::string_view indentation) {
+    std::ostringstream output;
+    size_t start = 0;
+    while (start < source.size()) {
+        const auto end = source.find('\n', start);
+        output << indentation;
+        if (end == std::string::npos) {
+            output << source.substr(start);
+            break;
+        }
+        output << source.substr(start, end - start) << '\n';
+        start = end + 1;
+    }
+    return output.str();
+}
+
 class MethodBodyAdapter {
 public:
+    explicit MethodBodyAdapter(const MetadataModel& metadata)
+        : abi_({}, metadata), genericResolver_(metadata), metadataIndex_(metadata) {}
+
     MethodBodyEmission emit(
         const RecoveredFunction& function,
         const MethodModel* method,
-        const MetadataModel& metadata) const {
+        const MetadataModel& metadata,
+        const TypeModel* owner,
+        const std::string& generatedTypeName) const {
         if (!method) return unsupportedBody("managed method metadata is unavailable");
         if (function.blocks.empty()) return unsupportedBody("typed IR body is empty");
 
-        const AbiAdapter abi;
-        const auto model = abi.bind(*method, metadata, function.architecture);
+        const auto model = abi_.bind(*method, metadata, function.architecture);
         if (!model.supported()) return unsupportedBody(abiDiagnostic(model));
 
         const bool constructor = method->name == ".ctor" || method->name == ".cctor";
@@ -848,9 +1024,22 @@ public:
         const auto pointerType = function.architecture == Architecture::Arm64 || function.architecture == Architecture::X64
             ? "ulong" : "uint";
         std::map<std::string, std::string> nativeDeclarations;
+        std::optional<std::pair<std::string, std::string>> thisDeclaration;
+        const auto thisBias = method->isStatic ? std::nullopt :
+            unmanagedThisPointerBias(owner, metadata, function.architecture);
         for (const auto& binding : model.bindings) {
             if (binding.role == AbiValueRole::MethodInfo) continue;
-            if (binding.role == AbiValueRole::This) continue;
+            if (binding.role == AbiValueRole::This) {
+                if (thisBias && binding.location.kind == AbiLocationKind::Register &&
+                    !binding.location.registerName.empty()) {
+                    std::string declaration = std::string("    ") + pointerType + " " + binding.location.registerName +
+                        " = unchecked((" + pointerType + ")__il2cpp_this";
+                    if (*thisBias != 0) declaration += " - " + std::to_string(*thisBias) + "UL";
+                    declaration += ");\n";
+                    thisDeclaration = {binding.location.registerName, std::move(declaration)};
+                }
+                continue;
+            }
             if (binding.valueKind != AbiValueKind::Integer || binding.conversion != AbiConversion::None) {
                 return unsupportedBody("parameter '" + binding.managedName + "' requires an unsupported ABI conversion");
             }
@@ -871,8 +1060,21 @@ public:
         }
 
         auto adapted = function;
-        auto managed = ManagedEmitter{}.emit(function, metadata);
+        ManagedEmitterOptions managedOptions;
+        managedOptions.patterns.genericResolver = &genericResolver_;
+        managedOptions.patterns.metadataIndex = &metadataIndex_;
+        auto managed = ManagedEmitter{}.emit(function, metadata, managedOptions);
         auto managedSupport = applyManagedCallSites(adapted, managed.callSites, metadata);
+        std::vector<uint64_t> unresolvedNativeCalls;
+        for (const auto& block : adapted.blocks) {
+            for (const auto& statement : block.statements) {
+                if (statement.kind == Statement::Kind::Call && statement.target &&
+                    statement.target->kind == Expression::Kind::Constant &&
+                    !managedSupport.handledTargets.contains(statement.target->constant)) {
+                    unresolvedNativeCalls.push_back(statement.address);
+                }
+            }
+        }
         bool hasReturnValue = false;
         for (auto& block : adapted.blocks) {
             for (auto& statement : block.statements) {
@@ -885,6 +1087,8 @@ public:
         if (!voidReturn && !hasReturnValue) return unsupportedBody("value-returning method has no typed return statement");
 
         const auto registers = usedRegisters(adapted);
+        const bool useThisPointer = thisDeclaration && registers.contains(thisDeclaration->first);
+        if (useThisPointer) nativeDeclarations.emplace(thisDeclaration->first, thisDeclaration->second);
         for (const auto& name : parameterRegisters) {
             if (registers.contains(name) && !nativeDeclarations.contains(name)) {
                 return unsupportedBody("native register '" + name + "' has no managed ABI value");
@@ -899,9 +1103,17 @@ public:
         result.status = emitted.partial ? MethodBodyStatus::Partial : MethodBodyStatus::Supported;
         result.support = managedSupport.source + emitted.support;
         result.source = managedSupport.prelude;
-        for (const auto& [name, declaration] : nativeDeclarations) result.source += declaration;
-        result.source += emitted.declarations;
-        result.source += emitted.body;
+        std::string nativeBody;
+        for (const auto& [name, declaration] : nativeDeclarations) nativeBody += declaration;
+        nativeBody += emitted.declarations;
+        nativeBody += emitted.body;
+        if (useThisPointer) {
+            result.source += "    fixed (" + generatedTypeName + "* __il2cpp_this = &this)\n    {\n";
+            result.source += indentCSharpSource(nativeBody, "    ");
+            result.source += "    }\n";
+        } else {
+            result.source += nativeBody;
+        }
         for (const auto& diagnostic : emitted.diagnostics) {
             if (!result.diagnostic.empty()) result.diagnostic += "; ";
             result.diagnostic += "0x" + hexAddress(diagnostic.address) + ": " + diagnostic.message;
@@ -909,8 +1121,19 @@ public:
         if (result.status == MethodBodyStatus::Partial && result.diagnostic.empty()) {
             result.diagnostic = "IR emitter reported partial recovery";
         }
+        if (!unresolvedNativeCalls.empty()) {
+            result.status = MethodBodyStatus::Partial;
+            if (!result.diagnostic.empty()) result.diagnostic += "; ";
+            result.diagnostic += "native direct call at 0x" + hexAddress(unresolvedNativeCalls.front()) +
+                " requires a RuntimeCalls handler";
+        }
         return result;
     }
+
+private:
+    AbiAdapter abi_;
+    GenericMethodResolver genericResolver_;
+    ManagedMetadataIndex metadataIndex_;
 };
 
 bool isConstructor(const MethodModel* method) {
@@ -935,8 +1158,37 @@ std::string trim(std::string value) {
     return std::string(first, last);
 }
 
-std::string managedTypeName(const std::string& type, const MetadataModel& metadata) {
-    return TypeSystem::resolve(type.empty() ? "object" : type, &metadata);
+std::string managedTypeName(
+    const std::string& type,
+    const MetadataModel& metadata,
+    std::string_view imageName = {}) {
+    const auto resolved = TypeSystem::resolve(type.empty() ? "object" : type, &metadata);
+    if (supportedCSharpType(resolved) || imageName.empty() || type.starts_with("type[")) return resolved;
+
+    // Compiler-generated metadata names such as `<MoveNext>c__AnonStorey0`
+    // are not C# type syntax. Reuse the exact identifier emitted for a unique
+    // same-image type; ambiguity leaves the member unsupported.
+    std::optional<std::string> unique;
+    for (const auto& candidate : metadata.types) {
+        if (candidate.imageName != imageName || candidate.genericContainerIndex >= 0 ||
+            candidate.declaringTypeIndex >= 0) continue;
+        const auto qualified = candidate.nameSpace.empty()
+            ? candidate.name : candidate.nameSpace + '.' + candidate.name;
+        if (type != candidate.name && type != qualified) continue;
+        const auto parts = namespaceParts(candidate.nameSpace);
+        auto emitted = join(parts, ".");
+        if (!emitted.empty()) emitted += '.';
+        emitted += safeName(candidate.name, "UnknownType");
+        if (unique) return resolved;
+        unique = std::move(emitted);
+    }
+    return unique.value_or(resolved);
+}
+
+std::string managedReturnType(const MethodModel& method, const MetadataModel& metadata) {
+    const auto resolved = TypeSystem::returnType(method, &metadata);
+    if (supportedCSharpType(resolved) || method.returnType.empty()) return resolved;
+    return managedTypeName(method.returnType, metadata, method.imageName);
 }
 
 void appendIndented(std::ostringstream& output, const std::string& source, const std::string& indentation) {
@@ -1257,6 +1509,7 @@ std::string parameterDeclaration(
     const ParameterModel& parameter,
     size_t index,
     const MetadataModel& metadata,
+    std::string_view imageName,
     bool includeDefault) {
     std::string direction;
     std::string type = trim(parameter.type);
@@ -1267,7 +1520,7 @@ std::string parameterDeclaration(
             break;
         }
     }
-    std::string resolved = TypeSystem::resolve(type.empty() ? "object" : type, &metadata);
+    std::string resolved = managedTypeName(type.empty() ? "object" : type, metadata, imageName);
     if (direction.empty() && type.starts_with("type[") && type.back() == ']') {
         const auto digits = std::string_view(type).substr(5, type.size() - 6);
         if (!digits.empty() && std::all_of(digits.begin(), digits.end(), [](unsigned char c) {
@@ -1312,7 +1565,8 @@ std::string parameterList(const MethodModel& method, const MetadataModel& metada
     std::vector<std::string> declarations;
     declarations.reserve(method.parameters.size());
     for (size_t index = 0; index < method.parameters.size(); ++index) {
-        declarations.push_back(parameterDeclaration(method.parameters[index], index, metadata, includeDefaults));
+        declarations.push_back(parameterDeclaration(method.parameters[index], index, metadata,
+                                                    method.imageName, includeDefaults));
     }
     if (includeDefaults) {
         // Native metadata can mark a parameter optional before a later required
@@ -1373,6 +1627,8 @@ struct MethodDeclarationInfo {
     std::string signature;
     bool bodyAllowed = true;
     bool partialMetadata = false;
+    bool signatureSupported = true;
+    std::string signatureReason;
 };
 
 MethodDeclarationInfo methodDeclaration(
@@ -1388,6 +1644,23 @@ MethodDeclarationInfo methodDeclaration(
         result.partialMetadata = true;
         return result;
     }
+    for (const auto& parameter : entry.method->parameters) {
+        const auto resolved = managedTypeName(parameter.type, metadata, entry.method->imageName);
+        if (hasUnresolvedGenericArity(parameter.type, metadata) || !supportedCSharpType(resolved)) {
+            result.signatureSupported = false;
+            result.signatureReason = "parameter type '" + resolved + "' has unresolved C# type syntax";
+            return result;
+        }
+    }
+    if (entry.method->name != ".ctor" && entry.method->name != ".cctor") {
+        const auto resolved = managedReturnType(*entry.method, metadata);
+        if (hasUnresolvedGenericArity(entry.method->returnType, metadata) ||
+            !supportedCSharpType(resolved)) {
+            result.signatureSupported = false;
+            result.signatureReason = "return type '" + resolved + "' has unresolved C# type syntax";
+            return result;
+        }
+    }
     const auto generic = genericDeclaration(metadata, entry.method->genericContainerIndex, true, false);
     result.partialMetadata = generic.partialMetadata || hasUnresolvedParameterDefaults(*entry.method, metadata);
     const auto flags = nativeFlags(*entry.method);
@@ -1402,7 +1675,7 @@ MethodDeclarationInfo methodDeclaration(
     }
 
     if (declaringType.kind == ManagedTypeKind::Interface) {
-        result.signature = TypeSystem::returnType(*entry.method, &metadata) + " " + name +
+        result.signature = managedReturnType(*entry.method, metadata) + " " + name +
             generic.parameters + parameters + generic.constraints;
         result.bodyAllowed = false;
         result.partialMetadata = result.partialMetadata || !flags.has_value();
@@ -1439,7 +1712,7 @@ MethodDeclarationInfo methodDeclaration(
     } else {
         result.partialMetadata = true;
     }
-    result.signature = modifiers + TypeSystem::returnType(*entry.method, &metadata) + " " + name +
+    result.signature = modifiers + managedReturnType(*entry.method, metadata) + " " + name +
         generic.parameters + parameters + generic.constraints;
     return result;
 }
@@ -1519,10 +1792,13 @@ bool appendProperty(
     if (getter && !getter->parameters.empty()) return false; // Indexers need parameterized C# syntax.
     if (setter && setter->parameters.size() != 1) return false;
     const std::string propertyType = getter
-        ? TypeSystem::returnType(*getter, &metadata)
-        : managedTypeName(setter->parameters.front().type, metadata);
-    if (propertyType.empty() || propertyType == "void") return false;
-    if (getter && setter && managedTypeName(setter->parameters.front().type, metadata) != propertyType) return false;
+        ? managedReturnType(*getter, metadata)
+        : managedTypeName(setter->parameters.front().type, metadata, type.imageName);
+    if (propertyType.empty() || propertyType == "void" || !supportedCSharpType(propertyType) ||
+        (getter && hasUnresolvedGenericArity(getter->returnType, metadata)) ||
+        (setter && hasUnresolvedGenericArity(setter->parameters.front().type, metadata))) return false;
+    if (getter && setter && managedTypeName(setter->parameters.front().type, metadata,
+                                            type.imageName) != propertyType) return false;
     if (getter && setter && getter->isStatic != setter->isStatic) return false;
     const MethodModel* principal = getter ? getter : setter;
     if (declaringType.kind != ManagedTypeKind::Interface) {
@@ -1563,7 +1839,8 @@ bool appendEvent(
     const bool frameworkDelegate = reference.definitionIndex < 0 &&
         (eventType == "System.Action" || eventType == "System.EventHandler" ||
          eventType.starts_with("System.Action<") || eventType.starts_with("System.EventHandler<"));
-    if (!frameworkDelegate) return false;
+    if (!frameworkDelegate || hasUnresolvedGenericArity(
+        "type[" + std::to_string(event.typeIndex) + "]", metadata)) return false;
     const MethodModel* add = accessorMethod(type, event.add, "add_" + event.name);
     const MethodModel* remove = accessorMethod(type, event.remove, "remove_" + event.name);
     if (!add || !remove || add->parameters.size() != 1 || remove->parameters.size() != 1 ||
@@ -1585,26 +1862,46 @@ bool appendEvent(
     return true;
 }
 
-void appendMethod(
+ProjectMethodEmission appendMethod(
     std::ostringstream& output,
     const MethodEntry& entry,
     const std::string& name,
     const std::string& typeName,
     const std::string& parameters,
     const MetadataModel& metadata,
+    const TypeModel* owner,
     const TypeDeclarationInfo& declaringType,
     const MethodBodyAdapter& bodyAdapter,
     std::set<std::string>& emittedSupport,
     const std::string& indentation) {
     const auto declaration = methodDeclaration(entry, name, typeName, parameters, metadata, declaringType);
+    ProjectMethodEmission emission;
+    emission.address = entry.function->address;
+    emission.name = name;
+    emission.declarationPartial = declaration.partialMetadata;
+    if (!declaration.signatureSupported) {
+        output << indentation << "// Partial recovery: " << singleLine(declaration.signatureReason)
+               << "; method at 0x" << hexAddress(entry.function->address) << " was not emitted.\n";
+        emission.status = ProjectMethodBodyStatus::Omitted;
+        emission.reason = declaration.signatureReason;
+        emission.declarationPartial = true;
+        return emission;
+    }
     if (declaration.partialMetadata) {
         output << indentation << "// Partial recovery: native method flags are unavailable or unsupported.\n";
     }
     if (!declaration.bodyAllowed) {
         output << indentation << declaration.signature << ";\n";
-        return;
+        emission.status = ProjectMethodBodyStatus::DeclarationOnly;
+        emission.reason = "managed declaration has no body";
+        return emission;
     }
-    const auto body = bodyAdapter.emit(*entry.function, entry.method, metadata);
+    const auto body = bodyAdapter.emit(*entry.function, entry.method, metadata, owner, typeName);
+    emission.reason = body.diagnostic;
+    emission.status = body.status == MethodBodyStatus::Supported ? ProjectMethodBodyStatus::Supported :
+        body.status == MethodBodyStatus::Partial ? ProjectMethodBodyStatus::Partial :
+        ProjectMethodBodyStatus::Unsupported;
+    if (body.source.empty()) emission.status = ProjectMethodBodyStatus::Unsupported;
     if (!body.support.empty() && emittedSupport.insert(body.support).second) {
         appendIndented(output, body.support, indentation);
         output << '\n';
@@ -1622,6 +1919,7 @@ void appendMethod(
         appendIndented(output, body.source, indentation + "    ");
     }
     output << indentation << "}\n";
+    return emission;
 }
 
 struct ProjectReference {
@@ -1697,7 +1995,7 @@ std::string projectFile(
 
 ProjectWriter::ProjectWriter(ProjectWriterOptions options) : options_(std::move(options)) {}
 
-void ProjectWriter::write(
+ProjectWriteReport ProjectWriter::write(
     const std::filesystem::path& outputDirectory,
     const MetadataModel& metadata,
     const std::vector<RecoveredFunction>& functions) const {
@@ -1724,20 +2022,23 @@ void ProjectWriter::write(
         }
     }
 
-    std::map<TypeKey, TypeGroup> groups;
+    // A single metadata corpus can contain assemblies declaring different
+    // types with the same namespace and name. Keep their members separate;
+    // C# project names are disambiguated at emission time.
+    std::map<size_t, TypeGroup> groups;
     for (size_t index = 0; index < metadata.types.size(); ++index) {
         if (!includedTypes[index]) continue;
         const auto& type = metadata.types[index];
-        groups[{type.nameSpace, type.name}].metadataTypes.push_back(&type);
+        groups[index].metadataTypes.push_back(&type);
     }
     for (const auto& function : functions) {
         const auto location = index.find(function);
         if (location && !includedTypes[location->first]) continue;
-        TypeKey key{"Il2CppRecovered", "UnmatchedMethods"};
+        size_t key = metadata.types.size();
         const MethodModel* method = nullptr;
         if (location) {
             const auto& type = metadata.types[location->first];
-            key = {type.nameSpace, type.name};
+            key = location->first;
             method = &type.methods[location->second];
         }
         MethodEntry entry;
@@ -1755,10 +2056,24 @@ void ProjectWriter::write(
     sourceFiles.push_back(runtimePath);
     writeFile(runtimePath, generateRuntimeSupport(functions.empty() ? Architecture::X64 : functions.front().architecture));
 
-    const MethodBodyAdapter bodyAdapter;
+    const MethodBodyAdapter bodyAdapter(metadata);
+    ProjectWriteReport report;
+    const auto record = [&report](ProjectMethodEmission emission) {
+        switch (emission.status) {
+        case ProjectMethodBodyStatus::Supported: ++report.supported; break;
+        case ProjectMethodBodyStatus::Partial: ++report.partial; break;
+        case ProjectMethodBodyStatus::Unsupported: ++report.unsupported; break;
+        case ProjectMethodBodyStatus::DeclarationOnly: ++report.declarationOnly; break;
+        case ProjectMethodBodyStatus::Omitted: ++report.omitted; break;
+        }
+        report.methods.push_back(std::move(emission));
+    };
     std::set<std::pair<std::string, std::string>> usedTypeNames;
     std::set<std::string> usedFilePaths;
     for (auto& [key, group] : groups) {
+        const bool unmatched = key == metadata.types.size();
+        const std::string sourceNamespace = unmatched ? "Il2CppRecovered" : metadata.types[key].nameSpace;
+        const std::string sourceName = unmatched ? "UnmatchedMethods" : metadata.types[key].name;
         auto& methods = group.methods;
         std::sort(methods.begin(), methods.end(), [](const MethodEntry& left, const MethodEntry& right) {
             return std::tie(left.metadataName, left.baseName, left.token, left.definitionIndex, left.function->address, left.function->name) <
@@ -1781,7 +2096,7 @@ void ProjectWriter::write(
                     (parent.flags & 0x20) == 0 && (parent.bitfield & 0x2) == 0) nestedParent = &parent;
             }
         }
-        const bool staticType = isStaticType(group, key == TypeKey{"Il2CppRecovered", "UnmatchedMethods"});
+        const bool staticType = isStaticType(group, unmatched);
         auto declaringType = typeDeclaration(group.metadataTypes.empty() ? nullptr : group.metadataTypes.front(),
                                              staticType, nestedParent != nullptr);
         const auto generic = group.metadataTypes.empty() ? GenericDeclarationInfo{} : genericDeclaration(
@@ -1790,12 +2105,21 @@ void ProjectWriter::write(
             false,
             declaringType.kind == ManagedTypeKind::Interface);
         declaringType.partialMetadata = declaringType.partialMetadata || generic.partialMetadata;
+        if (declaringType.kind == ManagedTypeKind::Enum && !generic.parameters.empty()) {
+            // CLR/C# enums cannot be generic. Conflicting metadata still has a
+            // value-type shape, so represent it as a partial struct and keep
+            // the members available for inspection.
+            declaringType.kind = ManagedTypeKind::Struct;
+            declaringType.modifiers.clear();
+            declaringType.sealedType = true;
+            declaringType.partialMetadata = true;
+        }
 
-        const auto parts = namespaceParts(key.first);
+        const auto parts = namespaceParts(sourceNamespace);
         const auto nameSpace = join(parts, ".");
         const auto typeName = uniqueTypeName(
             nameSpace,
-            safeName(genericTypeBaseName(key.second, generic), "UnnamedType"),
+            safeName(genericTypeBaseName(sourceName, generic), "UnnamedType"),
             usedTypeNames);
         std::filesystem::path directory = outputDirectory;
         for (const auto& part : parts) directory /= part;
@@ -1865,6 +2189,12 @@ void ProjectWriter::write(
                 if (!first) output << '\n';
                 first = false;
                 const auto fieldName = uniqueFieldName(field, typeName, fieldNames);
+                const auto fieldType = managedTypeName(field.type, metadata, type->imageName);
+                if (hasUnresolvedGenericArity(field.type, metadata) || !supportedCSharpType(fieldType)) {
+                    output << bodyIndent << "// Partial recovery: field '" << fieldName
+                           << "' has unresolved C# type syntax; member was not emitted.\n";
+                    continue;
+                }
                 if (const auto blobSize = attributeBlobSize(attributeBlobs, type->imageName, field.token)) {
                     output << bodyIndent << "// Custom attribute blob: " << *blobSize
                            << " bytes; constructor and arguments are not decoded.\n";
@@ -1889,7 +2219,7 @@ void ProjectWriter::write(
                 }
                 if (declaration.literal) {
                     if (defaultValue) {
-                        output << bodyIndent << declaration.modifiers << managedTypeName(field.type, metadata) << ' '
+                        output << bodyIndent << declaration.modifiers << fieldType << ' '
                                << fieldName << " = " << *defaultValue << ";\n";
                     } else {
                         output << bodyIndent << "// Partial recovery: constant value for '" << fieldName
@@ -1900,7 +2230,7 @@ void ProjectWriter::write(
                 if (declaration.partialMetadata || (declaration.hasDefault && !defaultValue)) {
                     output << bodyIndent << "// Partial recovery: native field flags or default value are incomplete.\n";
                 }
-                output << bodyIndent << declaration.modifiers << managedTypeName(field.type, metadata) << ' ' << fieldName;
+                output << bodyIndent << declaration.modifiers << fieldType << ' ' << fieldName;
                 if (defaultValue) output << " = " << *defaultValue;
                 output << ";\n";
             }
@@ -1940,7 +2270,7 @@ void ProjectWriter::write(
                         if (property.set >= 0) reservedAccessorNames.insert("set_" + property.name);
                         first = false;
                     } else {
-                        output << bodyIndent << "// Partial recovery: property accessor metadata is incomplete.\n";
+                        output << bodyIndent << "// Partial recovery: property type or accessor metadata is unresolved.\n";
                     }
                 }
             }
@@ -1994,6 +2324,8 @@ void ProjectWriter::write(
                     first = false;
                     output << bodyIndent << "// Unsupported duplicate constructor at 0x"
                            << hexAddress(entry.function->address) << ".\n";
+                    record({entry.function->address, typeName, ProjectMethodBodyStatus::Omitted,
+                            "duplicate constructor signature", true});
                     continue;
                 }
                 if (!first) output << '\n';
@@ -2001,9 +2333,13 @@ void ProjectWriter::write(
                 if (entry.method->name == ".cctor" && !entry.method->parameters.empty()) {
                     output << bodyIndent << "// Unsupported static constructor parameters at 0x"
                            << hexAddress(entry.function->address) << ".\n";
+                    record({entry.function->address, typeName, ProjectMethodBodyStatus::Omitted,
+                            "static constructor has parameters", true});
                     continue;
                 }
-                appendMethod(output, entry, typeName, typeName, parameters, metadata, declaringType, bodyAdapter, emittedSupport, bodyIndent);
+                record(appendMethod(output, entry, typeName, typeName, parameters, metadata,
+                                    group.metadataTypes.empty() ? nullptr : group.metadataTypes.front(),
+                                    declaringType, bodyAdapter, emittedSupport, bodyIndent));
                 continue;
             }
 
@@ -2029,7 +2365,9 @@ void ProjectWriter::write(
                 output << bodyIndent << "// Generated method metadata token: 0x"
                        << hexAddress(entry.token) << ".\n";
             }
-            appendMethod(output, entry, functionName, typeName, parameters, metadata, declaringType, bodyAdapter, emittedSupport, bodyIndent);
+            record(appendMethod(output, entry, functionName, typeName, parameters, metadata,
+                                group.metadataTypes.empty() ? nullptr : group.metadataTypes.front(),
+                                declaringType, bodyAdapter, emittedSupport, bodyIndent));
         }
         output << typeIndent << "}\n";
         if (nestedParent) output << outerIndent << "}\n";
@@ -2039,15 +2377,16 @@ void ProjectWriter::write(
 
     const auto projectPath = outputDirectory / (safeName(options_.projectName, "Il2CppRecovered") + ".csproj");
     writeFile(projectPath, projectFile(options_, sourceFiles, outputDirectory));
+    return report;
 }
 
-void ProjectWriter::write(
+ProjectWriteReport ProjectWriter::write(
     const std::filesystem::path& outputDirectory,
     const MetadataModel& metadata,
     const std::vector<RecoveredFunction>& functions,
     const ProjectWriterOptions& options) {
     ProjectWriter writer(options);
-    writer.write(outputDirectory, metadata, functions);
+    return writer.write(outputDirectory, metadata, functions);
 }
 
 } // namespace il2cpprec
