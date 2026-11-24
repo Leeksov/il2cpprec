@@ -307,7 +307,6 @@ struct TypeDeclarationInfo {
     std::string modifiers;
     ManagedTypeKind kind = ManagedTypeKind::Class;
     bool sealedType = false;
-    bool hasBaseType = false;
     bool partialMetadata = false;
 };
 
@@ -317,7 +316,6 @@ TypeDeclarationInfo typeDeclaration(const TypeModel* type, bool staticType, bool
         result.modifiers = "static ";
         return result;
     }
-    result.hasBaseType = !type->baseType.empty();
     const auto flags = nativeFlags(*type);
     if (!flags) {
         result.modifiers = staticType ? "static " : "";
@@ -1237,7 +1235,11 @@ std::string stableMethodSuffix(const MethodEntry& entry) {
     return '_' + stableHash(entry.function->name + '|' + entry.metadataName);
 }
 
-std::string parameterDeclaration(const ParameterModel& parameter, size_t index, const MetadataModel& metadata) {
+std::string parameterDeclaration(
+    const ParameterModel& parameter,
+    size_t index,
+    const MetadataModel& metadata,
+    bool includeDefault) {
     std::string direction;
     std::string type = trim(parameter.type);
     for (const std::string_view candidate : {std::string_view("ref "), std::string_view("out "), std::string_view("in ")}) {
@@ -1276,7 +1278,7 @@ std::string parameterDeclaration(const ParameterModel& parameter, size_t index, 
         resolved = resolved.substr(separator + 1);
     }
     auto declaration = direction + resolved + " " + managedIdentifier(parameter.name, "param" + std::to_string(index));
-    if (direction.empty()) {
+    if (includeDefault && direction.empty()) {
         if (const auto defaultValue = parameterDefaultValue(parameter, metadata)) declaration += " = " + *defaultValue;
     }
     return declaration;
@@ -1288,11 +1290,27 @@ bool hasUnresolvedParameterDefaults(const MethodModel& method, const MetadataMod
     });
 }
 
-std::string parameterList(const MethodModel& method, const MetadataModel& metadata) {
-    std::string result = "(";
+std::string parameterList(const MethodModel& method, const MetadataModel& metadata, bool includeDefaults = true) {
+    std::vector<std::string> declarations;
+    declarations.reserve(method.parameters.size());
     for (size_t index = 0; index < method.parameters.size(); ++index) {
+        declarations.push_back(parameterDeclaration(method.parameters[index], index, metadata, includeDefaults));
+    }
+    if (includeDefaults) {
+        // Native metadata can mark a parameter optional before a later required
+        // parameter. C# cannot spell that order, so omit only the unusable
+        // default syntax while preserving the parameters and their order.
+        bool requiredAfter = false;
+        for (size_t index = declarations.size(); index-- > 0;) {
+            const auto defaultAt = declarations[index].find(" = ");
+            if (defaultAt == std::string::npos) requiredAfter = true;
+            else if (requiredAfter) declarations[index].erase(defaultAt);
+        }
+    }
+    std::string result = "(";
+    for (size_t index = 0; index < declarations.size(); ++index) {
         if (index != 0) result += ", ";
-        result += parameterDeclaration(method.parameters[index], index, metadata);
+        result += declarations[index];
     }
     return result + ")";
 }
@@ -1308,7 +1326,8 @@ std::string parameterSignatureKey(const MethodModel* method, const MetadataModel
         static_cast<size_t>(method->genericContainerIndex) < metadata.genericContainers.size()) {
         genericArity = "<" + std::to_string(metadata.genericContainers[static_cast<size_t>(method->genericContainerIndex)].typeArgumentCount) + ">";
     }
-    return genericArity + parameterList(normalized, metadata);
+    // Default values and parameter names do not distinguish C# overloads.
+    return genericArity + parameterList(normalized, metadata, false);
 }
 
 std::string uniqueMethodName(
@@ -1381,21 +1400,22 @@ MethodDeclarationInfo methodDeclaration(
         const bool newSlot = (*flags & 0x100) != 0;
         const bool abstract = (*flags & 0x400) != 0;
         const bool privateVirtual = (*flags & 0x7) != 0x6 && virtualMethod;
+        const bool canBeVirtual = declaringType.kind == ManagedTypeKind::Class &&
+            !declaringType.sealedType && declaringType.modifiers != "static " &&
+            !isStatic && !privateVirtual;
         if (privateVirtual) result.partialMetadata = true;
-        if (abstract && !privateVirtual) {
+        if (abstract && canBeVirtual && declaringType.modifiers.find("abstract ") != std::string::npos) {
             result.bodyAllowed = false;
             modifiers += "abstract ";
-        }
-        if (virtualMethod && !newSlot) {
-            if (!declaringType.hasBaseType && !privateVirtual) {
-                if (final && !abstract) modifiers += "sealed ";
-                modifiers += "override ";
-            } else {
-                result.partialMetadata = true;
-            }
-        } else if (virtualMethod && !declaringType.sealedType && !abstract && !privateVirtual) {
+        } else if (virtualMethod && canBeVirtual && !abstract && !final) {
             modifiers += "virtual ";
         }
+        // The generated project does not emit base-class declarations. An
+        // `override` (or `sealed override`) would therefore claim a base member
+        // which is absent from the generated C# type graph. Preserve the method
+        // body and mark the relationship as incomplete instead.
+        if (virtualMethod && (!newSlot || !canBeVirtual || final)) result.partialMetadata = true;
+        if (abstract && result.bodyAllowed) result.partialMetadata = true;
         if (final && (abstract || !virtualMethod || newSlot)) result.partialMetadata = true;
         if (isStatic && (virtualMethod || abstract)) result.partialMetadata = true;
     } else {

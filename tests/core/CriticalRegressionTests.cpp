@@ -216,7 +216,75 @@ TEST_CASE("generic and virtual methods emit declared type parameters and modifie
     const auto source = readSources(output.path);
     if (source.find("unsafe partial class Box<T>") == std::string::npos ||
         source.find("public virtual TMethod Identity<TMethod>(TMethod value)") == std::string::npos ||
-        source.find("public override int Run()") == std::string::npos) {
+        source.find("public virtual int Run()") == std::string::npos ||
+        source.find("public override int Run()") != std::string::npos) {
+        fail("Generated sources:\n" + source, __FILE__, __LINE__);
+    }
+}
+
+TEST_CASE("enum and static class declarations use legal CSharp modifiers") {
+    MetadataModel metadata;
+    TypeModel enumeration;
+    enumeration.name = "Mode";
+    enumeration.flags = 0x1 | 0x80 | 0x100;
+    enumeration.bitfield = 0x2;
+    enumeration.fields.push_back({"value__", "int", 0, false, 0, 0, -1});
+    metadata.types.push_back(enumeration);
+
+    TypeModel utility;
+    utility.name = "Utility";
+    utility.flags = 0x1 | 0x80 | 0x100;
+    utility.fields.push_back({"Value", "int", 0, true, 0, 0x16, -1});
+    metadata.types.push_back(utility);
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/type-modifier-emission");
+    ProjectWriter::write(output.path, metadata, {}, {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    if (source.find("public enum Mode : int") == std::string::npos ||
+        source.find("public static unsafe partial class Utility") == std::string::npos ||
+        source.find("unsafe enum") != std::string::npos ||
+        source.find("abstract sealed") != std::string::npos) {
+        fail("Generated sources:\n" + source, __FILE__, __LINE__);
+    }
+}
+
+TEST_CASE("optional defaults do not create invalid or duplicate CSharp signatures") {
+    MetadataModel metadata;
+    metadata.parameterDefaultValues.push_back({0, -1, -1});
+    TypeModel type;
+    type.name = "Factory";
+    type.flags = 1;
+    MethodModel optional;
+    optional.name = "Create";
+    optional.returnType = "object";
+    optional.flags = 0x16;
+    optional.isStatic = true;
+    optional.address = 0x1000;
+    optional.parameters = {{"value", "object", 0}};
+    type.methods.push_back(optional);
+    MethodModel required = optional;
+    required.address = 0x2000;
+    required.parameters = {{"value", "object", -1}};
+    type.methods.push_back(required);
+    MethodModel mixed = optional;
+    mixed.name = "Mixed";
+    mixed.address = 0x3000;
+    mixed.parameters = {{"optional", "object", 0}, {"required", "int", -1}};
+    type.methods.push_back(mixed);
+    metadata.types.push_back(type);
+
+    std::vector<RecoveredFunction> functions = {
+        namedBody("Create", 0x1000), namedBody("Create", 0x2000), namedBody("Mixed", 0x3000)
+    };
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/default-parameter-emission");
+    ProjectWriter::write(output.path, metadata, functions, {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    if (source.find("Create(object value = null)") == std::string::npos ||
+        source.find("Create_0x2000(object value)") == std::string::npos ||
+        source.find("Mixed(object optional, int required)") == std::string::npos ||
+        source.find("Mixed(object optional = null, int required)") != std::string::npos) {
         fail("Generated sources:\n" + source, __FILE__, __LINE__);
     }
 }
