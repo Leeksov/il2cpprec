@@ -859,6 +859,12 @@ AbiRuntimeProfile AbiRuntimeProfile::modernFiveArgument() {
 
 AbiRuntimeProfile AbiRuntimeProfile::forMetadataVersion(double version) {
     if (version <= 0) return unity2017();
+    if (version == 16 || version == 18) {
+        auto result = unity2017();
+        result.id = "il2cpp-legacy-four-arg-invoker";
+        result.adjustorThunks = false;
+        return result;
+    }
     if (version < 24) return legacyThreeArgument();
     if (version < 27) return unity2017();
     if (version < 29) return modernFourArgument();
