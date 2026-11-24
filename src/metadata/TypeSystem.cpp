@@ -3,6 +3,7 @@
 #include <il2cpprec/ida/SourceProfile.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <iomanip>
 #include <limits>
@@ -194,11 +195,12 @@ bool parseTypeReference(std::string_view type, size_t& index) {
 class ReferenceResolver {
 public:
     explicit ReferenceResolver(const MetadataModel& metadata)
-        : metadata_(metadata), resolving_(metadata.typeReferences.size(), false) {}
+        : metadata_(metadata) {}
 
     std::string resolve(size_t index, size_t depth = 0) {
-        if (index >= metadata_.typeReferences.size() || depth > maxDepth || resolving_[index]) return "object";
-        resolving_[index] = true;
+        if (index >= metadata_.typeReferences.size() || depth > maxDepth ||
+            std::find(path_.begin(), path_.begin() + depth, index) != path_.begin() + depth) return "object";
+        path_[depth] = index;
         const TypeReferenceModel& reference = metadata_.typeReferences[index];
         const auto code = static_cast<Il2CppTypeCode>(reference.code);
         std::string result;
@@ -262,7 +264,6 @@ public:
             }
         }
 
-        resolving_[index] = false;
         if (result.empty()) result = "object";
         if (reference.byRef && code != Il2CppTypeCode::ByRef && !result.starts_with("ref ")) {
             result.insert(0, "ref ");
@@ -311,7 +312,7 @@ private:
     }
 
     const MetadataModel& metadata_;
-    std::vector<bool> resolving_;
+    std::array<size_t, maxDepth + 1> path_{};
 };
 
 std::string constructorName(const MethodModel& method) {

@@ -659,6 +659,67 @@ bool discoverLegacyGlobal(const BinaryImage& binary, MetadataModel& metadata,
     return true;
 }
 
+// Metadata 24.0/24.1 predates the CodeGenModule back pointers. Its metadata
+// registration consists of eight count/table pairs; the field-offset and
+// type-definition-size tables have the same number of entries.
+bool validEarlyMetadataRegistration(const BinaryImage& binary, size_t offset,
+                                    const MetadataModel& metadata) {
+    constexpr size_t pairCount = 8;
+    constexpr size_t pointerBytes = 8;
+    const auto& bytes = *binary.bytes;
+    if (offset > bytes.size() || pairCount * 2 * pointerBytes > bytes.size() - offset) return false;
+    uint32_t counts[pairCount]{};
+    size_t tables[pairCount]{};
+    constexpr size_t elementSizes[pairCount] = {8, 8, 12, 8, 12, 8, 4, 8};
+    for (size_t pair = 0; pair < pairCount; ++pair) {
+        const auto pairOffset = offset + pair * 2 * pointerBytes;
+        if (!readCount(bytes, pairOffset, pointerBytes, counts[pair]) ||
+            counts[pair] > maxLegacyMethodPointerCount || counts[pair] == 0) return false;
+        const auto pointer = readPointer(bytes, pairOffset + pointerBytes, pointerBytes);
+        size_t tableSize = 0;
+        if (!arraySize(counts[pair], elementSizes[pair], tableSize) ||
+            !mapPointer(binary, pointer, tableSize, tables[pair])) return false;
+    }
+    if (counts[5] != counts[6] || counts[3] < counts[5]) return false;
+    if (!metadata.types.empty() && counts[5] != metadata.types.size()) return false;
+
+    // Check several independent type entries. A mapped pointer table alone
+    // can be a coincidental match in a large native image.
+    const uint32_t samples[] = {0, 1, counts[3] / 4, counts[3] / 2,
+                                counts[3] * 3 / 4, counts[3] - 1};
+    for (const auto index : samples) {
+        const auto typePointer = read64(bytes, tables[3] + static_cast<size_t>(index) * pointerBytes);
+        size_t typeOffset = 0;
+        if (typePointer == 0 || !mapPointer(binary, typePointer, 16, typeOffset)) return false;
+        const auto code = bytes[typeOffset + 10];
+        if (code == 0 || (code > 0x21 && code != 0x40 && code != 0x41 &&
+                          code != 0x45 && code != 0x55 && code != 0xff)) return false;
+        if ((code == 0x11 || code == 0x12 || code == 0x55) &&
+            !metadata.types.empty() && read32(bytes, typeOffset) >= metadata.types.size()) return false;
+    }
+    return true;
+}
+
+void discoverEarlyMetadataRegistration(const BinaryImage& binary, MetadataModel& metadata) {
+    if (binary.format != BinaryFormat::MachO || binary.architecture != Architecture::Arm64 ||
+        metadata.version < 24.0 || metadata.version >= 24.2 ||
+        metadata.metadataRegistrationAddress != 0) return;
+    constexpr size_t registrationSize = 8 * 2 * sizeof(uint64_t);
+    const auto& bytes = *binary.bytes;
+    if (bytes.size() < registrationSize) return;
+    uint64_t discovered = 0;
+    for (size_t offset = 0; offset <= bytes.size() - registrationSize; offset += sizeof(uint64_t)) {
+        // These two neighboring counts are equal in this registration layout.
+        if (read32(bytes, offset + 5 * 16) != read32(bytes, offset + 6 * 16)) continue;
+        if (!validEarlyMetadataRegistration(binary, offset, metadata)) continue;
+        uint64_t address = 0;
+        if (!fileOffsetToPointer(binary, offset, address)) continue;
+        if (discovered != 0 && address != discovered) return;
+        discovered = address;
+    }
+    metadata.metadataRegistrationAddress = discovered;
+}
+
 } // namespace
 
 void discoverCodeGenModules(const BinaryImage& binary, MetadataModel& metadata) {
@@ -673,6 +734,7 @@ void discoverCodeGenModules(const BinaryImage& binary, MetadataModel& metadata,
     const auto layouts = layoutsForVersion(metadata.version);
     if (layouts.empty()) {
         if (metadata.version == 0 || metadata.version < 24.2) discoverLegacyGlobal(binary, metadata, validation);
+        discoverEarlyMetadataRegistration(binary, metadata);
         return;
     }
 

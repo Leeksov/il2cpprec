@@ -89,12 +89,16 @@ VerificationResult SemanticVerifier::verify(
 
     for (const auto& block : function.blocks) {
         for (const auto& statement : block.statements) {
-            if (!inside(image, statement.address)) {
-                finding(result, "statement-outside-image", statement.address, "IR statement is outside native method bytes");
-            } else if (!decoded.contains(statement.address)) {
-                finding(result, "statement-not-decoded", statement.address, "IR statement does not start at a decoded instruction");
-            } else {
-                represented.insert(statement.address);
+            // Address zero marks a statement synthesized by an IR pass. It has
+            // no native instruction to map and is not an out-of-bounds byte.
+            if (statement.address != 0) {
+                if (!inside(image, statement.address)) {
+                    finding(result, "statement-outside-image", statement.address, "IR statement is outside native method bytes");
+                } else if (!decoded.contains(statement.address)) {
+                    finding(result, "statement-not-decoded", statement.address, "IR statement does not start at a decoded instruction");
+                } else {
+                    represented.insert(statement.address);
+                }
             }
             std::unordered_set<const Expression*> visited;
             checkExpression(statement.destination, statement.address, result, visited);

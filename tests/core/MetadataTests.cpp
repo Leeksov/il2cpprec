@@ -55,6 +55,27 @@ BinaryImage moduleBinary() {
     return binary;
 }
 
+BinaryImage earlyMachOMetadataBinary() {
+    BinaryImage binary;
+    binary.architecture = Architecture::Arm64;
+    binary.format = BinaryFormat::MachO;
+    binary.imageBase = 0x100000000;
+    binary.bytes = std::make_shared<std::vector<uint8_t>>(0x900, 0);
+    binary.sections.push_back({"__DATA", binary.imageBase, 0x900, 0, 0x900, false});
+    auto& bytes = *binary.bytes;
+    const uint32_t counts[] = {1, 1, 1, 4, 1, 2, 2, 1};
+    const uint64_t tables[] = {0x600, 0x620, 0x640, 0x300, 0x660, 0x500, 0x580, 0x680};
+    for (size_t i = 0; i < 8; ++i) {
+        put64(bytes, 0x100 + i * 16, counts[i]);
+        put64(bytes, 0x108 + i * 16, binary.imageBase + tables[i]);
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        put64(bytes, 0x300 + i * 8, binary.imageBase + 0x400 + i * 16);
+        bytes[0x400 + i * 16 + 10] = 0x08; // Il2CppTypeCode::I4
+    }
+    return binary;
+}
+
 } // namespace
 
 TEST_CASE("metadata accepts minimal legacy and modern headers") {
@@ -201,6 +222,36 @@ TEST_CASE("codegen module discovery rejects invalid pointer ranges and counts") 
     put64(*binary.bytes, 0x08, 0);
     discoverCodeGenModules(binary, metadata);
     CHECK(metadata.methodPointersByImage.empty() || metadata.methodPointersByImage.at("Assembly-CSharp.dll").empty());
+}
+
+TEST_CASE("early Mach-O metadata registration requires consistent mapped type tables") {
+    auto binary = earlyMachOMetadataBinary();
+    MetadataModel metadata;
+    metadata.version = 24.0;
+    metadata.types.resize(2);
+    discoverCodeGenModules(binary, metadata);
+    CHECK_EQ(metadata.metadataRegistrationAddress, binary.imageBase + 0x100);
+
+    binary = earlyMachOMetadataBinary();
+    put64(*binary.bytes, 0x100 + 6 * 16, 3);
+    metadata.metadataRegistrationAddress = 0;
+    discoverCodeGenModules(binary, metadata);
+    CHECK_EQ(metadata.metadataRegistrationAddress, 0);
+
+    binary = earlyMachOMetadataBinary();
+    (*binary.bytes)[0x400 + 10] = 0xfe;
+    discoverCodeGenModules(binary, metadata);
+    CHECK_EQ(metadata.metadataRegistrationAddress, 0);
+
+    binary = earlyMachOMetadataBinary();
+    put64(*binary.bytes, 0x300, binary.imageBase + 0x1000);
+    discoverCodeGenModules(binary, metadata);
+    CHECK_EQ(metadata.metadataRegistrationAddress, 0);
+
+    binary = earlyMachOMetadataBinary();
+    std::memcpy(binary.bytes->data() + 0x700, binary.bytes->data() + 0x100, 0x80);
+    discoverCodeGenModules(binary, metadata);
+    CHECK_EQ(metadata.metadataRegistrationAddress, 0);
 }
 
 TEST_CASE("method resolver uses discovered module pointers and sorted ranges") {

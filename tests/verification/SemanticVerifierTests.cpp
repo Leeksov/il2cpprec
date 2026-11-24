@@ -44,6 +44,15 @@ int main() {
     assert(clean.representedInstructions == 1);
     assert(clean.unmappedInstructions == 1); // NOP is not a semantic mismatch.
 
+    auto synthesized = recovered;
+    synthesized.blocks[0].statements[0].address = 0;
+    const auto synthesizedResult = SemanticVerifier{}.verify(image, synthesized);
+    assert(synthesizedResult.status == VerificationStatus::NoFinding);
+
+    auto misplaced = recovered;
+    misplaced.blocks[0].statements[0].address = 0x2000;
+    assert(hasFinding(SemanticVerifier{}.verify(image, misplaced), "statement-outside-image"));
+
     auto duplicated = recovered;
     duplicated.blocks.push_back(duplicated.blocks.front());
     const auto duplicateResult = SemanticVerifier{}.verify(image, duplicated);
