@@ -2,15 +2,22 @@
 #include "MetadataFixtures.hpp"
 
 #include <il2cpprec/metadata/GlobalMetadata.hpp>
+#include <il2cpprec/emit/ProjectWriter.hpp>
 #include <il2cpprec/versions/Version38.hpp>
 #include <il2cpprec/versions/Version108.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace il2cpprec::tests {
@@ -973,6 +980,112 @@ TEST_CASE("v111 rejects negative truncated and parameter overflowing signatures"
     fixture = valid;
     fixture.bytes[methods + 5] = 2;
     expectInvalid(fixture);
+}
+
+TEST_CASE("modern project emission reports opaque ABI values and unresolved calls") {
+    MetadataModel metadata;
+    metadata.version = 24.0;
+    TypeModel type;
+    type.nameSpace = "ModernSafety";
+    type.name = "Case";
+    type.imageName = "Assembly-CSharp.dll";
+    type.flags = 1;
+    const auto method = [](std::string name, std::string returnType, uint64_t address) {
+        MethodModel result;
+        result.name = std::move(name);
+        result.returnType = std::move(returnType);
+        result.address = address;
+        result.isStatic = true;
+        result.flags = 0x16;
+        result.imageName = "Assembly-CSharp.dll";
+        result.declaringType = "ModernSafety.Case";
+        return result;
+    };
+    type.methods.push_back(method("UnboundMethodInfo", "int", 0x1000));
+    type.methods.push_back(method("UnresolvedCall", "void", 0x2000));
+    type.methods.push_back(method("FloatResult", "float", 0x3000));
+    auto floatParameter = method("FloatParameter", "void", 0x4000);
+    floatParameter.parameters.push_back({"value", "float", -1});
+    type.methods.push_back(std::move(floatParameter));
+    metadata.types.push_back(type);
+
+    const auto function = [](std::string name, uint64_t address, std::vector<Statement> statements) {
+        RecoveredFunction result;
+        result.architecture = Architecture::Arm64;
+        result.address = address;
+        result.name = "ModernSafety.Case__" + std::move(name);
+        result.blocks.push_back({address, std::move(statements)});
+        return result;
+    };
+    Statement methodInfoReturn;
+    methodInfoReturn.kind = Statement::Kind::Return;
+    methodInfoReturn.address = 0x1000;
+    methodInfoReturn.value = reg("x1", ScalarType::pointer(64));
+    Statement nativeCall;
+    nativeCall.kind = Statement::Kind::Call;
+    nativeCall.address = 0x2000;
+    nativeCall.target = constant(0x9000, ScalarType::pointer(64));
+    Statement voidReturn;
+    voidReturn.kind = Statement::Kind::Return;
+    voidReturn.address = 0x2004;
+    Statement floatReturn;
+    floatReturn.kind = Statement::Kind::Return;
+    floatReturn.address = 0x3000;
+    floatReturn.value = reg("s0", ScalarType::floatBits(32));
+    Statement floatUse;
+    floatUse.kind = Statement::Kind::Assign;
+    floatUse.address = 0x4000;
+    floatUse.destination = reg("s1", ScalarType::floatBits(32));
+    floatUse.value = reg("s0", ScalarType::floatBits(32));
+    Statement parameterReturn;
+    parameterReturn.kind = Statement::Kind::Return;
+    parameterReturn.address = 0x4004;
+
+    const auto output = std::filesystem::temp_directory_path() /
+        ("il2cpprec-modern-emission-safety-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } cleanup{output};
+    std::filesystem::create_directories(output);
+    const auto report = ProjectWriter::write(output, metadata, {
+        function("UnboundMethodInfo", 0x1000, {methodInfoReturn}),
+        function("UnresolvedCall", 0x2000, {nativeCall, voidReturn}),
+        function("FloatResult", 0x3000, {floatReturn}),
+        function("FloatParameter", 0x4000, {floatUse, parameterReturn})
+    }, {"ModernSafety", "netstandard2.1", {}, {"Assembly-CSharp.dll"}});
+    std::map<uint64_t, ProjectMethodEmission> byAddress;
+    for (const auto& emission : report.methods) byAddress.emplace(emission.address, emission);
+    CHECK_EQ(byAddress.size(), 4);
+    CHECK_EQ(report.supported + report.partial + report.unsupported +
+             report.declarationOnly + report.omitted, 4);
+    CHECK(byAddress.at(0x1000).status != ProjectMethodBodyStatus::Supported);
+    CHECK(!byAddress.at(0x1000).reason.empty());
+    CHECK(byAddress.at(0x2000).status != ProjectMethodBodyStatus::Supported);
+    CHECK(!byAddress.at(0x2000).reason.empty());
+    if (byAddress.at(0x3000).status != ProjectMethodBodyStatus::Supported) {
+        CHECK(!byAddress.at(0x3000).reason.empty());
+    }
+    if (byAddress.at(0x4000).status != ProjectMethodBodyStatus::Supported) {
+        CHECK(!byAddress.at(0x4000).reason.empty());
+    }
+    std::ifstream generated(output / "ModernSafety" / "Case.cs", std::ios::binary);
+    CHECK(generated.good());
+    const std::string source(std::istreambuf_iterator<char>{generated}, std::istreambuf_iterator<char>{});
+    CHECK(source.find("x1 = 0") == std::string::npos);
+    CHECK(source.find("x1 = default") == std::string::npos);
+    if (byAddress.at(0x3000).status == ProjectMethodBodyStatus::Supported) {
+        CHECK(source.find("float FloatResult()") != std::string::npos);
+        CHECK(source.find("Partial recovery of method 0x3000") == std::string::npos);
+    }
+    if (byAddress.at(0x4000).status == ProjectMethodBodyStatus::Supported) {
+        CHECK(source.find("FloatParameter(float value)") != std::string::npos);
+        CHECK(source.find("Partial recovery of method 0x4000") == std::string::npos);
+    }
 }
 
 } // namespace
