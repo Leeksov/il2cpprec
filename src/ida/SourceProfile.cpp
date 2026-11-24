@@ -729,7 +729,10 @@ const SourceProfile& unity2017_4_11f1Profile() noexcept {
         "2017.4.11f1",
         "24.1",
         "libil2cpp/Unity_2017.4/2017.4.11f1",
-        true
+        true,
+        24.1,
+        NativeProfileConfidence::Exact,
+        "Unity 2017.4.11f1 layout"
     };
     return profile;
 }
@@ -740,7 +743,10 @@ const SourceProfile& metadata24BaseProfile() noexcept {
         "24.x",
         "24.0-24.5",
         "libil2cpp metadata 24 native layout family",
-        false
+        false,
+        24.0,
+        NativeProfileConfidence::Compatible,
+        "Metadata 24 layout family"
     };
     return profile;
 }
