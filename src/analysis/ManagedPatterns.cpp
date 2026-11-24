@@ -1,4 +1,5 @@
 #include <il2cpprec/analysis/ManagedPatterns.hpp>
+#include <il2cpprec/analysis/RuntimeHelpers.hpp>
 
 #include <il2cpprec/metadata/GenericMethodResolver.hpp>
 
@@ -89,6 +90,13 @@ public:
     }
 
     void run() {
+        for (const auto& evidence : RuntimeHelpers{}.infer(function_)) {
+            if (evidence.role == RuntimeHelperRole::ClassInit &&
+                !methodsByAddress_.contains(evidence.targetAddress) &&
+                !genericsByAddress_.contains(evidence.targetAddress)) {
+                inferredClassInitSites_.insert({evidence.blockIndex, evidence.statementIndex});
+            }
+        }
         for (size_t blockIndex = 0; blockIndex < function_.blocks.size(); ++blockIndex) {
             constants_.clear();
             symbolic_.clear();
@@ -116,6 +124,7 @@ private:
     std::unordered_map<std::string, uint64_t> constants_;
     std::unordered_map<std::string, ExpressionPtr> symbolic_;
     std::unordered_map<std::string, AllocationState> allocations_;
+    std::set<std::pair<size_t, size_t>> inferredClassInitSites_;
 
     ScalarType pointerType() const {
         return ScalarType::pointer(pointerBits_);
@@ -707,7 +716,8 @@ private:
             valueArgument = options_.isInstValueArgument;
         } else if (options_.nullCheckAddresses.contains(targetAddress)) {
             kind = ManagedOperationKind::NullCheck;
-        } else if (options_.runtimeClassInitAddresses.contains(targetAddress)) {
+        } else if (options_.runtimeClassInitAddresses.contains(targetAddress) ||
+                   inferredClassInitSites_.contains({blockIndex, statementIndex})) {
             kind = ManagedOperationKind::RuntimeClassInit;
             typeArgument = options_.runtimeClassInitTypeArgument;
         }
@@ -715,7 +725,12 @@ private:
 
         auto result = operation(*kind, blockIndex, statementIndex, statement);
         result.status = ManagedPatternStatus::Resolved;
-        result.confidence = ManagedPatternConfidence::High;
+        const bool inferred = *kind == ManagedOperationKind::RuntimeClassInit &&
+            !options_.runtimeClassInitAddresses.contains(targetAddress);
+        result.confidence = inferred ? ManagedPatternConfidence::Medium : ManagedPatternConfidence::High;
+        if (inferred) {
+            result.reason = "The guarded zero test and matching write to one identify a class-init call site.";
+        }
         result.destination = statement.destination;
         result.targetAddress = targetAddress;
         if (valueArgument < statement.arguments.size()) result.object = statement.arguments[valueArgument];

@@ -1,4 +1,5 @@
 #include <il2cpprec/IR.hpp>
+#include <il2cpprec/analysis/RuntimeHelpers.hpp>
 
 #include <il2cpprec/flow/Structurer.hpp>
 
@@ -341,6 +342,7 @@ private:
     std::set<const Expression*> conflictingLoads_;
     std::set<uint64_t> blockAddresses_;
     std::set<uint64_t> referencedAddresses_;
+    std::set<uint64_t> inferredClassInitCalls_;
     std::vector<CSharpDiagnostic> diagnostics_;
     std::set<std::pair<uint64_t, std::string>> diagnosticKeys_;
     ExceptionPlan exceptionPlan_;
@@ -682,6 +684,9 @@ private:
     void prepare() {
         if (prepared_) return;
         prepared_ = true;
+        for (const auto& evidence : RuntimeHelpers{}.infer(function_)) {
+            if (evidence.role == RuntimeHelperRole::ClassInit) inferredClassInitCalls_.insert(evidence.callAddress);
+        }
         normalizeLoadTypes();
         returnType_ = nativePointerType_;
         bool sawReturn = false;
@@ -1199,6 +1204,9 @@ private:
         if (!statement.target) {
             output << indentation(level) << unsupported(ScalarType::intBits(32), "Call without a target") << ";\n";
             return;
+        }
+        if (inferredClassInitCalls_.contains(statement.address)) {
+            output << indentation(level) << "// Likely IL2CPP class initialization helper (guarded call).\n";
         }
         std::string invocation;
         if (isUnsupportedCallTarget(statement.target)) {
