@@ -483,9 +483,15 @@ private:
     }
 
     static bool hasWriteback(const NativeInstruction& instruction) {
+        if (instruction.writeback == WritebackMode::PreIndex) return true;
         std::string text = instruction.text;
         text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) { return std::isspace(c) != 0; }), text.end());
         return text.find('!') != std::string::npos;
+    }
+
+    ExpressionPtr decodedPostIndexOffset(const NativeInstruction& instruction) const {
+        if (!instruction.writebackRegister.empty()) return readOperandRegister(instruction.writebackRegister);
+        return constant(static_cast<uint32_t>(instruction.writebackOffset), wordType());
     }
 
     void addAssignmentWithCondition(const NativeInstruction& instruction, const std::string& destination,
@@ -660,7 +666,7 @@ private:
         }
         const int index = std::stoi(name.substr(1));
         if (name[0] == 's' && index >= 0 && index <= 31) return ScalarType::floatBits(32);
-        if (name[0] == 'd' && index >= 0 && index <= 15) return ScalarType::floatBits(64);
+        if (name[0] == 'd' && index >= 0 && index <= 31) return ScalarType::floatBits(64);
         return ScalarType::unknown();
     }
 
@@ -759,33 +765,58 @@ private:
         }
         const auto open = text.find('[', begin);
         const auto close = open == std::string::npos ? std::string::npos : text.find(']', open);
-        if (open == std::string::npos || close == std::string::npos || close != open + 2) return -1;
-        const char lane = text[open + 1];
-        return lane == '0' || lane == '1' ? lane - '0' : -1;
+        if (open == std::string::npos || close == std::string::npos || close == open + 1) return -1;
+        int lane = 0;
+        for (size_t position = open + 1; position < close; ++position) {
+            if (!std::isdigit(static_cast<unsigned char>(text[position]))) return -1;
+            lane = lane * 10 + text[position] - '0';
+            if (lane >= 16) return -1;
+        }
+        return lane;
     }
 
-    ExpressionPtr readLane32(const Operand& operand, int lane) const {
-        if (lane < 0 || lane > 1 || vfpStorageType(operand.reg).bits != 64) return nullptr;
+    ExpressionPtr readLane(const Operand& operand, int lane, uint32_t width) const {
+        if (width != 8 && width != 16 && width != 32) return nullptr;
+        if (lane < 0 || lane >= static_cast<int>(64 / width) || vfpStorageType(operand.reg).bits != 64) return nullptr;
         auto bits = readVfpBits(operand);
-        if (lane != 0) bits = binary(">>", bits, constant(32, doubleWordType()), doubleWordType());
-        return cast(bits, wordType());
+        if (lane != 0) bits = binary(">>", bits, constant(lane * width, doubleWordType()), doubleWordType());
+        return cast(bits, ScalarType::uintBits(width));
     }
 
-    bool writeLane32(const NativeInstruction& instruction, const Operand& destination, int lane,
-                     ExpressionPtr value) {
-        if (!value || lane < 0 || lane > 1 || vfpStorageType(destination.reg).bits != 64) return false;
-        const auto shift = static_cast<uint32_t>(lane * 32);
-        const auto mask = shift == 0 ? 0xFFFFFFFF00000000ULL : 0xFFFFFFFFULL;
+    bool writeLane(const NativeInstruction& instruction, const Operand& destination, int lane,
+                   uint32_t width, ExpressionPtr value) {
+        if (!value || width == 0 || width > 32 || lane < 0 ||
+            lane >= static_cast<int>(64 / width) || vfpStorageType(destination.reg).bits != 64) return false;
+        const auto shift = static_cast<uint32_t>(lane * width);
+        const uint64_t laneMask = (uint64_t{1} << width) - 1;
+        const auto mask = ~(laneMask << shift);
         const auto preserved = binary("&", readVfpBits(destination), constant(mask, doubleWordType()), doubleWordType());
-        auto inserted = cast(value, doubleWordType());
+        auto inserted = binary("&", cast(value, doubleWordType()), constant(laneMask, doubleWordType()), doubleWordType());
         if (shift != 0) inserted = binary("<<", inserted, constant(shift, doubleWordType()), doubleWordType());
         return addVfpAssignment(instruction, destination, binary("|", preserved, inserted, doubleWordType()));
     }
 
-    ExpressionPtr splat32(ExpressionPtr value) {
-        const auto low = cast(value, doubleWordType());
-        const auto high = binary("<<", low, constant(32, doubleWordType()), doubleWordType());
-        return binary("|", high, low, doubleWordType());
+    static uint32_t neonWidth(const std::string& mnemonic) {
+        const auto dot = mnemonic.rfind('.');
+        if (dot == std::string::npos || dot + 1 >= mnemonic.size()) return 0;
+        const bool typed = mnemonic[dot + 1] == 'i' || mnemonic[dot + 1] == 's' || mnemonic[dot + 1] == 'u';
+        const auto suffix = mnemonic.substr(dot + (typed ? 2 : 1));
+        if (suffix == "8") return 8;
+        if (suffix == "16") return 16;
+        if (suffix == "32") return 32;
+        if (suffix == "64") return 64;
+        return 0;
+    }
+
+    static ExpressionPtr splat(ExpressionPtr value, uint32_t width) {
+        const auto mask = (uint64_t{1} << width) - 1;
+        const auto lane = binary("&", cast(value, doubleWordType()), constant(mask, doubleWordType()), doubleWordType());
+        ExpressionPtr result = constant(0, doubleWordType());
+        for (uint32_t shift = 0; shift < 64; shift += width) {
+            auto part = shift == 0 ? lane : binary("<<", lane, constant(shift, doubleWordType()), doubleWordType());
+            result = binary("|", result, part, doubleWordType());
+        }
+        return result;
     }
 
     bool liftNeonMove(const NativeInstruction& instruction) {
@@ -813,7 +844,9 @@ private:
         const auto destinationLane = laneIndex(0);
         const auto sourceLane = laneIndex(1);
         if (destinationLane >= 0 && ops[1].kind == OperandKind::Register) {
-            return writeLane32(instruction, ops[0], destinationLane, readRegister(ops[1].reg));
+            const auto width = neonWidth(mnemonic);
+            if (width != 8 && width != 16 && width != 32) return false;
+            return writeLane(instruction, ops[0], destinationLane, width, readRegister(ops[1].reg));
         }
         if (ops[0].kind == OperandKind::Register && ops[1].kind == OperandKind::Register && sourceLane >= 0) {
             return false;
@@ -823,20 +856,22 @@ private:
 
     bool liftNeonDup(const NativeInstruction& instruction) {
         const auto& ops = instruction.operands;
-        if (ops.size() != 2 || instruction.mnemonic != "vdup.32" ||
+        const auto width = neonWidth(instruction.mnemonic);
+        if (ops.size() != 2 || (width != 8 && width != 16 && width != 32) ||
             ops[0].kind != OperandKind::Register || vfpStorageType(ops[0].reg).bits != 64) return false;
         if (ops[1].kind != OperandKind::Register) return false;
         if (vfpStorageType(ops[1].reg).bits == 64) {
-            return addVfpAssignment(instruction, ops[0], splat32(readLane32(ops[1], laneIndex(1))));
+            const auto lane = readLane(ops[1], laneIndex(1), width);
+            return lane && addVfpAssignment(instruction, ops[0], splat(lane, width));
         }
-        return addVfpAssignment(instruction, ops[0], splat32(readRegister(ops[1].reg)));
+        return addVfpAssignment(instruction, ops[0], splat(readRegister(ops[1].reg), width));
     }
 
     bool liftNeonArithmetic(const NativeInstruction& instruction) {
         const auto& ops = instruction.operands;
-        const bool is32 = instruction.mnemonic.ends_with(".i32");
-        const bool is64 = instruction.mnemonic.ends_with(".i64");
-        if ((!is32 && !is64) || (ops.size() != 3 && !(ops.size() == 2 && instruction.id == ARM_INS_VMVN))) return false;
+        const auto width = neonWidth(instruction.mnemonic);
+        if ((width != 8 && width != 16 && width != 32 && width != 64) ||
+            (ops.size() != 3 && !(ops.size() == 2 && instruction.id == ARM_INS_VMVN))) return false;
         for (const auto& operand : ops) {
             if (operand.kind != OperandKind::Register || vfpStorageType(operand.reg).bits != 64) return false;
         }
@@ -853,16 +888,20 @@ private:
         case ARM_INS_VEOR: operation = "^"; break;
         default: return false;
         }
-        if (is64) {
+        if (width == 64) {
             return addVfpAssignment(instruction, ops[0],
                 binary(operation, readVfpBits(ops[1]), readVfpBits(ops[2]), doubleWordType()));
         }
-        for (int lane = 0; lane < 2; ++lane) {
-            const auto left = readLane32(ops[1], lane);
-            const auto right = readLane32(ops[2], lane);
-            if (!writeLane32(instruction, ops[0], lane, binary(operation, left, right, wordType()))) return false;
+        ExpressionPtr packed = constant(0, doubleWordType());
+        for (uint32_t lane = 0; lane < 64 / width; ++lane) {
+            const auto left = readLane(ops[1], lane, width);
+            const auto right = readLane(ops[2], lane, width);
+            if (!left || !right) return false;
+            auto part = cast(binary(operation, left, right, ScalarType::uintBits(width)), doubleWordType());
+            if (lane != 0) part = binary("<<", part, constant(lane * width, doubleWordType()), doubleWordType());
+            packed = binary("|", packed, part, doubleWordType());
         }
-        return true;
+        return addVfpAssignment(instruction, ops[0], packed);
     }
 
     bool liftVfpCompare(const NativeInstruction& instruction) {
@@ -920,7 +959,7 @@ private:
         const auto storage = vfpStorageType(ops[0].reg);
         if (storage.bits == 0) return false;
         const auto& memory = ops[1];
-        const bool postIndex = ops.size() == 3;
+        const bool postIndex = instruction.writeback == WritebackMode::PostIndex || ops.size() == 3;
         const bool preIndex = hasWriteback(instruction);
         if (postIndex && preIndex) return false;
         const auto& base = memory.memoryBase;
@@ -931,7 +970,9 @@ private:
         if (instruction.id == ARM_INS_VLDR) addVfpAssignment(instruction, ops[0], load(address, storage));
         else addStore(instruction, address, readVfpStorage(ops[0]));
         if (postIndex || preIndex) {
-            const auto offset = postIndex ? postIndexOffset(ops[2]) : memoryOffset(memory);
+            const auto offset = postIndex
+                ? (ops.size() == 3 ? postIndexOffset(ops[2]) : decodedPostIndexOffset(instruction))
+                : memoryOffset(memory);
             if (!offset) return false;
             addAssignment(instruction, base, binary("+", cast(readOperandRegister(base), pointerType()),
                 cast(offset, pointerType()), pointerType()));
@@ -1026,9 +1067,12 @@ private:
         const auto& ops = instruction.operands;
         if (ops.size() == 2 && ops[0].kind == OperandKind::Register && ops[1].kind == OperandKind::Register &&
             vfpStorageType(ops[0].reg).bits == 0 && laneIndex(1) >= 0) {
-            const auto value = readLane32(ops[1], laneIndex(1));
+            const auto width = neonWidth(instruction.mnemonic);
+            const auto value = readLane(ops[1], laneIndex(1), width);
             if (!value) return false;
-            addAssignment(instruction, ops[0].reg, value);
+            const auto extended = instruction.mnemonic.starts_with("vmov.s")
+                ? signExtend(value, width) : zeroExtend(value, width);
+            addAssignment(instruction, ops[0].reg, extended);
             return true;
         }
         if (ops.size() == 2 && ops[0].kind == OperandKind::Register && vfpStorageType(ops[0].reg).bits == 64 &&
@@ -1091,10 +1135,15 @@ private:
         const auto sourceStorage = vfpStorageType(ops[1].reg);
         if (destinationType.bits == 0 || sourceType.bits == 0 || destinationStorage.bits == 0 || sourceStorage.bits == 0 ||
             destinationStorage.bits != destinationType.bits || sourceStorage.bits != sourceType.bits) return false;
-        if (destinationType.kind != ScalarKind::FloatingPoint && instruction.id != ARM_INS_VCVTR) return false;
+        if (destinationType.kind != ScalarKind::FloatingPoint &&
+            sourceType.kind != ScalarKind::FloatingPoint) return false;
         const auto source = readVfp(ops[1], sourceType);
         if (!source) return false;
-        return addVfpAssignment(instruction, ops[0], cast(source, destinationType));
+        auto converted = source;
+        if (destinationType.kind != ScalarKind::FloatingPoint && instruction.id == ARM_INS_VCVTR) {
+            converted = unary("round_ties_even", converted, sourceType);
+        }
+        return addVfpAssignment(instruction, ops[0], cast(converted, destinationType));
     }
 
     bool liftVfp(const NativeInstruction& instruction) {
@@ -1109,7 +1158,7 @@ private:
         if (instruction.id == ARM_INS_VMOV) return liftVfpMove(instruction);
         if (instruction.id == ARM_INS_VMVN && !instruction.operands.empty() &&
             instruction.operands.back().kind == OperandKind::Immediate) return liftVfpMove(instruction);
-        if (instruction.mnemonic.ends_with(".i32") || instruction.mnemonic.ends_with(".i64")) {
+        if (neonWidth(instruction.mnemonic) != 0) {
             return liftNeonArithmetic(instruction);
         }
         if (instruction.id == ARM_INS_VMVN) return liftVfpMove(instruction);
@@ -1556,7 +1605,7 @@ private:
         }
         if (ops.size() > memoryIndex + 2) return false;
         const auto& memory = ops[memoryIndex];
-        const bool postIndex = ops.size() == memoryIndex + 2;
+        const bool postIndex = instruction.writeback == WritebackMode::PostIndex || ops.size() == memoryIndex + 2;
         const bool preIndex = hasWriteback(instruction);
         if (postIndex && preIndex) return false;
         const auto& base = memory.memoryBase;
@@ -1596,7 +1645,9 @@ private:
         }
 
         if (postIndex || preIndex) {
-            const auto offset = postIndex ? postIndexOffset(ops.back()) : memoryOffset(memory);
+            const auto offset = postIndex
+                ? (ops.size() == memoryIndex + 2 ? postIndexOffset(ops.back()) : decodedPostIndexOffset(instruction))
+                : memoryOffset(memory);
             if (!offset) return false;
             const auto updated = binary("+", cast(readOperandRegister(base), pointerType()),
                                         cast(offset, pointerType()), pointerType());

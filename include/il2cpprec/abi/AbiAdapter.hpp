@@ -36,6 +36,7 @@ struct AbiRuntimeProfile {
     AbiMethodInfoPointerLayout methodInfoPointers = AbiMethodInfoPointerLayout::MethodPointerOnly;
     bool adjustorThunks = false;
     bool unresolvedReducedSignatures = false;
+    bool genericContexts = true;
     MethodInfoArgumentPolicy generatedMethodInfo = MethodInfoArgumentPolicy::Append;
 
     static AbiRuntimeProfile automatic();
@@ -103,7 +104,8 @@ enum class AbiValueRole {
     MethodPointer,
     Instance,
     Parameters,
-    InvokerContext
+    InvokerContext,
+    InvokerReturnStorage = InvokerContext
 };
 
 enum class AbiValueKind {
@@ -248,6 +250,9 @@ struct CallSiteAbiSpec {
     ExpressionPtr virtualMethodPointer;
     ExpressionPtr invokerMethod;
     ExpressionPtr invokerContext;
+    // Fifth argument of modern InvokerMethod: storage for the native return value.
+    // invokerContext remains accepted for callers of the original API.
+    ExpressionPtr invokerReturnStorage;
     ExpressionPtr methodInfo;
     ExpressionPtr genericClassInstance;
     ExpressionPtr genericMethodInstance;
@@ -281,6 +286,7 @@ struct CallSiteAbiModel {
     ExpressionPtr virtualMethodPointer;
     ExpressionPtr invokerMethod;
     ExpressionPtr invokerContext;
+    ExpressionPtr invokerReturnStorage;
     ExpressionPtr methodInfo;
     std::string targetRuntimeHelper;
     std::string methodInfoRuntimeHelper;

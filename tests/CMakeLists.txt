@@ -18,8 +18,11 @@ add_executable(il2cpprec_core_tests
     core/GoldenTests.cpp
     core/Legacy2017Tests.cpp
     core/LegacyVersionMatrixTests.cpp
+    core/LegacyMatrixExpansionTests.cpp
     core/MetadataTests.cpp
     core/PipelineTests.cpp
+    modern/MetadataFixtures.cpp
+    modern/ModernMetadataTests.cpp
 )
 target_link_libraries(il2cpprec_core_tests PRIVATE il2cpprec)
 target_compile_definitions(il2cpprec_core_tests PRIVATE

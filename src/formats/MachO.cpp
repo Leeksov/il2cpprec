@@ -83,6 +83,8 @@ std::string fixedName(const std::vector<uint8_t>& bytes, size_t offset) {
 struct FatSlice {
     uint64_t offset = 0;
     uint64_t size = 0;
+    uint32_t cpuType = 0;
+    uint32_t cpuSubtype = 0;
 };
 
 FatSlice selectFatSlice(const std::vector<uint8_t>& data, uint32_t magic) {
@@ -113,15 +115,19 @@ FatSlice selectFatSlice(const std::vector<uint8_t>& data, uint32_t magic) {
         bestSlice.size = is64
             ? readU64(data, entry + 16, littleEndian)
             : readU32(data, entry + 12, littleEndian);
+        bestSlice.cpuType = cpuType;
+        bestSlice.cpuSubtype = cpuSubtype;
         bestScore = score;
     }
 
     if (bestScore == 0) {
         throw std::runtime_error("FAT Mach-O contains no ARM64 or ARM32 slice");
     }
-    if (bestSlice.offset > data.size() ||
+    const size_t tableEnd = kFatHeaderSize + static_cast<size_t>(architectureCount) * entrySize;
+    if (bestSlice.offset < tableEnd || bestSlice.size < kMachOHeaderSize ||
+        bestSlice.offset > data.size() ||
         bestSlice.size > data.size() - static_cast<size_t>(bestSlice.offset)) {
-        throw std::runtime_error("Selected Mach-O FAT slice extends beyond the file");
+        throw std::runtime_error("Selected Mach-O FAT slice has an invalid file range");
     }
     return bestSlice;
 }
@@ -343,6 +349,14 @@ BinaryImage MachOLoader::parse(std::shared_ptr<std::vector<uint8_t>> bytes) {
     if (!isFat) return parseThin(std::move(bytes));
 
     const FatSlice slice = selectFatSlice(*bytes, magic);
+    const auto sliceOffset = static_cast<size_t>(slice.offset);
+    const uint32_t thinMagic = readU32(*bytes, sliceOffset);
+    if (thinMagic != (slice.cpuType == kCpuTypeArm64 ? kMachOMagic64 : kMachOMagic) ||
+        readU32(*bytes, sliceOffset + 4) != slice.cpuType ||
+        (readU32(*bytes, sliceOffset + 8) & 0x00ffffffu) !=
+            (slice.cpuSubtype & 0x00ffffffu)) {
+        throw std::runtime_error("Selected Mach-O FAT slice does not match its architecture entry");
+    }
     auto sliceBytes = std::make_shared<std::vector<uint8_t>>(
         bytes->begin() + static_cast<std::ptrdiff_t>(slice.offset),
         bytes->begin() + static_cast<std::ptrdiff_t>(slice.offset + slice.size));

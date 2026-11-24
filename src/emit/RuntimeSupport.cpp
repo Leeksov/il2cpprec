@@ -203,7 +203,7 @@ public unsafe struct RuntimeVector128
             return default;
         if (count >= 64)
             return new RuntimeVector128(0, Low << (count - 64));
-        return new RuntimeVector128((Low << count) | (High >> (64 - count)), High << count);
+        return new RuntimeVector128(Low << count, (High << count) | (Low >> (64 - count)));
     }
 
     public RuntimeVector128 ShiftRightLogical(int count)
@@ -216,7 +216,7 @@ public unsafe struct RuntimeVector128
             return default;
         if (count >= 64)
             return new RuntimeVector128(High >> (count - 64), 0);
-        return new RuntimeVector128(Low >> count, (High >> count) | (Low << (64 - count)));
+        return new RuntimeVector128((Low >> count) | (High << (64 - count)), High >> count);
     }
 
     public RuntimeVector128 ShiftLeft(int count) => ShiftLeftLogical(count);

@@ -2,6 +2,8 @@
 #include "MetadataFixtures.hpp"
 
 #include <il2cpprec/metadata/GlobalMetadata.hpp>
+#include <il2cpprec/versions/Version38.hpp>
+#include <il2cpprec/versions/Version108.hpp>
 
 #include <array>
 #include <cstddef>
@@ -370,7 +372,6 @@ MetadataFixture makeDefinitionFixture(int version) {
 }
 
 void checkDefinition(const MetadataModel& metadata) {
-    REQUIRE:;
     CHECK_EQ(metadata.types.size(), 1);
     const auto& type = metadata.types.at(0);
     CHECK_EQ(type.nameSpace, "Modern");
@@ -425,7 +426,7 @@ MetadataFixture makeSpecFixture(int version) {
     RecordWriter types;
     writeType(types, version, names, TypeOptions{3, 0});
     RecordWriter images;
-    writeImage(images, version, names, ImageOptions{1, 5, 2, 2});
+    writeImage(images, version, names, ImageOptions{1, 0, 2, 2});
 
     RecordWriter classSpecs;
     classSpecs.index(0, 1);
@@ -527,7 +528,7 @@ void checkSpecs(const MetadataModel& metadata) {
     CHECK_EQ(metadata.staticConstructorTypeIndices[0], 0);
     CHECK_EQ(metadata.staticConstructorTypeIndices[1], -1);
     CHECK_EQ(metadata.images.size(), 1);
-    CHECK_EQ(metadata.images[0].rgctxRangesStart, 5);
+    CHECK_EQ(metadata.images[0].rgctxRangesStart, 0);
     CHECK_EQ(metadata.images[0].rgctxRangesCount, 2);
     CHECK_EQ(metadata.images[0].staticConstructorCount, 2);
 }
@@ -622,6 +623,73 @@ TEST_CASE("modern metadata accepts exact header sizes for versions 33 35 38 39 a
     }
 }
 
+TEST_CASE("modern fixture section positions match independent wire offsets") {
+    const auto v33 = modern::buildMetadataFixture(33);
+    CHECK_EQ(v33.layout(Section::Methods).headerOffset, 48);
+    CHECK_EQ(v33.layout(Section::TypeDefinitions).headerOffset, 160);
+    CHECK_EQ(v33.layout(Section::AttributeDataRanges).headerOffset, 208);
+
+    const auto v38 = modern::buildMetadataFixture(38);
+    CHECK_EQ(v38.layout(Section::Methods).headerOffset, 68);
+    CHECK_EQ(v38.layout(Section::TypeDefinitions).headerOffset, 236);
+    CHECK_EQ(v38.layout(Section::ExportedTypeDefinitions).headerOffset, 368);
+
+    const auto v104 = modern::buildMetadataFixture(104);
+    CHECK_EQ(v104.layout(Section::TypeInlineArrays).headerOffset, 248);
+    CHECK_EQ(v104.layout(Section::Images).headerOffset, 260);
+
+    const auto v108 = modern::buildMetadataFixture(108);
+    CHECK_EQ(v108.layout(Section::MethodSpecsOnGenericType).headerOffset, 392);
+    CHECK_EQ(v108.layout(Section::RgctxValues).headerOffset, 476);
+
+    const auto v110 = modern::buildMetadataFixture(110);
+    CHECK_EQ(v110.layout(Section::GeneratedMethodTypeInfos).headerOffset, 500);
+    CHECK_EQ(v110.layout(Section::GeneratedMethodTokens).headerOffset, 512);
+
+    const auto v111 = modern::buildMetadataFixture(111);
+    CHECK_EQ(v111.layout(Section::MethodSignatures).headerOffset, 68);
+    CHECK_EQ(v111.layout(Section::Methods).headerOffset, 80);
+    CHECK_EQ(v111.layout(Section::GeneratedMethodTokens).headerOffset, 524);
+}
+
+TEST_CASE("modern fixture builder rejects duplicate and unavailable sections") {
+    const SectionBytes strings{Section::Strings, {'a', 0}, 2};
+    checkThrows<std::invalid_argument>(
+        [&] { modern::buildMetadataFixture(38, {strings, strings}); },
+        "Duplicate fixture section", __FILE__, __LINE__);
+    checkThrows<std::invalid_argument>(
+        [&] { modern::buildMetadataFixture(33, {{Section::MethodSignatures, {1}, 1}}); },
+        "Section is not present", __FILE__, __LINE__);
+    checkThrows<std::invalid_argument>(
+        [&] { modern::buildMetadataFixture(107, {{Section::GeneratedMethodTokens, {1}, 1}}); },
+        "Section is not present", __FILE__, __LINE__);
+}
+
+TEST_CASE("modern index width boundaries preserve the negative sentinel") {
+    CHECK_EQ(Version38Header::indexWidth(254), 1);
+    CHECK_EQ(Version38Header::indexWidth(255), 2);
+    CHECK_EQ(Version38Header::indexWidth(65534), 2);
+    CHECK_EQ(Version38Header::indexWidth(65535), 4);
+    CHECK_EQ(Version108Header::indexWidth(254), 1);
+    CHECK_EQ(Version108Header::indexWidth(255), 1);
+    CHECK_EQ(Version108Header::indexWidth(256), 2);
+    CHECK_EQ(Version108Header::indexWidth(65534), 2);
+    CHECK_EQ(Version108Header::indexWidth(65535), 2);
+    CHECK_EQ(Version108Header::indexWidth(65536), 4);
+    RecordWriter sentinels;
+    sentinels.index(-1, 1);
+    sentinels.index(-1, 2);
+    sentinels.index(-1, 4);
+    CHECK_EQ(sentinels.bytes.size(), 7);
+    for (const auto byte : sentinels.bytes) CHECK_EQ(byte, 0xFF);
+    checkThrows<std::out_of_range>(
+        [&] { sentinels.index(255, 1); }, "sentinel", __FILE__, __LINE__);
+    checkThrows<std::out_of_range>(
+        [&] { sentinels.index(65535, 2); }, "sentinel", __FILE__, __LINE__);
+    checkThrows<std::out_of_range>(
+        [&] { sentinels.index(-2, 4); }, "sentinel", __FILE__, __LINE__);
+}
+
 TEST_CASE("modern metadata rejects newer binary layouts labeled with older versions") {
     auto fixture = makeLegacyFixture(35);
     modern::put32(fixture.bytes, 4, 33);
@@ -633,8 +701,17 @@ TEST_CASE("modern metadata rejects newer binary layouts labeled with older versi
     fixture = makeDefinitionFixture(38);
     modern::put32(fixture.bytes, 4, 37);
     expectInvalid(fixture);
+    fixture = makeDefinitionFixture(39);
+    modern::put32(fixture.bytes, 4, 38);
+    expectInvalid(fixture);
     fixture = makeDefinitionFixture(104);
     modern::put32(fixture.bytes, 4, 103);
+    expectInvalid(fixture);
+    fixture = makeDefinitionFixture(105);
+    modern::put32(fixture.bytes, 4, 104);
+    expectInvalid(fixture);
+    fixture = makeDefinitionFixture(106);
+    modern::put32(fixture.bytes, 4, 105);
     expectInvalid(fixture);
     fixture = makeSpecFixture(108);
     modern::put32(fixture.bytes, 4, 107);
@@ -848,6 +925,21 @@ TEST_CASE("v108 rejects spec and generic mapping indices outside their normalize
     expectInvalid(fixture);
     fixture = valid;
     fixture.bytes[valid.layout(Section::GenericMethodFunctions).dataOffset] = 9;
+    expectInvalid(fixture);
+    fixture = valid;
+    fixture.bytes[valid.layout(Section::GenericMethodFunctionsWithAdjustor).dataOffset] = 0;
+    expectInvalid(fixture);
+}
+
+TEST_CASE("v108 rejects invalid static constructor indices and image RGCTX ranges") {
+    const auto valid = makeSpecFixture(108);
+    auto fixture = valid;
+    fixture.bytes[valid.layout(Section::StaticConstructorTypeIndices).dataOffset + 1] = 1;
+    expectInvalid(fixture);
+    fixture = valid;
+    const auto images = valid.layout(Section::Images).dataOffset;
+    // The RGCTX start follows the invoker start in the v108 image record.
+    modern::put32(fixture.bytes, images + 35, 5);
     expectInvalid(fixture);
 }
 

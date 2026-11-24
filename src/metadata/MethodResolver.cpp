@@ -6,6 +6,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <utility>
 
@@ -55,6 +56,10 @@ std::string diagnosticFor(MethodResolutionError error) {
         return "legacy method has no global method pointer index";
     case MethodResolutionError::InvalidMethodToken:
         return "per-image method pointers require a non-zero MethodDef token row id";
+    case MethodResolutionError::InvalidGeneratedMethodToken:
+        return "generated method token does not match its definition index";
+    case MethodResolutionError::DuplicateMethodToken:
+        return "MethodDef token is duplicated within its image";
     case MethodResolutionError::PointerIndexOutOfRange:
         return "method pointer index is outside the image method pointer table";
     case MethodResolutionError::NullPointer:
@@ -140,6 +145,15 @@ std::optional<AddressLocation> locateAddress(const BinaryImage& binary, uint64_t
 
 PointerLookup methodPointer(const MethodModel& method, const MetadataModel& metadata) {
     PointerLookup result;
+    if (metadata.version >= 110.0 && metadata.generatedMethodsStart >= 0 &&
+        method.definitionIndex >= metadata.generatedMethodsStart) {
+        const auto tokenIndex = static_cast<size_t>(method.definitionIndex - metadata.generatedMethodsStart);
+        if (tokenIndex >= metadata.generatedMethodTokens.size() ||
+            metadata.generatedMethodTokens[tokenIndex].token != method.token) {
+            result.error = MethodResolutionError::InvalidGeneratedMethodToken;
+            return result;
+        }
+    }
     const auto image = metadata.methodPointersByImage.find(method.imageName);
     if (image == metadata.methodPointersByImage.end() || image->second.empty()) {
         result.error = MethodResolutionError::MissingMethodPointerTable;
@@ -240,6 +254,44 @@ void discoverAdjustorThunks(
     MethodResolutionResult& result) {
     const auto& metadata = result.metadata;
     if (metadata.version < 24.2 || !supportsAdjustorThunks(metadata.version) || !binary.bytes) return;
+
+    // Registration readers can provide token/pointer pairs directly. A token is
+    // only an identity when it occurs in exactly one image.
+    std::map<uint32_t, const MethodModel*> uniqueTokens;
+    std::set<uint32_t> ambiguousTokens;
+    for (const auto& type : metadata.types) {
+        for (const auto& method : type.methods) {
+            if (method.token == 0) continue;
+            if (!uniqueTokens.emplace(method.token, &method).second) ambiguousTokens.insert(method.token);
+        }
+    }
+    for (const auto& thunk : metadata.adjustorThunks) {
+        if (ambiguousTokens.contains(thunk.token) || !uniqueTokens.contains(thunk.token)) {
+            result.report.auxiliaryDiagnostics.push_back("adjustor thunk token has no unique method identity: " +
+                std::to_string(thunk.token));
+            continue;
+        }
+        const auto location = locateAddress(binary, thunk.address);
+        if (!location || !binary.sections[location->sectionIndex].executable) {
+            result.report.auxiliaryDiagnostics.push_back("adjustor thunk points outside executable code");
+            continue;
+        }
+        const auto& method = *uniqueTokens.at(thunk.token);
+        MethodAddressMetadata exported;
+        exported.fullName = dumperMethodName(method);
+        exported.token = method.token;
+        exported.imageName = method.imageName;
+        exported.declaringType = method.declaringType;
+        exported.methodIndex = method.methodIndex;
+        const auto existing = result.adjustorThunkMapping.find(location->address);
+        if (existing == result.adjustorThunkMapping.end()) {
+            result.adjustorThunkMapping.emplace(location->address, std::move(exported));
+        } else if (existing->second.token != exported.token ||
+                   existing->second.imageName != exported.imageName) {
+            result.report.auxiliaryDiagnostics.push_back("conflicting adjustor thunk address: " +
+                std::to_string(location->address));
+        }
+    }
     const auto pointerBytes = nativePointerSize(binary);
     if (binary.bytes->size() < 5 * pointerBytes) return;
 
@@ -305,7 +357,14 @@ void discoverAdjustorThunks(
                 } else {
                     exported.fullName = name + "$$AdjustorThunk_" + std::to_string(token);
                 }
-                result.adjustorThunkMapping.emplace(location->address, std::move(exported));
+                const auto existing = result.adjustorThunkMapping.find(location->address);
+                if (existing == result.adjustorThunkMapping.end()) {
+                    result.adjustorThunkMapping.emplace(location->address, std::move(exported));
+                } else if (existing->second.token != exported.token ||
+                           existing->second.imageName != exported.imageName) {
+                    result.report.auxiliaryDiagnostics.push_back(name + " conflicting adjustor thunk address: " +
+                        std::to_string(location->address));
+                }
             }
         }
     }
@@ -403,7 +462,10 @@ void discoverUnresolvedStubs(
             stub.kind = kind;
             stub.index = index;
             stub.fullName = "Il2Cpp$$" + unresolvedStubPrefix(kind) + std::to_string(index);
-            result.unresolvedStubs.emplace(stub.address, std::move(stub));
+            if (!result.unresolvedStubs.emplace(stub.address, std::move(stub)).second) {
+                result.report.auxiliaryDiagnostics.push_back(unresolvedStubPrefix(kind) +
+                    "duplicate unresolved stub address: " + std::to_string(location->address));
+            }
         }
     };
 
@@ -443,6 +505,7 @@ MethodResolutionResult MethodResolver::resolveWithReport(const MetadataModel& me
     }
 
     std::map<uint64_t, ResolvedFunction> methods;
+    std::set<std::pair<std::string, uint32_t>> seenTokens;
     for (auto& type : result.metadata.types) {
         for (auto& method : type.methods) {
             ++result.report.totalMethods;
@@ -461,10 +524,16 @@ MethodResolutionResult MethodResolver::resolveWithReport(const MetadataModel& me
                 declaration.reason = reason;
                 declaration.diagnostic = reason == DeclarationOnlyReason::EmptyAssembly
                     ? "assembly has no native method pointer table; declarations only"
-                    : "declaration has no native method body";
+                    : reason == DeclarationOnlyReason::GeneratedWithoutNativePointer
+                        ? "generated method has no confirmed native method pointer"
+                        : "declaration has no native method body";
                 ++result.report.declarationOnly;
                 result.report.declarations.push_back(std::move(declaration));
             };
+            if ((method.flags & 0x0400U) != 0) {
+                declare(DeclarationOnlyReason::ExpectedNoNativeBody);
+                continue;
+            }
             if (suppliedAddress == 0 && legacy && method.methodIndex == -1) {
                 const auto image = result.metadata.methodPointersByImage.find(method.imageName);
                 declare(image == result.metadata.methodPointersByImage.end() || image->second.empty()
@@ -496,18 +565,34 @@ MethodResolutionResult MethodResolver::resolveWithReport(const MetadataModel& me
                 result.report.unresolved.push_back(std::move(unresolved));
             };
 
+            if (!legacy && (method.token & ~tokenRowIdMask) == methodTokenType &&
+                (method.token & tokenRowIdMask) != 0 &&
+                !seenTokens.emplace(method.imageName, method.token).second) {
+                ++result.report.duplicateMethodTokens;
+                fail(MethodResolutionError::DuplicateMethodToken);
+                continue;
+            }
+
             if (lookup.error) {
+                const bool generated = result.metadata.version >= 110.0 &&
+                    result.metadata.generatedMethodsStart >= 0 &&
+                    method.definitionIndex >= result.metadata.generatedMethodsStart;
                 if (!legacy && *lookup.error == MethodResolutionError::MissingMethodPointerTable &&
-                    expectedDeclarationOnly(method)) {
-                    declare(DeclarationOnlyReason::EmptyAssembly);
+                    (expectedDeclarationOnly(method) || generated)) {
+                    declare(generated ? DeclarationOnlyReason::GeneratedWithoutNativePointer
+                                      : DeclarationOnlyReason::EmptyAssembly);
                 } else {
                     fail(*lookup.error);
                 }
                 continue;
             }
             if (normalizePointer(binary, lookup.pointer) == 0) {
-                if (!legacy && expectedDeclarationOnly(method)) {
-                    declare(DeclarationOnlyReason::ExpectedNoNativeBody);
+                const bool generated = result.metadata.version >= 110.0 &&
+                    result.metadata.generatedMethodsStart >= 0 &&
+                    method.definitionIndex >= result.metadata.generatedMethodsStart;
+                if (!legacy && (expectedDeclarationOnly(method) || generated)) {
+                    declare(generated ? DeclarationOnlyReason::GeneratedWithoutNativePointer
+                                      : DeclarationOnlyReason::ExpectedNoNativeBody);
                 } else {
                     fail(MethodResolutionError::NullPointer);
                 }
@@ -536,7 +621,11 @@ MethodResolutionResult MethodResolver::resolveWithReport(const MetadataModel& me
             auto [unused, inserted] = methods.emplace(location->address, ResolvedFunction{
                 std::move(image), location->sectionIndex, location->fileOffset});
             (void)unused;
-            if (!inserted) ++result.report.duplicateAddresses;
+            if (!inserted) {
+                ++result.report.duplicateAddresses;
+                result.report.auxiliaryDiagnostics.push_back("duplicate native method address " +
+                    std::to_string(location->address) + " for " + dumperMethodName(method));
+            }
         }
     }
 

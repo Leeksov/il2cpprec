@@ -15,6 +15,7 @@ constexpr uint16_t kDosSignature = 0x5a4d;
 constexpr uint32_t kNtSignature = 0x00004550;
 constexpr uint16_t kMachineX86 = 0x014c;
 constexpr uint16_t kMachineArm = 0x01c0;
+constexpr uint16_t kMachineThumb = 0x01c2;
 constexpr uint16_t kMachineArmNt = 0x01c4;
 constexpr uint16_t kMachineX64 = 0x8664;
 constexpr uint16_t kMachineArm64 = 0xaa64;
@@ -58,7 +59,8 @@ size_t checkedTableSize(uint16_t count, size_t entrySize) {
 }
 
 bool is32BitMachine(uint16_t machine) {
-    return machine == kMachineX86 || machine == kMachineArm || machine == kMachineArmNt;
+    return machine == kMachineX86 || machine == kMachineArm ||
+           machine == kMachineThumb || machine == kMachineArmNt;
 }
 
 bool is64BitMachine(uint16_t machine) {
@@ -69,6 +71,7 @@ Architecture architectureFor(uint16_t machine) {
     switch (machine) {
         case kMachineX86: return Architecture::X86;
         case kMachineArm:
+        case kMachineThumb:
         case kMachineArmNt: return Architecture::Arm32;
         case kMachineX64: return Architecture::X64;
         case kMachineArm64: return Architecture::Arm64;
@@ -159,6 +162,9 @@ BinaryImage parsePE(std::shared_ptr<std::vector<uint8_t>> bytes) {
         const uint64_t virtualSize = section.virtualSize != 0 ? section.virtualSize : section.fileSize;
         if (virtualSize > std::numeric_limits<uint64_t>::max() - sectionStart) {
             throw std::invalid_argument("PE section virtual address range overflows");
+        }
+        if (!is64 && sectionStart + virtualSize > uint64_t{1} << 32) {
+            throw std::invalid_argument("PE 32-bit section extends beyond the address space");
         }
         image.sections.push_back(std::move(section));
     }

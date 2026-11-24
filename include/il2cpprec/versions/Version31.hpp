@@ -51,6 +51,12 @@ struct Version31AssemblyDefinition {
     Version31AssemblyNameDefinition name;
 };
 
+struct Version31DefaultValue {
+    int32_t memberIndex = -1;
+    int32_t typeIndex = -1;
+    int32_t dataIndex = -1;
+};
+
 enum class Version31AttributeValueKind {
     Boolean,
     Char,
@@ -128,6 +134,8 @@ struct Version31AttributeBlob {
 struct Version31Metadata {
     std::vector<Version31MethodDefinition> methods;
     std::vector<Version31AssemblyDefinition> assemblies;
+    std::vector<Version31DefaultValue> fieldDefaultValues;
+    std::vector<Version31DefaultValue> parameterDefaultValues;
     std::vector<Version31AttributeBlob> attributes;
 };
 
@@ -140,6 +148,7 @@ public:
     static constexpr size_t returnParameterTokenOffset = 12;
     static constexpr size_t assemblyDefinitionStride = 64;
     static constexpr size_t attributeDataRangeStride = 8;
+    static constexpr size_t defaultValueStride = 12;
 
     Version31(const uint8_t* data, size_t size);
     explicit Version31(const std::vector<uint8_t>& data);
@@ -151,12 +160,17 @@ public:
     bool validHeader() const;
     Version31Section methodsSection() const;
     Version31Section assembliesSection() const;
+    Version31Section fieldDefaultValuesSection() const;
+    Version31Section parameterDefaultValuesSection() const;
+    Version31Section defaultValueDataSection() const;
     Version31Section attributeDataSection() const;
     Version31Section attributeDataRangesSection() const;
 
     std::optional<Version31Metadata> read() const;
     bool readMethods(std::vector<Version31MethodDefinition>& output) const;
     bool readAssemblies(std::vector<Version31AssemblyDefinition>& output) const;
+    bool readFieldDefaultValues(std::vector<Version31DefaultValue>& output) const;
+    bool readParameterDefaultValues(std::vector<Version31DefaultValue>& output) const;
     bool readAttributes(std::vector<Version31AttributeBlob>& output) const;
 
     static bool readMethods(
@@ -169,6 +183,12 @@ public:
         size_t size,
         Version31Section section,
         std::vector<Version31AssemblyDefinition>& output);
+    static bool readDefaultValues(
+        const uint8_t* data,
+        size_t size,
+        Version31Section section,
+        Version31Section valueData,
+        std::vector<Version31DefaultValue>& output);
     static bool readAttributes(
         const uint8_t* data,
         size_t size,
@@ -192,6 +212,7 @@ namespace il2cpprec {
 using versions::Version31;
 using versions::Version31AssemblyDefinition;
 using versions::Version31AssemblyNameDefinition;
+using versions::Version31DefaultValue;
 using versions::Version31Attribute;
 using versions::Version31AttributeBlob;
 using versions::Version31AttributeNamedMember;

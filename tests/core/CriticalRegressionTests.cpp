@@ -3,6 +3,7 @@
 #include <il2cpprec/IR.hpp>
 #include <il2cpprec/emit/ProjectWriter.hpp>
 #include <il2cpprec/lifters/Arm64Lifter.hpp>
+#include <il2cpprec/metadata/TypeSystem.hpp>
 
 #include <capstone/arm64.h>
 
@@ -11,6 +12,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace il2cpprec::tests {
@@ -285,6 +287,144 @@ TEST_CASE("optional defaults do not create invalid or duplicate CSharp signature
         source.find("Create_0x2000(object value)") == std::string::npos ||
         source.find("Mixed(object optional, int required)") == std::string::npos ||
         source.find("Mixed(object optional = null, int required)") != std::string::npos) {
+        fail("Generated sources:\n" + source, __FILE__, __LINE__);
+    }
+}
+
+TEST_CASE("generic constraints use the constraint index table") {
+    MetadataModel metadata;
+    metadata.genericContainers.push_back({0, 1, 0, 0});
+    metadata.genericParameters.push_back({0, "T", 1, 1, 0, 0});
+    metadata.genericParameterConstraints = {99, 1};
+    metadata.typeReferences.resize(2);
+    metadata.typeReferences[1].code = static_cast<uint8_t>(Il2CppTypeCode::Class);
+    metadata.typeReferences[1].name = "IRequirement";
+    metadata.typeReferences[1].definitionIndex = 1;
+
+    TypeModel holder;
+    holder.name = "Holder`1";
+    holder.flags = 1;
+    holder.genericContainerIndex = 0;
+    metadata.types.push_back(holder);
+    TypeModel requirement;
+    requirement.name = "IRequirement";
+    requirement.flags = 0x21;
+    metadata.types.push_back(requirement);
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/constraint-index-emission");
+    ProjectWriter::write(output.path, metadata, {}, {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    if (source.find("Holder<T> where T : IRequirement") == std::string::npos) {
+        fail("Generated sources:\n" + source, __FILE__, __LINE__);
+    }
+}
+
+TEST_CASE("v111 generated method signature and token reach project emission") {
+    MetadataModel metadata;
+    metadata.version = 111;
+    metadata.typeReferences.resize(2);
+    metadata.typeReferences[0].code = static_cast<uint8_t>(Il2CppTypeCode::I4);
+    metadata.typeReferences[1].code = static_cast<uint8_t>(Il2CppTypeCode::Boolean);
+    metadata.methodSignatures.push_back({4, 0, {1}});
+    metadata.generatedMethodsStart = 0;
+    metadata.generatedMethodTokens.push_back({0x06000042});
+    TypeModel type;
+    type.name = "Modern";
+    type.flags = 1;
+    MethodModel method;
+    method.name = "Generated";
+    method.address = 0x1000;
+    method.definitionIndex = 0;
+    method.token = 0x06000042;
+    method.flags = 0x16;
+    method.isStatic = true;
+    method.returnType = "type[0]";
+    method.signatureOffset = 4;
+    method.parameters.push_back({"flag", "type[1]", -1});
+    type.methods.push_back(method);
+    metadata.types.push_back(type);
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/v111-emission");
+    ProjectWriter::write(output.path, metadata, {namedBody("Generated", 0x1000)},
+                         {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    if (source.find("int Generated(bool flag)") == std::string::npos ||
+        source.find("Generated method metadata token: 0x6000042") == std::string::npos) {
+        fail("Generated sources:\n" + source, __FILE__, __LINE__);
+    }
+}
+
+TEST_CASE("property and framework event metadata emit CSharp members") {
+    MetadataModel metadata;
+    metadata.typeReferences.resize(1);
+    metadata.typeReferences[0].code = static_cast<uint8_t>(Il2CppTypeCode::Class);
+    metadata.typeReferences[0].name = "System.Action";
+    metadata.properties.push_back({"Name", 0, 1, 0, 0x17000001});
+    metadata.events.push_back({"Changed", 0, 2, 3, -1, 0x14000001});
+    TypeModel type;
+    type.name = "Container";
+    type.flags = 1;
+    type.propertyStart = 0;
+    type.propertyCount = 1;
+    type.eventStart = 0;
+    type.eventCount = 1;
+    const auto addMethod = [&](std::string name, int definitionIndex, uint64_t address,
+                               std::string returnType, std::vector<ParameterModel> parameters) {
+        MethodModel method;
+        method.name = std::move(name);
+        method.definitionIndex = definitionIndex;
+        method.address = address;
+        method.returnType = std::move(returnType);
+        method.parameters = std::move(parameters);
+        method.flags = 0x6;
+        type.methods.push_back(std::move(method));
+    };
+    addMethod("get_Name", 0, 0x1000, "string", {});
+    addMethod("set_Name", 1, 0x2000, "void", {{"value", "string", -1}});
+    addMethod("add_Changed", 2, 0x3000, "void", {{"value", "System.Action", -1}});
+    addMethod("remove_Changed", 3, 0x4000, "void", {{"value", "System.Action", -1}});
+    addMethod("get_Name", 4, 0x5000, "string", {});
+    metadata.types.push_back(type);
+    std::vector<RecoveredFunction> functions = {
+        namedBody("get_Name", 0x1000), namedBody("set_Name", 0x2000),
+        namedBody("add_Changed", 0x3000), namedBody("remove_Changed", 0x4000),
+        namedBody("get_Name", 0x5000)
+    };
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/property-event-emission");
+    ProjectWriter::write(output.path, metadata, functions, {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    if (source.find("string Name") == std::string::npos ||
+        source.find("event System.Action Changed") == std::string::npos ||
+        source.find("get_Name_0x1000") == std::string::npos ||
+        source.find("get_Name_0x5000") == std::string::npos ||
+        source.find("add_Changed_0x3000") == std::string::npos) {
+        fail("Generated sources:\n" + source, __FILE__, __LINE__);
+    }
+}
+
+TEST_CASE("simple nested type is emitted inside its declaring type") {
+    MetadataModel metadata;
+    TypeModel outer;
+    outer.nameSpace = "Regression";
+    outer.name = "Outer";
+    outer.flags = 1;
+    metadata.types.push_back(outer);
+    TypeModel inner;
+    inner.nameSpace = "Regression";
+    inner.name = "Inner";
+    inner.flags = 2;
+    inner.declaringTypeIndex = 0;
+    metadata.types.push_back(inner);
+
+    OutputDirectory output(
+        std::filesystem::path(IL2CPPREC_TEST_SOURCE_DIR).parent_path() / "build/tests/nested-type-emission");
+    ProjectWriter::write(output.path, metadata, {}, {"RegressionChecks", "net8.0", {}, {}});
+    const auto source = readSources(output.path);
+    if (source.find("public unsafe partial class Outer\n    {\n        public unsafe partial class Inner") == std::string::npos) {
         fail("Generated sources:\n" + source, __FILE__, __LINE__);
     }
 }

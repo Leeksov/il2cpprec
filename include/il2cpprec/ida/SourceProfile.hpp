@@ -11,6 +11,8 @@
 
 namespace il2cpprec::ida {
 
+enum class NativeInvokerSignature { Unknown, LegacyThreeArguments, FourArguments, FiveArguments };
+
 enum class CodeGenModulePresence {
     Absent,
     Present
@@ -28,6 +30,20 @@ enum class NativeProfileConfidence {
     Override,
     Unsupported
 };
+
+struct NativeProfileCapabilities {
+    NativeInvokerSignature invoker = NativeInvokerSignature::Unknown;
+    bool hiddenMethodInfo = false;
+    bool virtualMethodPointer = false;
+    bool genericContexts = false;
+    bool adjustorThunks = false;
+    bool unresolvedReducedSignatures = false;
+    bool generatedMethods = false;
+    bool managedObjectLayout = false;
+};
+
+enum class NativeTypeBitEra { Unknown, LegacyFlags, ModernPacked };
+struct NativeTypeBitLayout { bool present = false; std::size_t size = 0; std::size_t dataOffset = 0; std::size_t bitsOffset = 0; std::size_t bitsSize = 0; std::size_t codeOffset = 0; std::size_t codeSize = 0; std::size_t byRefOffset = 0; std::size_t pinnedOffset = 0; std::uint8_t byRefMask = 0; std::uint8_t pinnedMask = 0; };
 
 struct NativeFieldLayout {
     std::size_t offset = 0;
@@ -145,7 +161,9 @@ struct SourceProfile;
 
 struct SourceLayoutSelection {
     const SourceProfile* profile = nullptr;
+    int rawVersion = 0;
     double metadataVersion = 0;
+    double registrationVersion = 0;
     std::size_t pointerSize = 0;
     bool supported = false;
     bool nativeRuntimeAvailable = false;
@@ -153,6 +171,10 @@ struct SourceLayoutSelection {
     NativeProfileConfidence confidence = NativeProfileConfidence::Unsupported;
     std::string provenance;
     MethodMapping methodMapping = MethodMapping::GlobalMethodIndex;
+    NativeProfileCapabilities capabilities;
+    NativeTypeBitEra typeBitEra = NativeTypeBitEra::Unknown;
+    NativeTypeBitLayout typeBits;
+    std::size_t typedReferencePointers = 0;
     CodeGenModulePresence codeGenModules = CodeGenModulePresence::Absent;
     GlobalMetadataSourceLayout globalMetadata;
     MethodInfoSourceLayout methodInfo;
@@ -194,6 +216,7 @@ struct RegistrationProfileEvidence {
     std::optional<std::uint64_t> metadataRegistrationAddress;
     std::optional<std::uint64_t> codeRegistrationAddress;
     std::optional<bool> codeGenModulesPresent;
+    std::optional<double> registrationVersion;
 };
 
 struct SourceDetectionInput {

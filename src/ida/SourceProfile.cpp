@@ -278,7 +278,7 @@ GlobalMetadataSourceLayout makeGlobalMetadata(double version) {
     else if (versionIs(version, 24.2)) layout.typeDefinitionStride = 92;
     else if (versionIs(version, 24.3)) layout.typeDefinitionStride = 88;
     else if (versionIs(version, 24.4)) layout.typeDefinitionStride = 96;
-    else if (versionIs(version, 24.5)) layout.typeDefinitionStride = 92;
+    else if (versionIs(version, 24.5)) layout.typeDefinitionStride = 88;
     else layout.typeDefinitionStride = 88;
 
     if (version <= 24.1) layout.methodDefinitionStride = 56;
@@ -422,26 +422,60 @@ SourceLayoutSelection SourceProfile::resolve(double version, std::size_t pointer
     SourceLayoutSelection selection;
     selection.profile = this;
     selection.metadataVersion = version == 0 ? canonicalMetadataVersion : version;
+    selection.rawVersion = static_cast<int>(selection.metadataVersion);
+    selection.registrationVersion = selection.metadataVersion;
     selection.pointerSize = pointerSize;
     selection.confidence = confidence;
     selection.provenance = provenance;
     if (pointerSize != 4 && pointerSize != 8) return selection;
 
     const bool base24 = id == "il2cpp-24-base";
+    const bool alternate24_5 = id == "il2cpp-24.5-type92";
     const bool base27 = id == "il2cpp-27";
     const bool versionMatches = canonicalMetadataVersion != 0 &&
         (versionIs(selection.metadataVersion, canonicalMetadataVersion) ||
          (base27 && selection.metadataVersion >= 27.0 && selection.metadataVersion <= 27.2));
-    const bool familyMatches = base24 && selection.metadataVersion >= 24.0 && selection.metadataVersion <= 24.5;
+    const bool familyMatches = base24 && selection.metadataVersion >= 24.0 &&
+        selection.metadataVersion <= 24.5 &&
+        std::abs(selection.metadataVersion * 10 - std::round(selection.metadataVersion * 10)) < 0.001;
     if ((!versionMatches && !familyMatches) || selection.metadataVersion == 0) return selection;
 
     selection.globalMetadata = makeGlobalMetadata(selection.metadataVersion);
+    if (alternate24_5) selection.globalMetadata.typeDefinitionStride = 92;
     if (selection.globalMetadata.typeDefinitionStride == 0) return selection;
     selection.variant = versionText(selection.metadataVersion);
     selection.methodMapping = selection.metadataVersion >= 24.5
         ? MethodMapping::PerImageTokenRowId
         : MethodMapping::GlobalMethodIndex;
     selection.nativeRuntimeAvailable = selection.metadataVersion >= 24.0 && selection.metadataVersion <= 24.5;
+    selection.capabilities.hiddenMethodInfo = true;
+    selection.capabilities.genericContexts = true;
+    selection.capabilities.generatedMethods = selection.metadataVersion >= 110.0;
+    selection.capabilities.managedObjectLayout = selection.nativeRuntimeAvailable;
+    if (selection.metadataVersion <= 24.5) selection.typedReferencePointers = 3;
+    if (selection.metadataVersion == 16.0 || selection.metadataVersion == 18.0) {
+        selection.capabilities.invoker = NativeInvokerSignature::FourArguments;
+    } else if (selection.metadataVersion >= 19.0 && selection.metadataVersion <= 23.0) {
+        selection.capabilities.invoker = NativeInvokerSignature::LegacyThreeArguments;
+        selection.capabilities.unresolvedReducedSignatures = true;
+    } else if (selection.metadataVersion >= 24.0 && selection.metadataVersion <= 24.5) {
+        selection.capabilities.invoker = NativeInvokerSignature::FourArguments;
+        selection.capabilities.adjustorThunks = true;
+    } else if (selection.metadataVersion >= 27.0 && selection.metadataVersion <= 27.2) {
+        selection.capabilities.invoker = NativeInvokerSignature::FourArguments;
+        selection.capabilities.virtualMethodPointer = true;
+        selection.capabilities.adjustorThunks = true;
+    } else if (selection.metadataVersion == 29.0 || selection.metadataVersion == 29.1 ||
+               selection.metadataVersion == 31.0) {
+        selection.capabilities.invoker = NativeInvokerSignature::FiveArguments;
+        selection.capabilities.virtualMethodPointer = true;
+        selection.capabilities.adjustorThunks = true;
+    }
+    if (selection.metadataVersion <= 24.1 && selection.metadataVersion >= 16.0) {
+        selection.typeBitEra = NativeTypeBitEra::LegacyFlags;
+        selection.typeBits = {true, 2 * pointerSize, 0, pointerSize, 1,
+            pointerSize + 2, 1, pointerSize + 3, pointerSize + 3, 0x40, 0x20};
+    }
     if (selection.nativeRuntimeAvailable) {
         const bool customAttributeIndex = exact || versionIs(selection.metadataVersion, 24.0) ||
             versionIs(selection.metadataVersion, 24.1) || versionIs(selection.metadataVersion, 24.2);
@@ -460,7 +494,8 @@ SourceLayoutSelection SourceProfile::resolve(double version, std::size_t pointer
     selection.object = makeObject(pointerSize);
     selection.array = makeArray(pointerSize);
     selection.string = makeString(pointerSize);
-    if (exact) selection.variant = "2017.4.11f1-metadata-24.0";
+    if (exact) selection.variant = "2017.4.11f1-raw24-precise24.1";
+    if (alternate24_5) selection.variant = "24.5-type92-provisional";
     selection.supported = true;
     return selection;
 }
@@ -504,7 +539,23 @@ std::string SourceLayoutSelection::layoutHash() const {
     if (profile) hash.add(profile->profileHash());
     hash.add(variant);
     hash.add(versionText(metadataVersion));
+    hash.add(rawVersion);
+    hash.add(versionText(registrationVersion));
     hash.add(pointerSize);
+    hash.add(static_cast<std::uint64_t>(capabilities.invoker));
+    hash.add(capabilities.hiddenMethodInfo);
+    hash.add(capabilities.virtualMethodPointer);
+    hash.add(capabilities.genericContexts);
+    hash.add(capabilities.adjustorThunks);
+    hash.add(capabilities.unresolvedReducedSignatures);
+    hash.add(capabilities.generatedMethods);
+    hash.add(capabilities.managedObjectLayout);
+    hash.add(static_cast<std::uint64_t>(typeBitEra));
+    hash.add(typeBits.present);
+    hash.add(typeBits.size);
+    hash.add(typeBits.codeOffset);
+    hash.add(typeBits.byRefMask);
+    hash.add(typedReferencePointers);
     hash.add(supported);
     hash.add(nativeRuntimeAvailable);
     hash.add(static_cast<std::uint64_t>(methodMapping));
@@ -761,4 +812,130 @@ const SourceProfile* findSourceProfile(std::string_view unityVersion) noexcept {
     return nullptr;
 }
 
+const std::vector<const SourceProfile*>& Il2CppNativeProfileRegistry::profiles() {
+    static const std::vector<SourceProfile> catalog = [] {
+        std::vector<SourceProfile> result;
+        auto add = [&](double version) {
+            result.push_back({"il2cpp-" + versionText(version), "", versionText(version),
+                "metadata version catalog", false, version,
+                NativeProfileConfidence::Compatible, "native offsets provisional"});
+        };
+        for (double v : {16.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0}) add(v);
+        result.push_back(metadata24BaseProfile());
+        result.push_back(unity2017_4_11f1Profile());
+        result.push_back({"il2cpp-24.5-type92", "", "24.5", "alternate TypeDefinition layout",
+            false, 24.5, NativeProfileConfidence::Compatible, "provisional 92-byte candidate"});
+        result.push_back({"il2cpp-27", "", "27.0-27.2", "metadata version catalog",
+            false, 27.0, NativeProfileConfidence::Compatible, "native offsets provisional"});
+        for (double v : {29.0, 29.1, 31.0, 33.0, 35.0, 38.0,
+                         104.0, 105.0, 106.0, 107.0, 108.0, 109.0, 110.0, 111.0}) add(v);
+        return result;
+    }();
+    static const std::vector<const SourceProfile*> result = [&] {
+        std::vector<const SourceProfile*> pointers;
+        for (const auto& profile : catalog) pointers.push_back(&profile);
+        return pointers;
+    }();
+    return result;
+}
+const SourceProfile* Il2CppNativeProfileRegistry::find(std::string_view id) noexcept {
+    if (const auto* legacy = findSourceProfile(id)) return legacy;
+    for (const auto* profile : profiles()) if (profile->id == id) return profile;
+    return nullptr;
+}
+const SourceProfile* Il2CppNativeProfileRegistry::findMetadata(double version) noexcept {
+    if (!std::isfinite(version) || version <= 0 || version > 111) return nullptr;
+    if (version >= 24.0 && version <= 24.5 &&
+        std::abs(version * 10 - std::round(version * 10)) < 0.001) return &metadata24BaseProfile();
+    if (version >= 27.0 && version <= 27.2) return find("il2cpp-27");
+    return find("il2cpp-" + versionText(version));
+}
+SourceDetectionResult Il2CppNativeProfileRegistry::detect(const SourceDetectionInput& input) {
+    SourceDetectionResult result;
+    const auto raw = input.rawMetadata.empty() ? std::optional<std::uint32_t>{} : read32(input.rawMetadata, 4);
+    if (!input.rawMetadata.empty() && (read32(input.rawMetadata, 0) != 0xfab11baf || !raw)) {
+        result.error = "invalid global metadata header"; return result;
+    }
+    const double version = input.overrides.metadataVersion.value_or(input.metadataVersion.value_or(raw.value_or(0)));
+    if (!std::isfinite(version) || !findMetadata(version)) {
+        result.error = "unknown precise metadata version"; return result;
+    }
+    if (raw && static_cast<int>(version) != static_cast<int>(*raw)) {
+        result.error = "raw/precise metadata version conflict"; return result;
+    }
+    if (raw && (*raw == 24 || *raw == 27) && !input.metadataVersion &&
+        !input.overrides.metadataVersion && input.overrides.profileId.empty() && input.unityVersion.empty()) {
+        result.error = "raw metadata version has ambiguous precise layouts"; return result;
+    }
+    if (input.registration.registrationVersion &&
+        !versionIs(*input.registration.registrationVersion, version)) {
+        result.error = "registration version conflicts with metadata version"; return result;
+    }
+    const SourceProfile* profile = input.overrides.profileId.empty() ? findMetadata(version) : find(input.overrides.profileId);
+    if (!input.unityVersion.empty() && input.overrides.profileId.empty()) profile = find(input.unityVersion);
+    if (!profile) { result.error = "unknown source profile"; return result; }
+    if (profile->id == "il2cpp-24.5-type92") {
+        const auto offset = read32(input.rawMetadata, 160);
+        const auto bytes = read32(input.rawMetadata, 164);
+        if (!offset || !bytes || *bytes == 0 || *bytes % 92 != 0 || *bytes % 88 == 0 ||
+            *offset > input.rawMetadata.size() || *bytes > input.rawMetadata.size() - *offset) {
+            result.error = "92-byte TypeDefinition layout lacks unambiguous table evidence";
+            return result;
+        }
+        result.evidence.push_back("TypeDefinition stride=92");
+    }
+    const auto pointerSize = input.overrides.pointerSize.value_or(input.binary ? sourcePointerSize(*input.binary) : 0);
+    if (input.binary && input.overrides.pointerSize &&
+        *input.overrides.pointerSize != sourcePointerSize(*input.binary)) {
+        result.error = "pointer size conflicts with binary architecture"; return result;
+    }
+    result.selection = profile->resolve(version, pointerSize);
+    if (!result.selection.supported || !result.selection.nativeRuntimeAvailable)
+        result.error = "native source layout is unsupported or provisional";
+    result.selection.rawVersion = raw.value_or(static_cast<std::uint32_t>(version));
+    result.selection.registrationVersion = input.registration.registrationVersion.value_or(version);
+    if (input.overrides.globalMetadata) result.selection.globalMetadata = *input.overrides.globalMetadata;
+    if (!result.error.empty()) return result;
+    if (!validateSourceLayout(result.selection).empty()) {
+        result.error = "source layout failed structural validation"; return result;
+    }
+    if (input.registration.codeGenModulesPresent &&
+        *input.registration.codeGenModulesPresent !=
+            (result.selection.codeGenModules == CodeGenModulePresence::Present)) {
+        result.error = "CodeGenModule evidence conflicts with source layout"; return result;
+    }
+    if (input.binary) {
+        try {
+            if (input.registration.metadataRegistrationAddress &&
+                *input.registration.metadataRegistrationAddress != 0 &&
+                !metadataRegistrationValid(*input.binary, result.selection,
+                    *input.registration.metadataRegistrationAddress)) {
+                result.error = "metadata registration conflicts with source layout"; return result;
+            }
+            if (input.registration.codeRegistrationAddress &&
+                *input.registration.codeRegistrationAddress != 0 &&
+                !codeRegistrationValid(*input.binary, result.selection,
+                    *input.registration.codeRegistrationAddress)) {
+                result.error = "code registration conflicts with source layout"; return result;
+            }
+            if (input.registration.codeRegistrationAddress &&
+                *input.registration.codeRegistrationAddress != 0) {
+                const auto observed = observedCodeGenModules(*input.binary, result.selection,
+                    *input.registration.codeRegistrationAddress);
+                if (observed && *observed !=
+                    (result.selection.codeGenModules == CodeGenModulePresence::Present)) {
+                    result.error = "binary CodeGenModule table conflicts with source layout"; return result;
+                }
+            }
+        } catch (const std::exception&) {
+            result.error = "registration address is not file-backed"; return result;
+        }
+    }
+    if (input.overrides.metadataVersion || !input.overrides.profileId.empty() || input.overrides.globalMetadata) {
+        result.selection.confidence = NativeProfileConfidence::Override;
+        result.selection.provenance = "explicit override; " + result.selection.provenance;
+    }
+    result.evidence.push_back("layout hash=" + result.selection.layoutHash());
+    return result;
+}
 } // namespace il2cpprec::ida

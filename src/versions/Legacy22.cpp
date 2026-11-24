@@ -177,6 +177,7 @@ std::vector<uint64_t> readPointers(
 struct NativeMetadataRegistration {
     MetadataRegistrationInfo info;
     NativeTable metadataUsages;
+    NativeTable typeDefinitionSizes;
 };
 
 NativeMetadataRegistration readMetadataRegistration(
@@ -196,7 +197,7 @@ NativeMetadataRegistration readMetadataRegistration(
     const auto types = readTable(reader, metadataRegistrationAddress, 3, "types");
     const auto methodSpecs = readTable(reader, metadataRegistrationAddress, 4, "methodSpecs");
     const auto fieldOffsets = readTable(reader, metadataRegistrationAddress, 5, "fieldOffsets");
-    readTable(reader, metadataRegistrationAddress, 6, "typeDefinitionsSizes");
+    result.typeDefinitionSizes = readTable(reader, metadataRegistrationAddress, 6, "typeDefinitionsSizes");
     result.metadataUsages = readTable(reader, metadataRegistrationAddress, 7, "metadataUsages");
 
     result.info.genericClassesAddress = genericClasses.address;
@@ -213,6 +214,46 @@ NativeMetadataRegistration readMetadataRegistration(
     result.info.fieldOffsetsCount = fieldOffsets.count;
     result.info.metadataUsagesCount = result.metadataUsages.count;
     return result;
+}
+
+void validatePerTypeTables(
+    const ImageReader& reader,
+    const NativeMetadataRegistration& registration,
+    const MetadataModel& metadata) {
+    const size_t typeCount = metadata.types.size();
+    const auto& fields = registration.info;
+    if (fields.fieldOffsetsCount != typeCount) {
+        invalid("fieldOffsets count does not match the type definition count");
+    }
+    if (registration.typeDefinitionSizes.count != typeCount) {
+        invalid("typeDefinitionsSizes count does not match the type definition count");
+    }
+
+    const auto offsets = reader.pointerTable(fields.fieldOffsetsAddress, fields.fieldOffsetsCount, "fieldOffsets");
+    const auto sizes = reader.pointerTable(
+        registration.typeDefinitionSizes.address,
+        registration.typeDefinitionSizes.count,
+        "typeDefinitionsSizes");
+    for (size_t index = 0; index < typeCount; ++index) {
+        const auto fieldCount = metadata.types[index].fields.size();
+        if (fieldCount != 0 && offsets[index] == 0) {
+            invalid("fieldOffsets has a null entry for a type with fields");
+        }
+        if (fieldCount != 0) {
+            reader.require(offsets[index], checkedTableSize(fieldCount, sizeof(int32_t)));
+        }
+        if (sizes[index] != 0) reader.require(sizes[index], 16);
+    }
+}
+
+void validateMethodIndices(const MetadataModel& metadata, size_t pointerCount) {
+    for (const auto& type : metadata.types) {
+        for (const auto& method : type.methods) {
+            if (method.methodIndex >= 0 && static_cast<size_t>(method.methodIndex) >= pointerCount) {
+                invalid("global methodIndex is outside methodPointers");
+            }
+        }
+    }
 }
 
 class FileReader {
@@ -463,6 +504,7 @@ Legacy22ReadResult Legacy22Reader::read(
     const size_t pointerSize = inferredPointerSize(binary, pointerSize_);
     ImageReader reader(binary, pointerSize);
     auto native = readMetadataRegistration(reader, metadataRegistrationAddress, codeRegistrationAddress);
+    validatePerTypeTables(reader, native, metadata);
 
     Legacy22ReadResult result;
     result.metadata = metadata;
@@ -480,9 +522,22 @@ Legacy22ReadResult Legacy22Reader::read(
         native.info.genericMethodPointersCount = genericMethods.count;
         native.info.invokerPointersAddress = invokers.address;
         native.info.invokerPointersCount = invokers.count;
+        const size_t unresolvedPair = metadata.version == 22.0 ? 9 : 5;
+        const auto unresolved = readTable(
+            reader, codeRegistrationAddress, unresolvedPair, "unresolvedVirtualCallPointers");
+        native.info.unresolvedVirtualCallPointersAddress = unresolved.address;
+        native.info.unresolvedVirtualCallPointersCount = unresolved.count;
+        validateMethodIndices(metadata, result.code.methodPointers.size());
     }
 
     MetadataRegistrationReader{pointerSize}.read(binary, result.metadata, native.info);
+    for (const auto& signature : result.metadata.unresolvedSignatures) {
+        for (const int32_t typeIndex : signature.parameterTypeIndices) {
+            if (typeIndex < 0 || static_cast<size_t>(typeIndex) >= result.metadata.typeReferences.size()) {
+                invalid("unresolved virtual parameter type index is outside the type table");
+            }
+        }
+    }
     result.metadataUsages = readPointers(reader, native.metadataUsages, "metadataUsages");
     result.metadata.metadataUsagesCount = result.metadataUsages.size();
     result.metadataUsageAddresses.reserve(result.metadata.metadataUsagePairs.size());

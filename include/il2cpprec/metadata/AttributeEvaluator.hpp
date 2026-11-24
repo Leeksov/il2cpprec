@@ -26,6 +26,7 @@ enum class CustomAttributeValueKind : uint8_t {
     R4 = 0x0c,
     R8 = 0x0d,
     String = 0x0e,
+    SzArray = 0x1d,
     Enum = 0x55,
     Type = 0xff
 };
@@ -52,6 +53,9 @@ struct CustomAttributeValue {
     std::optional<CustomAttributeValueKind> enumUnderlyingKind;
     std::optional<uint32_t> typeIndex;
     std::string typeName;
+    std::optional<CustomAttributeValueKind> elementKind;
+    std::vector<CustomAttributeValue> elements;
+    bool arrayNull = false;
 
     bool isNull() const noexcept;
 };
@@ -138,6 +142,8 @@ struct AttributeEvaluatorOptions {
     size_t maxNamedArguments = 4096;
     size_t maxTotalArguments = 16384;
     size_t maxStringLength = 16 * 1024 * 1024;
+    size_t maxArrayElements = 1024 * 1024;
+    size_t maxValueDepth = 16;
     size_t maxBlobSize = 64 * 1024 * 1024;
     size_t maxImageRanges = 1024 * 1024;
     size_t maxDiagnostics = 128;

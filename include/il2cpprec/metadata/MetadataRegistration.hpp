@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include <il2cpprec/Model.hpp>
@@ -37,6 +38,7 @@ struct MetadataRegistrationInfo {
     uint32_t genericMethodTableEntrySize = 0;
     double registrationVersion = 0;
     MetadataVersionConfidence versionConfidence = MetadataVersionConfidence::Unknown;
+    std::string versionProvenance;
 };
 
 class MetadataRegistrationReader {

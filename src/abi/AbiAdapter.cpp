@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <string_view>
 #include <utility>
 
@@ -858,24 +859,54 @@ AbiRuntimeProfile AbiRuntimeProfile::modernFiveArgument() {
 }
 
 AbiRuntimeProfile AbiRuntimeProfile::forMetadataVersion(double version) {
-    if (version <= 0) return unity2017();
+    const auto unsupported = [] {
+        AbiRuntimeProfile result;
+        result.id = "unsupported-il2cpp-invoker-profile";
+        result.invoker = static_cast<AbiInvokerSignature>(-1);
+        return result;
+    };
+    if (!std::isfinite(version) || version <= 0) return unsupported();
     if (version == 16 || version == 18) {
         auto result = unity2017();
         result.id = "il2cpp-legacy-four-arg-invoker";
         result.adjustorThunks = false;
         return result;
     }
-    if (version < 24) return legacyThreeArgument();
-    if (version < 27) return unity2017();
-    if (version < 29) return modernFourArgument();
-    return modernFiveArgument();
+    if (version >= 19 && version <= 23 && std::floor(version) == version) return legacyThreeArgument();
+    if (version == 24 || version == 24.1 || version == 24.2 || version == 24.3 ||
+        version == 24.4 || version == 24.5) return unity2017();
+    if (version == 27 || version == 27.1 || version == 27.2) return modernFourArgument();
+    if (version == 29 || version == 29.1 || version == 31) {
+        return modernFiveArgument();
+    }
+    return unsupported();
 }
 
 AbiRuntimeProfile AbiRuntimeProfile::fromSourceLayout(const ida::SourceLayoutSelection& selection) {
+    if (!selection.supported) return forMetadataVersion(0);
     auto result = forMetadataVersion(selection.metadataVersion);
     if (selection.profile) result.id = selection.profile->id + "-abi";
-    result.adjustorThunks = selection.codeRegistration.genericAdjustorThunks.present ||
-        selection.codeGenModule.adjustorThunks.present;
+    switch (selection.capabilities.invoker) {
+    case ida::NativeInvokerSignature::LegacyThreeArguments:
+        result.invoker = AbiInvokerSignature::LegacyThreeArguments;
+        break;
+    case ida::NativeInvokerSignature::FourArguments:
+        result.invoker = AbiInvokerSignature::FourArguments;
+        break;
+    case ida::NativeInvokerSignature::FiveArguments:
+        result.invoker = AbiInvokerSignature::FiveArguments;
+        break;
+    case ida::NativeInvokerSignature::Unknown:
+        result.invoker = static_cast<AbiInvokerSignature>(-1);
+        break;
+    }
+    result.generatedMethodInfo = selection.capabilities.hiddenMethodInfo ?
+        MethodInfoArgumentPolicy::Append : MethodInfoArgumentPolicy::Omit;
+    result.methodInfoPointers = selection.capabilities.virtualMethodPointer ?
+        AbiMethodInfoPointerLayout::MethodAndVirtualMethodPointer : AbiMethodInfoPointerLayout::MethodPointerOnly;
+    result.genericContexts = selection.capabilities.genericContexts;
+    result.adjustorThunks = selection.capabilities.adjustorThunks;
+    result.unresolvedReducedSignatures = selection.capabilities.unresolvedReducedSignatures;
     return result;
 }
 
@@ -939,8 +970,10 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
     CallSiteAbiModel result;
     result.kind = spec.kind;
     result.signature.architecture = architecture;
+    const double version = metadata.versionInfo.preciseVersion > 0 ?
+        metadata.versionInfo.preciseVersion : metadata.version;
     result.runtimeProfile = options_.runtime.id == "auto" ?
-        AbiRuntimeProfile::forMetadataVersion(metadata.version) : options_.runtime;
+        AbiRuntimeProfile::forMetadataVersion(version) : options_.runtime;
     result.targetOptions = options_;
     result.targetOptions.runtime = result.runtimeProfile;
     if (spec.x64) result.targetOptions.x64 = *spec.x64;
@@ -950,6 +983,7 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
     result.virtualMethodPointer = spec.virtualMethodPointer;
     result.invokerMethod = spec.invokerMethod;
     result.invokerContext = spec.invokerContext;
+    result.invokerReturnStorage = spec.invokerReturnStorage ? spec.invokerReturnStorage : spec.invokerContext;
 
     const auto addError = [&result](AbiDiagnosticCode code, std::string message) {
         result.diagnostics.push_back({AbiDiagnosticSeverity::Error, code, std::move(message), std::nullopt});
@@ -965,7 +999,9 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
         return result;
     }
     if (const auto error = runtimeProfileError(result.runtimeProfile)) {
-        addError(AbiDiagnosticCode::UnknownCallingConvention, *error);
+        addError(AbiDiagnosticCode::UnknownCallingConvention,
+            result.runtimeProfile.id == "unsupported-il2cpp-invoker-profile" ?
+                "No verified invocation ABI for IL2CPP metadata version " + std::to_string(version) : *error);
         setUnsupportedReturn(result.signature);
         return result;
     }
@@ -1029,7 +1065,9 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
         result.targetKind = CallTargetKind::UnresolvedMethodPointer;
         result.methodInfoPolicy = result.runtimeProfile.generatedMethodInfo;
         result.target = spec.methodPointer;
-        reduced = true;
+        // An unresolved stub may expose only a reduced signature. A full
+        // invocation is safe only when the caller supplied every native type.
+        reduced = !spec.returnType || spec.parameterTypes.size() != method.parameters.size();
         break;
     case CallSiteKind::AdjustorThunk:
         result.targetKind = CallTargetKind::AdjustorThunk;
@@ -1065,6 +1103,21 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
         result.adjustorThunk.methodPointer = spec.methodPointer;
         result.adjustorThunk.thisValue = spec.adjustorThunkThis;
         result.adjustorThunk.thisOffset = spec.adjustorThunkThisOffset.value_or(0);
+    }
+    if ((spec.kind == CallSiteKind::GenericInstance || spec.genericInstance ||
+         spec.genericClassInstance || spec.genericMethodInstance) && !result.runtimeProfile.genericContexts) {
+        addError(AbiDiagnosticCode::ProfileConflict,
+            "The runtime profile does not establish a generic context calling convention");
+    }
+    if (invoker && result.runtimeProfile.invoker != AbiInvokerSignature::FiveArguments &&
+        (spec.invokerContext || spec.invokerReturnStorage)) {
+        addError(AbiDiagnosticCode::InvalidCallSignature,
+            "This invoker profile has no fifth return-storage argument");
+    }
+    if (invoker && spec.invokerContext && spec.invokerReturnStorage &&
+        spec.invokerContext != spec.invokerReturnStorage) {
+        addError(AbiDiagnosticCode::InvalidCallSignature,
+            "Conflicting fifth invoker argument values");
     }
 
     MethodModel signatureMethod = method;
@@ -1117,7 +1170,7 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
         MethodModel invokerMethod;
         invokerMethod.address = method.address;
         invokerMethod.isStatic = true;
-        invokerMethod.returnType = "void*";
+        invokerMethod.returnType = result.runtimeProfile.invoker == AbiInvokerSignature::FiveArguments ? "void" : "void*";
         BindingBuilder builder(invokerMethod, metadata, architecture, callOptions, result.signature);
         if (result.runtimeProfile.invoker != AbiInvokerSignature::LegacyThreeArguments) {
             builder.addPointer(AbiValueRole::MethodPointer, "__abi_method_pointer", "methodPointer", "Il2CppMethodPointer");
@@ -1126,7 +1179,7 @@ CallSiteAbiModel AbiAdapter::bindCallSite(
         builder.addPointer(AbiValueRole::Instance, "__abi_instance", "obj", "void*");
         builder.addPointer(AbiValueRole::Parameters, "__abi_parameters", "params", "void**");
         if (result.runtimeProfile.invoker == AbiInvokerSignature::FiveArguments) {
-            builder.addPointer(AbiValueRole::InvokerContext, "__abi_invoker_context", "context", "void*");
+            builder.addPointer(AbiValueRole::InvokerReturnStorage, "__abi_invoker_return_storage", "ret", "void*");
         }
         builder.setReturn();
         if (!result.target) result.targetRuntimeHelper = "RuntimeCalls.GetInvokerMethod";

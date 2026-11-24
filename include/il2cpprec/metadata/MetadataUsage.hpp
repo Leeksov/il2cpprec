@@ -144,11 +144,19 @@ struct MetadataUsageSignatureResult {
     std::vector<MetadataUsageDiagnostic> diagnostics;
 };
 
+struct MetadataUsageRgctxResult {
+    MetadataUsageStatus status = MetadataUsageStatus::Unresolved;
+    uint32_t token = 0;
+    std::vector<RgctxValueModel> values;
+    std::string diagnostic;
+};
+
 MetadataUsageHeaderResult readMetadataUsageHeader(const std::vector<uint8_t>& globalMetadata, double version);
 MetadataUsageSignatureResult readUnresolvedSignatures(
     const std::vector<uint8_t>& globalMetadata,
     double version,
     const MetadataModel& metadata);
+MetadataUsageRgctxResult resolveMetadataRgctx(const MetadataModel& metadata, uint32_t token);
 
 struct MetadataUsageResult {
     MetadataUsageStatus status = MetadataUsageStatus::Unresolved;

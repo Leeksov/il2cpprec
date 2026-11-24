@@ -5,6 +5,7 @@
 #include <il2cpprec/metadata/TypeSystem.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -33,7 +34,7 @@ void exact(const std::string& name, const std::function<void()>& test) {
         std::cout << "RUN " << name << '\n';
         test();
         ++passed;
-        std::cout << "PASS exact " << name << '\n';
+        std::cout << "PASS synthetic " << name << '\n';
     } catch (const std::exception& error) {
         ++failed;
         std::cout << "FAIL " << name << ": " << error.what() << '\n';
@@ -245,15 +246,20 @@ std::vector<uint8_t> headerFixture(int version) {
 int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     if (argc == 2 && std::string(argv[1]) == "--runtime-oracle") {
-        const float left = 3.0F;
-        const float right = 4.0F;
-        const float result = left + right;
-        uint32_t bits = 0;
-        std::memcpy(&bits, &result, sizeof(bits));
-        const uint64_t low = 0x402000003FA00000ULL;
-        const uint64_t high = 0x40800000C0700000ULL;
-        std::cout << std::hex << "float_result=0x" << bits << "\nvector_low=0x" << low
-                  << "\nvector_high=0x" << high << "\nvector_equal=0x1\n";
+        const auto bits = [](float value) {
+            uint32_t result = 0;
+            std::memcpy(&result, &value, sizeof(result));
+            return result;
+        };
+        volatile float left = 3.0F;
+        volatile float right = 4.0F;
+        const float vectorLeft[] = {1.25F, 2.5F, -3.75F, 4.0F};
+        const float vectorRight[] = {0.5F, -1.25F, 2.0F, 0.25F};
+        std::cout << std::hex << "float_add=0x" << bits(left + right)
+                  << "\nfloat_sqrt=0x" << bits(std::sqrt(right));
+        for (size_t lane = 0; lane < 4; ++lane)
+            std::cout << "\nvector_add_" << lane << "=0x" << bits(vectorLeft[lane] + vectorRight[lane]);
+        std::cout << '\n';
         return 0;
     }
     if (argc != 1) {
@@ -309,6 +315,26 @@ int main(int argc, char** argv) {
             require(!unresolved.diagnostic.empty(), "missing generic diagnostic");
             return unresolved.diagnostic;
         });
+        expectedPartial(prefix + "/GenericConflictingMapping", [&] {
+            auto metadata = genericMetadata(version.value);
+            auto conflict = metadata.genericMethodTable.front();
+            conflict.methodPointer = 0x9000;
+            metadata.genericMethodTable.push_back(conflict);
+            const auto resolved = GenericMethodResolver(metadata).resolve(0);
+            require(resolved.status == MetadataUsageStatus::Ambiguous,
+                "conflicting generic targets became exact");
+            require(!resolved.method && !resolved.diagnostic.empty(), "conflict lost its diagnostic");
+            return resolved.diagnostic;
+        });
+        expectedPartial(prefix + "/GenericMissingSpec", [&] {
+            auto metadata = genericMetadata(version.value);
+            metadata.methodSpecs.clear();
+            const auto resolved = GenericMethodResolver(metadata).resolve(0);
+            require(resolved.status == MetadataUsageStatus::Unresolved,
+                "generic mapping without a method spec became exact");
+            require(!resolved.method && !resolved.diagnostic.empty(), "missing spec lost its diagnostic");
+            return resolved.diagnostic;
+        });
         exact(prefix + "/MethodSignatureLegacy", [&] {
             MethodModel method;
             method.name = "Generated";
@@ -320,9 +346,9 @@ int main(int argc, char** argv) {
                 "wrong legacy method signature: " + signature);
         });
         provisionalCase(prefix + "/GeneratedMethods",
-            "generatedMethodTypeInfos/generatedMethodTokens have no production resolver or emitter consumer");
+            "generated method native behavior is not verified by this synthetic harness");
         provisionalCase(prefix + "/MethodSignatureTable",
-            "MethodModel.signatureOffset and MetadataModel.methodSignatures are not consumed by TypeSystem.methodSignature");
+            "method signature native behavior is not verified by this synthetic harness");
     }
 
     for (const int version : {24, 27, 29, 31}) {
@@ -333,16 +359,8 @@ int main(int argc, char** argv) {
     }
     for (const auto& version : versions) {
         if (version.value <= 31.0) continue;
-        expectedPartial(std::string(version.label) + "/MetadataHeaderUnsupported", [&] {
-            try {
-                static_cast<void>(GlobalMetadata{}.read(headerFixture(static_cast<int>(version.value))));
-            } catch (const std::exception& error) {
-                require(std::string(error.what()).find("Unsupported global metadata version") != std::string::npos,
-                    "unexpected header parser failure");
-                return std::string(error.what());
-            }
-            throw std::runtime_error("unsupported metadata header was accepted");
-        });
+        provisionalCase(std::string(version.label) + "/MetadataHeader",
+            "header-only bytes cannot validate a modern section layout or native behavior");
     }
 
     std::cout << "MODERN_NATIVE SUMMARY passed=" << passed << " partial=" << partial

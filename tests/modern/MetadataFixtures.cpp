@@ -76,6 +76,11 @@ void RecordWriter::u32(uint32_t value) {
 
 void RecordWriter::index(int32_t value, size_t width) {
     if (width != 1 && width != 2 && width != 4) throw std::invalid_argument("Invalid fixture index width");
+    if (value < -1 ||
+        (width == 1 && value >= std::numeric_limits<uint8_t>::max()) ||
+        (width == 2 && value >= std::numeric_limits<uint16_t>::max())) {
+        throw std::out_of_range("Fixture index cannot fit without colliding with the sentinel");
+    }
     uint32_t encoded = static_cast<uint32_t>(value);
     if (value == -1) {
         encoded = width == 1 ? std::numeric_limits<uint8_t>::max()
@@ -135,6 +140,13 @@ const std::vector<Section>& sectionOrder(int version) {
 
 MetadataFixture buildMetadataFixture(int version, const std::vector<SectionBytes>& inputs) {
     const auto& order = sectionOrder(version);
+    std::array<bool, sectionCount> supplied{};
+    for (const auto& input : inputs) {
+        const auto index = indexOf(input.section);
+        if (index >= sectionCount) throw std::invalid_argument("Unknown fixture section");
+        if (supplied[index]) throw std::invalid_argument("Duplicate fixture section");
+        supplied[index] = true;
+    }
     MetadataFixture fixture;
     fixture.version = version;
     fixture.headerSize = expectedHeaderSize(version);
@@ -151,7 +163,6 @@ MetadataFixture buildMetadataFixture(int version, const std::vector<SectionBytes
             return candidate.section == section;
         });
         if (input != inputs.end()) {
-            if (seen[indexOf(section)]) throw std::invalid_argument("Duplicate fixture section");
             seen[indexOf(section)] = true;
             if (!input->bytes.empty()) {
                 const auto padding = (4 - fixture.bytes.size() % 4) % 4;

@@ -22,12 +22,14 @@ struct VersionedDispatchLayout {
     size_t pointerSize = 0;
     VersionedVtableForm vtableForm = VersionedVtableForm::InlineVirtualInvokeData;
     size_t vtableOffset = 0;
+    std::optional<size_t> vtableCountOffset;
     size_t vtableEntrySize = 0;
     size_t methodPointerOffset = 0;
     std::optional<size_t> methodInfoOffset;
     size_t methodInfoMethodPointerOffset = 0;
     std::optional<size_t> classInterfaceOffsetsPointerOffset;
     std::optional<size_t> classInterfaceOffsetsCountOffset;
+    size_t interfaceOffsetsCountWidth = 2;
     size_t interfaceOffsetEntrySize = 0;
     size_t interfaceOffsetValueOffset = 0;
     std::optional<size_t> unresolvedCallCountOffset;

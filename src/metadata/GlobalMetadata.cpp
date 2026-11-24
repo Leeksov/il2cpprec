@@ -1,4 +1,10 @@
 #include <il2cpprec/metadata/GlobalMetadata.hpp>
+#include <il2cpprec/versions/Version33.hpp>
+#include <il2cpprec/versions/Version38.hpp>
+#include <il2cpprec/versions/Version104.hpp>
+#include <il2cpprec/versions/Version108.hpp>
+#include <il2cpprec/versions/Version110.hpp>
+#include <il2cpprec/versions/Version111.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -30,6 +36,10 @@ struct Header {
     int32_t stringLiteralDataSize = 0;
     uint32_t stringOffset = 0;
     int32_t stringSize = 0;
+    uint32_t eventsOffset = 0;
+    int32_t eventsSize = 0;
+    uint32_t propertiesOffset = 0;
+    int32_t propertiesSize = 0;
     uint32_t methodsOffset = 0;
     int32_t methodsSize = 0;
     uint32_t parameterDefaultValuesOffset = 0;
@@ -44,8 +54,16 @@ struct Header {
     int32_t fieldsSize = 0;
     uint32_t genericParametersOffset = 0;
     int32_t genericParametersSize = 0;
+    uint32_t genericParameterConstraintsOffset = 0;
+    int32_t genericParameterConstraintsSize = 0;
     uint32_t genericContainersOffset = 0;
     int32_t genericContainersSize = 0;
+    uint32_t nestedTypesOffset = 0;
+    int32_t nestedTypesSize = 0;
+    uint32_t attributeDataOffset = 0;
+    int32_t attributeDataSize = 0;
+    uint32_t attributeDataRangesOffset = 0;
+    int32_t attributeDataRangesSize = 0;
     uint32_t typeDefinitionsOffset = 0;
     int32_t typeDefinitionsSize = 0;
     uint32_t rgctxEntriesOffset = 0;
@@ -86,8 +104,14 @@ struct TypeDefinition {
     uint32_t flags = 0;
     int32_t fieldStart = -1;
     int32_t methodStart = -1;
+    int32_t eventStart = -1;
+    int32_t propertyStart = -1;
+    int32_t nestedTypeStart = -1;
     uint16_t methodCount = 0;
     uint16_t fieldCount = 0;
+    uint16_t eventCount = 0;
+    uint16_t propertyCount = 0;
+    uint16_t nestedTypeCount = 0;
     uint32_t bitfield = 0;
     uint32_t token = 0;
 };
@@ -363,6 +387,10 @@ Header readHeader(const Reader& reader) {
     header.stringLiteralDataSize = reader.i32(20);
     header.stringOffset = reader.u32(24);
     header.stringSize = reader.i32(28);
+    header.eventsOffset = reader.u32(32);
+    header.eventsSize = reader.i32(36);
+    header.propertiesOffset = reader.u32(40);
+    header.propertiesSize = reader.i32(44);
     header.methodsOffset = reader.u32(48);
     header.methodsSize = reader.i32(52);
     header.parameterDefaultValuesOffset = reader.u32(56);
@@ -377,8 +405,18 @@ Header readHeader(const Reader& reader) {
     header.fieldsSize = reader.i32(100);
     header.genericParametersOffset = reader.u32(104);
     header.genericParametersSize = reader.i32(108);
+    header.genericParameterConstraintsOffset = reader.u32(112);
+    header.genericParameterConstraintsSize = reader.i32(116);
     header.genericContainersOffset = reader.u32(120);
     header.genericContainersSize = reader.i32(124);
+    header.nestedTypesOffset = reader.u32(128);
+    header.nestedTypesSize = reader.i32(132);
+    if (version >= 31 && reader.size() >= 216) {
+        header.attributeDataOffset = reader.u32(200);
+        header.attributeDataSize = reader.i32(204);
+        header.attributeDataRangesOffset = reader.u32(208);
+        header.attributeDataRangesSize = reader.i32(212);
+    }
     header.typeDefinitionsOffset = reader.u32(160);
     header.typeDefinitionsSize = reader.i32(164);
     const size_t imagesField = header.imagesOffset;
@@ -464,9 +502,15 @@ TypeDefinition parseType(const Reader& reader, size_t base, double version, size
     cursor += 4;
     type.fieldStart = reader.i32(cursor);
     type.methodStart = reader.i32(cursor + 4);
+    type.eventStart = reader.i32(cursor + 8);
+    type.propertyStart = reader.i32(cursor + 12);
+    type.nestedTypeStart = reader.i32(cursor + 16);
     cursor += 32;
     type.methodCount = reader.u16(cursor);
+    type.propertyCount = reader.u16(cursor + 2);
     type.fieldCount = reader.u16(cursor + 4);
+    type.eventCount = reader.u16(cursor + 6);
+    type.nestedTypeCount = reader.u16(cursor + 8);
     type.bitfield = reader.u32(cursor + 16);
     if (version >= 19.0) type.token = reader.u32(cursor + 20);
     return type;
@@ -616,6 +660,15 @@ MetadataModel GlobalMetadata::read(const std::vector<uint8_t>& data) const {
 
 MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
     Reader reader(data, size);
+    reader.require(0, 8);
+    if (reader.u32(0) != sanityValue) invalid("incorrect sanity value");
+    const int32_t rawVersion = reader.i32(4);
+    if (rawVersion == 33 || rawVersion == 35) return Version33{}.read(data, size);
+    if (rawVersion == 38 || rawVersion == 39) return Version38{}.read(data, size);
+    if (rawVersion >= 104 && rawVersion <= 107) return Version104{static_cast<double>(rawVersion)}.read(data, size);
+    if (rawVersion == 108 || rawVersion == 109) return Version108{}.read(data, size);
+    if (rawVersion == 110) return Version110{}.read(data, size);
+    if (rawVersion == 111) return Version111{}.read(data, size);
     Header header = readHeader(reader);
     validateBlob(reader, header.stringOffset, header.stringSize, "string table");
     validateBlob(reader, header.stringLiteralDataOffset, header.stringLiteralDataSize, "string literal data");
@@ -728,6 +781,41 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
         fieldStride,
         "fields",
         [&](size_t base) { return parseField(reader, base, header.version, fieldStride); });
+
+    const size_t eventStride = header.version <= 24.0 ? (header.version >= 19.0 ? 28 : 24) : 24;
+    auto events = readTable<EventModel>(
+        reader, header.eventsOffset, header.eventsSize, eventStride, "events",
+        [&](size_t base) {
+            EventModel event;
+            event.name = readString(reader, header, reader.u32(base)).value_or("");
+            event.typeIndex = reader.i32(base + 4);
+            event.add = reader.i32(base + 8);
+            event.remove = reader.i32(base + 12);
+            event.raise = reader.i32(base + 16);
+            if (header.version >= 19.0) event.token = reader.u32(base + eventStride - 4);
+            return event;
+        });
+    const size_t propertyStride = header.version <= 24.0 ? (header.version >= 19.0 ? 24 : 20) : 20;
+    auto properties = readTable<PropertyModel>(
+        reader, header.propertiesOffset, header.propertiesSize, propertyStride, "properties",
+        [&](size_t base) {
+            PropertyModel property;
+            property.name = readString(reader, header, reader.u32(base)).value_or("");
+            property.get = reader.i32(base + 4);
+            property.set = reader.i32(base + 8);
+            property.attrs = reader.u32(base + 12);
+            if (header.version >= 19.0) property.token = reader.u32(base + propertyStride - 4);
+            return property;
+        });
+    auto genericParameterConstraints = readTable<int32_t>(
+        reader, header.genericParameterConstraintsOffset, header.genericParameterConstraintsSize, 4,
+        "generic parameter constraints", [&](size_t base) { return reader.i32(base); });
+    auto nestedTypes = readTable<int32_t>(
+        reader, header.nestedTypesOffset, header.nestedTypesSize, 4,
+        "nested types", [&](size_t base) { return reader.i32(base); });
+    for (const int32_t nested : nestedTypes) {
+        if (nested < 0 || static_cast<size_t>(nested) >= types.size()) invalid("nested type index is outside the types table");
+    }
 
     std::vector<int32_t> unresolvedTypes;
     std::vector<UnresolvedSignatureModel> unresolvedSignatures;
@@ -857,6 +945,9 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
     model.versionInfo.confidence = header.rawVersion == 24 && header.version != 24.0
         ? MetadataVersionConfidence::InferredLayout
         : MetadataVersionConfidence::RawHeader;
+    model.versionInfo.provenance = model.versionInfo.confidence == MetadataVersionConfidence::InferredLayout
+        ? "global-metadata:header-and-table-layout"
+        : "global-metadata:header";
     model.assemblies = std::move(assemblies);
     model.unresolvedSignatures = std::move(unresolvedSignatures);
     model.sections.stringLiterals = {
@@ -867,12 +958,16 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
         static_cast<int32_t>(header.stringOffset), header.stringSize, header.stringSize};
     model.sections.methods = {
         static_cast<int32_t>(header.methodsOffset), header.methodsSize, static_cast<int32_t>(methods.size())};
+    model.sections.events = {
+        static_cast<int32_t>(header.eventsOffset), header.eventsSize, static_cast<int32_t>(events.size())};
+    model.sections.properties = {
+        static_cast<int32_t>(header.propertiesOffset), header.propertiesSize, static_cast<int32_t>(properties.size())};
     model.sections.parameterDefaultValues = {
         static_cast<int32_t>(header.parameterDefaultValuesOffset), header.parameterDefaultValuesSize,
-        static_cast<int32_t>(model.parameterDefaultValues.size())};
+        static_cast<int32_t>(parameterDefaultValues.size())};
     model.sections.fieldDefaultValues = {
         static_cast<int32_t>(header.fieldDefaultValuesOffset), header.fieldDefaultValuesSize,
-        static_cast<int32_t>(model.fieldDefaultValues.size())};
+        static_cast<int32_t>(fieldDefaultValues.size())};
     model.sections.defaultValueData = {
         static_cast<int32_t>(header.defaultValueDataOffset), header.defaultValueDataSize, header.defaultValueDataSize};
     model.sections.parameters = {
@@ -881,22 +976,72 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
         static_cast<int32_t>(header.fieldsOffset), header.fieldsSize, static_cast<int32_t>(fields.size())};
     model.sections.genericParameters = {
         static_cast<int32_t>(header.genericParametersOffset), header.genericParametersSize,
-        static_cast<int32_t>(model.genericParameters.size())};
+        static_cast<int32_t>(genericParameters.size())};
+    model.sections.genericParameterConstraints = {
+        static_cast<int32_t>(header.genericParameterConstraintsOffset), header.genericParameterConstraintsSize,
+        static_cast<int32_t>(genericParameterConstraints.size())};
     model.sections.genericContainers = {
         static_cast<int32_t>(header.genericContainersOffset), header.genericContainersSize,
-        static_cast<int32_t>(model.genericContainers.size())};
+        static_cast<int32_t>(genericContainers.size())};
+    model.sections.nestedTypes = {
+        static_cast<int32_t>(header.nestedTypesOffset), header.nestedTypesSize,
+        static_cast<int32_t>(nestedTypes.size())};
+    model.sections.attributeData = {
+        static_cast<int32_t>(header.attributeDataOffset), header.attributeDataSize, header.attributeDataSize};
     model.sections.typeDefinitions = {
         static_cast<int32_t>(header.typeDefinitionsOffset), header.typeDefinitionsSize, static_cast<int32_t>(types.size())};
     model.sections.images = {
         static_cast<int32_t>(header.imagesOffset), header.imagesSize, static_cast<int32_t>(images.size())};
     model.sections.assemblies = {
         static_cast<int32_t>(header.assembliesOffset), header.assembliesSize, static_cast<int32_t>(model.assemblies.size())};
+    model.sections.metadataUsageLists = {
+        static_cast<int32_t>(header.metadataUsageListsOffset), header.metadataUsageListsSize,
+        static_cast<int32_t>(usageLists.size())};
+    model.sections.metadataUsagePairs = {
+        static_cast<int32_t>(header.metadataUsagePairsOffset), header.metadataUsagePairsSize,
+        static_cast<int32_t>(usagePairs.size())};
+    model.sections.unresolvedIndirectCallParameterTypes = {
+        static_cast<int32_t>(header.unresolvedTypesOffset), header.unresolvedTypesSize,
+        static_cast<int32_t>(unresolvedTypes.size())};
+    model.sections.unresolvedIndirectCallParameterRanges = {
+        static_cast<int32_t>(header.unresolvedRangesOffset), header.unresolvedRangesSize,
+        static_cast<int32_t>(model.unresolvedSignatures.size())};
     model.metadataUsageLists = std::move(usageLists);
     model.metadataUsagePairs = std::move(usagePairs);
+    model.events = std::move(events);
+    model.properties = std::move(properties);
+    model.genericParameterConstraints = std::move(genericParameterConstraints);
+    model.nestedTypes = std::move(nestedTypes);
     model.genericParameters = std::move(genericParameters);
     model.genericContainers = std::move(genericContainers);
     model.fieldDefaultValues = std::move(fieldDefaultValues);
     model.parameterDefaultValues = std::move(parameterDefaultValues);
+    if (header.attributeDataSize != 0 || header.attributeDataRangesSize != 0) {
+        validateBlob(reader, header.attributeDataOffset, header.attributeDataSize, "attribute data");
+        model.attributeData.assign(
+            reader.bytes(header.attributeDataOffset, static_cast<size_t>(header.attributeDataSize)),
+            reader.bytes(header.attributeDataOffset, static_cast<size_t>(header.attributeDataSize)) + header.attributeDataSize);
+        model.attributeDataRanges = readTable<AttributeDataRangeModel>(
+            reader, header.attributeDataRangesOffset, header.attributeDataRangesSize, 8, "attribute data ranges",
+            [&](size_t base) { return AttributeDataRangeModel{reader.u32(base), reader.u32(base + 4)}; });
+        if ((model.attributeDataRanges.empty() && !model.attributeData.empty()) ||
+            (!model.attributeDataRanges.empty() && model.attributeDataRanges.front().start != 0)) {
+            invalid("attribute data ranges do not cover the blob");
+        }
+        uint32_t previous = 0;
+        for (const auto& range : model.attributeDataRanges) {
+            if (range.start < previous || range.start > model.attributeData.size()) {
+                invalid("attribute data range is outside the blob or out of order");
+            }
+            previous = range.start;
+        }
+        if (!model.attributeDataRanges.empty() && model.attributeDataRanges.back().start != model.attributeData.size()) {
+            invalid("attribute data ranges do not end at the blob boundary");
+        }
+    }
+    model.sections.attributeDataRanges = {
+        static_cast<int32_t>(header.attributeDataRangesOffset), header.attributeDataRangesSize,
+        static_cast<int32_t>(model.attributeDataRanges.size())};
     if (header.defaultValueDataSize > 0) {
         model.defaultValueData.assign(
             data + header.defaultValueDataOffset,
@@ -911,7 +1056,7 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
         if (value.dataIndex >= 0 && static_cast<size_t>(value.dataIndex) > static_cast<size_t>(header.defaultValueDataSize)) {
             invalid("field default value data index is outside the data blob");
         }
-        fieldDefaults.insert_or_assign(value.fieldIndex, static_cast<int32_t>(index));
+        fieldDefaults.try_emplace(value.fieldIndex, static_cast<int32_t>(index));
     }
     std::unordered_map<int32_t, int32_t> parameterDefaults;
     for (size_t index = 0; index < model.parameterDefaultValues.size(); ++index) {
@@ -922,7 +1067,7 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
         if (value.dataIndex >= 0 && static_cast<size_t>(value.dataIndex) > static_cast<size_t>(header.defaultValueDataSize)) {
             invalid("parameter default value data index is outside the data blob");
         }
-        parameterDefaults.insert_or_assign(value.parameterIndex, static_cast<int32_t>(index));
+        parameterDefaults.try_emplace(value.parameterIndex, static_cast<int32_t>(index));
     }
     model.types.reserve(types.size());
     std::vector<std::string> typeImages(types.size());
@@ -962,6 +1107,12 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
         type.flags = definition.flags;
         type.bitfield = definition.bitfield;
         type.token = definition.token;
+        type.eventStart = definition.eventStart;
+        type.eventCount = definition.eventCount;
+        type.propertyStart = definition.propertyStart;
+        type.propertyCount = definition.propertyCount;
+        type.nestedTypeStart = definition.nestedTypeStart;
+        type.nestedTypeCount = definition.nestedTypeCount;
         declaringNames.push_back(qualifiedName(type));
         model.types.push_back(std::move(type));
     }
@@ -969,6 +1120,31 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
     for (size_t typeIndex = 0; typeIndex < types.size(); ++typeIndex) {
         const auto& definition = types[typeIndex];
         auto& outputType = model.types[typeIndex];
+        if (definition.fieldCount != 0 &&
+            (definition.fieldStart < 0 || static_cast<size_t>(definition.fieldStart) > fields.size() ||
+             definition.fieldCount > fields.size() - static_cast<size_t>(definition.fieldStart))) {
+            invalid("type field range is outside the fields table");
+        }
+        if (definition.methodCount != 0 &&
+            (definition.methodStart < 0 || static_cast<size_t>(definition.methodStart) > methods.size() ||
+             definition.methodCount > methods.size() - static_cast<size_t>(definition.methodStart))) {
+            invalid("type method range is outside the methods table");
+        }
+        if (definition.eventCount != 0 &&
+            (definition.eventStart < 0 || static_cast<size_t>(definition.eventStart) > model.events.size() ||
+             definition.eventCount > model.events.size() - static_cast<size_t>(definition.eventStart))) {
+            invalid("type event range is outside the events table");
+        }
+        if (definition.propertyCount != 0 &&
+            (definition.propertyStart < 0 || static_cast<size_t>(definition.propertyStart) > model.properties.size() ||
+             definition.propertyCount > model.properties.size() - static_cast<size_t>(definition.propertyStart))) {
+            invalid("type property range is outside the properties table");
+        }
+        if (definition.nestedTypeCount != 0 &&
+            (definition.nestedTypeStart < 0 || static_cast<size_t>(definition.nestedTypeStart) > model.nestedTypes.size() ||
+             definition.nestedTypeCount > model.nestedTypes.size() - static_cast<size_t>(definition.nestedTypeStart))) {
+            invalid("type nested range is outside the nested types table");
+        }
         for (uint32_t index = 0; index < definition.fieldCount; ++index) {
             const int64_t fieldIndex = static_cast<int64_t>(definition.fieldStart) + index;
             if (fieldIndex < 0 || static_cast<uint64_t>(fieldIndex) >= fields.size()) break;
@@ -988,6 +1164,13 @@ MetadataModel GlobalMetadata::read(const uint8_t* data, size_t size) const {
             const int64_t methodIndex = static_cast<int64_t>(definition.methodStart) + index;
             if (methodIndex < 0 || static_cast<uint64_t>(methodIndex) >= methods.size()) break;
             const auto& methodDefinition = methods[static_cast<size_t>(methodIndex)];
+            if (methodDefinition.parameterCount != 0 &&
+                (methodDefinition.parameterStart < 0 ||
+                 static_cast<size_t>(methodDefinition.parameterStart) > parameters.size() ||
+                 methodDefinition.parameterCount >
+                     parameters.size() - static_cast<size_t>(methodDefinition.parameterStart))) {
+                invalid("method parameter range is outside the parameters table");
+            }
             MethodModel method;
             method.token = methodDefinition.token;
             method.definitionIndex = static_cast<int>(methodIndex);

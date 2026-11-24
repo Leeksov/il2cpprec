@@ -216,9 +216,15 @@ bool valid(Legacy21VTableKind value) {
         value == Legacy21VTableKind::VirtualInvokeData;
 }
 
+bool valid(Legacy21ReversePInvokeName value) {
+    return value == Legacy21ReversePInvokeName::DelegateWrappersFromNativeToManaged ||
+        value == Legacy21ReversePInvokeName::ReversePInvokeWrapper;
+}
+
 bool hasEvidence(const Legacy21DetectionEvidence& evidence) {
     return evidence.fieldOffsets.has_value() || evidence.typeDefinitionSizes.has_value() ||
-        evidence.vtable.has_value() || evidence.hasGenericRecursionDepth.has_value();
+        evidence.vtable.has_value() || evidence.hasGenericRecursionDepth.has_value() ||
+        evidence.reversePInvokeName.has_value();
 }
 
 bool matches(
@@ -254,6 +260,14 @@ bool matches(
         mismatch = std::string("genericRecursionDepth presence is ") +
             (*evidence.hasGenericRecursionDepth ? "true" : "false") + ", expected " +
             (expectedGenericRecursionDepth ? "true" : "false");
+        return false;
+    }
+    const auto expectedReversePInvoke = variant == Legacy21Variant::Unity535
+        ? Legacy21ReversePInvokeName::DelegateWrappersFromNativeToManaged
+        : Legacy21ReversePInvokeName::ReversePInvokeWrapper;
+    if (evidence.reversePInvokeName && *evidence.reversePInvokeName != expectedReversePInvoke) {
+        mismatch = std::string("reverse P/Invoke registration is ") + toString(*evidence.reversePInvokeName) +
+            ", expected " + toString(expectedReversePInvoke);
         return false;
     }
     return true;
@@ -323,6 +337,11 @@ void expect(
     std::string code,
     std::string message) {
     if (!condition) validationError(diagnostics, std::move(code), std::move(message));
+}
+
+bool sameField(const Legacy21FieldLayout& actual, const Legacy21FieldLayout& expected) {
+    return actual.present == expected.present && actual.offset == expected.offset &&
+        actual.size == expected.size;
 }
 
 } // namespace
@@ -395,7 +414,8 @@ Legacy21DetectionResult detectLegacy21Layout(
     }
     if ((evidence.fieldOffsets && !valid(*evidence.fieldOffsets)) ||
         (evidence.typeDefinitionSizes && !valid(*evidence.typeDefinitionSizes)) ||
-        (evidence.vtable && !valid(*evidence.vtable))) {
+        (evidence.vtable && !valid(*evidence.vtable)) ||
+        (evidence.reversePInvokeName && !valid(*evidence.reversePInvokeName))) {
         addDiagnostic(
             result,
             Legacy21DetectionStatus::ConflictingEvidence,
@@ -463,6 +483,15 @@ Legacy21DetectionResult detectLegacy21Layout(
     }
 
     if (structuralVariant) {
+        std::string mismatch;
+        if (!matches(evidence, *structuralVariant, mismatch)) {
+            addDiagnostic(
+                result,
+                Legacy21DetectionStatus::ConflictingEvidence,
+                "conflicting-v21-evidence",
+                "Native layout selects " + std::string(toString(*structuralVariant)) + " but " + mismatch);
+            return result;
+        }
         confirm(result, *structuralVariant, pointerSize, "complete-matching-abi-evidence");
         return result;
     }
@@ -561,6 +590,7 @@ std::vector<Legacy21Diagnostic> validateLegacy21Layout(const Legacy21Layout& lay
 
     const std::size_t pointerSize = layout.pointerSize;
     const bool old = layout.variant == Legacy21Variant::Unity535;
+    const auto expected = makeLegacy21Layout(layout.variant, pointerSize);
     expect(
         diagnostics,
         layout.fieldOffsetStorage == (old ? Legacy21FieldOffsetStorage::FlatInt32
@@ -585,10 +615,8 @@ std::vector<Legacy21Diagnostic> validateLegacy21Layout(const Legacy21Layout& lay
     expect(
         diagnostics,
         layout.vtable.kind == expectedVtable && layout.vtable.elementSize == (old ? pointerSize : 2 * pointerSize) &&
-            layout.vtable.methodPointer.present && layout.vtable.methodPointer.offset == 0 &&
-            layout.vtable.methodPointer.size == pointerSize &&
-            layout.vtable.methodInfo.present == !old &&
-            (old || (layout.vtable.methodInfo.offset == pointerSize && layout.vtable.methodInfo.size == pointerSize)),
+            sameField(layout.vtable.methodPointer, expected.vtable.methodPointer) &&
+            sameField(layout.vtable.methodInfo, expected.vtable.methodInfo),
         "invalid-vtable-layout",
         "Vtable element layout does not match MethodInfo pointers or VirtualInvokeData for the selected variant");
 
@@ -619,7 +647,26 @@ std::vector<Legacy21Diagnostic> validateLegacy21Layout(const Legacy21Layout& lay
         klass.vtableCount, klass.interfacesCount, klass.interfaceOffsetsCount, klass.typeHierarchyDepth,
         klass.genericRecursionDepth, klass.rank, klass.minimumAlignment, klass.packingSize, klass.bitfield
     };
-    for (const auto& value : classFields) checkField(diagnostics, "Il2CppClass", "field", value, klass.size);
+    const auto& expectedClass = expected.classLayout;
+    const Legacy21FieldLayout expectedClassFields[] = {
+        expectedClass.vtable, expectedClass.interfaceOffsets, expectedClass.typeHierarchy,
+        expectedClass.cctorStarted, expectedClass.cctorFinished, expectedClass.cctorThread,
+        expectedClass.genericContainerIndex, expectedClass.customAttributeIndex,
+        expectedClass.instanceSize, expectedClass.actualSize, expectedClass.elementSize,
+        expectedClass.nativeSize, expectedClass.staticFieldsSize, expectedClass.threadStaticFieldsSize,
+        expectedClass.threadStaticFieldsOffset, expectedClass.flags, expectedClass.token,
+        expectedClass.methodCount, expectedClass.propertyCount, expectedClass.fieldCount,
+        expectedClass.eventCount, expectedClass.nestedTypeCount, expectedClass.vtableCount,
+        expectedClass.interfacesCount, expectedClass.interfaceOffsetsCount,
+        expectedClass.typeHierarchyDepth, expectedClass.genericRecursionDepth, expectedClass.rank,
+        expectedClass.minimumAlignment, expectedClass.packingSize, expectedClass.bitfield
+    };
+    for (std::size_t index = 0; index < std::size(classFields); ++index) {
+        checkField(diagnostics, "Il2CppClass", "field", classFields[index], klass.size);
+        if (!sameField(classFields[index], expectedClassFields[index])) {
+            validationError(diagnostics, "invalid-class-field", "Il2CppClass field differs from the selected v21 variant");
+        }
+    }
 
     const auto& method = layout.methodInfo;
     const std::size_t methodScalar = 8 * pointerSize;
@@ -637,7 +684,20 @@ std::vector<Legacy21Diagnostic> validateLegacy21Layout(const Legacy21Layout& lay
         method.parameters, method.rgctxData, method.genericMethod, method.customAttributeIndex, method.token,
         method.flags, method.iflags, method.slot, method.parametersCount, method.methodFlags
     };
-    for (const auto& value : methodFields) checkField(diagnostics, "MethodInfo", "field", value, method.size);
+    const auto& expectedMethod = expected.methodInfo;
+    const Legacy21FieldLayout expectedMethodFields[] = {
+        expectedMethod.methodPointer, expectedMethod.invokerMethod, expectedMethod.name,
+        expectedMethod.declaringType, expectedMethod.returnType, expectedMethod.parameters,
+        expectedMethod.rgctxData, expectedMethod.genericMethod, expectedMethod.customAttributeIndex,
+        expectedMethod.token, expectedMethod.flags, expectedMethod.iflags, expectedMethod.slot,
+        expectedMethod.parametersCount, expectedMethod.methodFlags
+    };
+    for (std::size_t index = 0; index < std::size(methodFields); ++index) {
+        checkField(diagnostics, "MethodInfo", "field", methodFields[index], method.size);
+        if (!sameField(methodFields[index], expectedMethodFields[index])) {
+            validationError(diagnostics, "invalid-method-info-field", "MethodInfo field differs from the selected v21 variant");
+        }
+    }
 
     const auto& code = layout.codeRegistration;
     expect(

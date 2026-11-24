@@ -25,12 +25,14 @@ struct Version104Layout {
     double version = 104.0;
     double registrationVersion = 104.0;
     std::size_t typeIndex = 4;
+    bool typeIndexWidthKnown = false;
     std::size_t typeDefinitionIndex = 4;
     std::size_t genericContainerIndex = 4;
     std::size_t parameterIndex = 4;
     std::size_t eventIndex = 4;
     std::size_t interfaceIndex = 4;
     std::size_t nestedTypeIndex = 4;
+    std::size_t nestedTypeTableIndex = 4;
     std::size_t propertyIndex = 4;
     std::size_t methodIndex = 4;
     std::size_t genericParameterIndex = 4;

@@ -132,7 +132,8 @@ public:
             return value == std::numeric_limits<uint16_t>::max() ? -1 : value;
         }
         case 4:
-            return i32(offset);
+            if (const int32_t value = i32(offset); value >= -1) return value;
+            invalid("index has an invalid negative value");
         default:
             invalid("unsupported index width " + std::to_string(width));
         }
@@ -268,6 +269,41 @@ size_t validateIndexTable(const MetadataSectionModel& section, const char* name)
         invalid(std::string(name) + " has an invalid index width");
     }
     return stride;
+}
+
+size_t typeIndexWidthFromSections(const Version38Header& header) {
+    const auto& sections = header.sections;
+    const bool hasWidthEvidence =
+        sections.interfaceOffsets.count != 0 || sections.events.count != 0 ||
+        sections.methods.count != 0 || sections.parameterDefaultValues.count != 0 ||
+        sections.fieldDefaultValues.count != 0 || sections.fieldMarshaledSizes.count != 0 ||
+        sections.parameters.count != 0 || sections.fields.count != 0 ||
+        sections.typeDefinitions.count != 0 || sections.fieldRefs.count != 0;
+    if (!hasWidthEvidence) return 4;
+    const auto matches = [&](const MetadataSectionModel& section, size_t expected) {
+        return section.count == 0 || strideOf(section, "type-index-dependent section") == expected;
+    };
+    size_t selected = 0;
+    for (const size_t width : {size_t{1}, size_t{2}, size_t{4}}) {
+        if (!matches(sections.interfaceOffsets, 4 + width) ||
+            !matches(sections.events, 20 + width) ||
+            !matches(sections.methods,
+                20 + header.typeDefinitionIndexWidth + width +
+                    header.parameterIndexWidth + header.genericContainerIndexWidth) ||
+            !matches(sections.parameterDefaultValues, header.parameterIndexWidth + width + 4) ||
+            !matches(sections.fieldDefaultValues, 8 + width) ||
+            !matches(sections.fieldMarshaledSizes, 8 + width) ||
+            !matches(sections.parameters, 8 + width) ||
+            !matches(sections.fields, 8 + width) ||
+            !matches(sections.typeDefinitions, 68 + 3 * width + header.genericContainerIndexWidth) ||
+            !matches(sections.fieldRefs, 4 + width)) {
+            continue;
+        }
+        if (selected != 0) invalid("ambiguous type index width");
+        selected = width;
+    }
+    if (selected != 0) return selected;
+    invalid("inconsistent type index widths across sections");
 }
 
 void validateLayouts(const Version38Header& header) {
@@ -413,7 +449,7 @@ std::string qualifiedName(const TypeModel& type) {
 }
 
 void validateRange(int32_t start, uint64_t count, size_t size, const char* name) {
-    if (count == 0 && start < 0) return;
+    if (count == 0 && start == -1) return;
     if (start < 0 || static_cast<uint64_t>(static_cast<uint32_t>(start)) > size ||
         count > size - static_cast<size_t>(static_cast<uint32_t>(start))) {
         invalid(std::string(name) + " range is outside its table");
@@ -571,22 +607,7 @@ Version38Header Version38::readHeader(const uint8_t* data, size_t size) const {
         ? Version38Header::indexWidth(header.sections.parameters.count)
         : 4;
 
-    const size_t interfaceOffsetStride = header.sections.interfaceOffsets.count == 0
-        ? 8
-        : strideOf(header.sections.interfaceOffsets, "interface offsets");
-    switch (interfaceOffsetStride) {
-    case 5:
-        header.typeIndexWidth = 1;
-        break;
-    case 6:
-        header.typeIndexWidth = 2;
-        break;
-    case 8:
-        header.typeIndexWidth = 4;
-        break;
-    default:
-        invalid("interface offsets must have 5, 6, or 8 byte records");
-    }
+    header.typeIndexWidth = typeIndexWidthFromSections(header);
 
     validateLayouts(header);
     return header;
@@ -616,7 +637,13 @@ MetadataModel Version38::read(const uint8_t* data, size_t size) const {
 
     MetadataModel model;
     model.version = header.version;
-    model.versionInfo = {header.version, static_cast<double>(header.version), 0, MetadataVersionConfidence::RawHeader};
+    model.versionInfo = {
+        header.version,
+        static_cast<double>(header.version),
+        0,
+        MetadataVersionConfidence::RawHeader,
+        "global metadata header",
+    };
     model.sections = sections;
     model.images = images;
     model.assemblies = std::move(assemblies);
@@ -643,6 +670,33 @@ MetadataModel Version38::read(const uint8_t* data, size_t size) const {
             container.genericParameterStart = record.i32();
             return container;
         });
+    for (const auto& parameter : model.genericParameters) {
+        if (parameter.ownerIndex < 0 ||
+            static_cast<size_t>(parameter.ownerIndex) >= model.genericContainers.size()) {
+            invalid("generic parameter references an invalid container");
+        }
+        if (parameter.constraintsCount < 0) invalid("generic parameter has a negative constraint count");
+        validateRange(
+            parameter.constraintsStart,
+            static_cast<uint16_t>(parameter.constraintsCount),
+            static_cast<size_t>(sections.genericParameterConstraints.count),
+            "generic parameter constraint");
+    }
+    for (const auto& container : model.genericContainers) {
+        if (container.typeArgumentCount < 0) invalid("generic container has a negative argument count");
+        validateRange(
+            container.genericParameterStart,
+            static_cast<uint32_t>(container.typeArgumentCount),
+            model.genericParameters.size(),
+            "generic container parameter");
+        if (container.isMethod != 0 && container.isMethod != 1) {
+            invalid("generic container has an invalid method flag");
+        }
+        const size_t ownerCount = container.isMethod ? methods.size() : types.size();
+        if (container.ownerIndex < 0 || static_cast<size_t>(container.ownerIndex) >= ownerCount) {
+            invalid("generic container references an invalid owner");
+        }
+    }
     model.fieldDefaultValues = readTable<FieldDefaultValueModel>(sections.fieldDefaultValues, "field default values",
         [&](size_t base, size_t stride) {
             RecordReader record(reader, base, stride);
@@ -696,6 +750,9 @@ MetadataModel Version38::read(const uint8_t* data, size_t size) const {
     std::vector<std::string> typeImages(types.size());
     for (const auto& image : images) {
         validateRange(image.typeStart, image.typeCount, types.size(), "image type");
+        validateRange(
+            image.exportedTypeStart, image.exportedTypeCount,
+            static_cast<size_t>(sections.exportedTypeDefinitions.count), "image exported type");
         model.methodPointersByImage.try_emplace(image.name);
         if (image.typeStart < 0) continue;
         const size_t begin = static_cast<size_t>(image.typeStart);
@@ -796,9 +853,11 @@ MetadataModel Version38::read(const uint8_t* data, size_t size) const {
         if (index != 0 && literalOffsets[index] < literalOffsets[index - 1]) {
             invalid("string literal data indices are not monotonic");
         }
-        if (index + 1 == literalOffsets.size()) continue;
         const size_t start = static_cast<size_t>(literalOffsets[index]);
-        const size_t length = static_cast<size_t>(literalOffsets[index + 1]) - start;
+        const size_t end = index + 1 == literalOffsets.size()
+            ? literalDataSize
+            : static_cast<size_t>(literalOffsets[index + 1]);
+        const size_t length = end - start;
         const size_t offset = static_cast<size_t>(sections.stringLiteralData.offset) + start;
         const char* bytes = reinterpret_cast<const char*>(reader.bytes(offset, length));
         model.stringLiterals.emplace(static_cast<uint32_t>(index), std::string(bytes, length));

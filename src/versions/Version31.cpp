@@ -12,6 +12,9 @@ namespace {
 constexpr uint32_t metadataSanity = 0xFAB11BAF;
 constexpr int32_t metadataVersion = 31;
 constexpr size_t methodsHeaderOffset = 48;
+constexpr size_t parameterDefaultsHeaderOffset = 56;
+constexpr size_t fieldDefaultsHeaderOffset = 64;
+constexpr size_t defaultValueDataHeaderOffset = 72;
 constexpr size_t assembliesHeaderOffset = 176;
 constexpr size_t attributeDataHeaderOffset = 200;
 constexpr size_t attributeDataRangesHeaderOffset = 208;
@@ -124,7 +127,7 @@ public:
             value = std::numeric_limits<uint32_t>::max() - 1;
             return true;
         }
-        if ((first & 192) == 192) {
+        if ((first & 224) == 192) {
             uint8_t second = 0;
             uint8_t third = 0;
             uint8_t fourth = 0;
@@ -135,6 +138,7 @@ public:
                 fourth;
             return true;
         }
+        if ((first & 192) != 128) return false;
         uint8_t second = 0;
         if (!readU8(second)) return false;
         value = (static_cast<uint32_t>(first & 127) << 8) | second;
@@ -236,12 +240,10 @@ bool resolveEnumUnderlyingType(
     int32_t enumTypeIndex,
     const Version31EnumUnderlyingTypeResolver& resolver,
     uint8_t& underlyingType) {
-    underlyingType = typeI4;
-    if (resolver) {
-        const auto resolved = resolver(enumTypeIndex);
-        if (!resolved) return false;
-        underlyingType = *resolved;
-    }
+    if (!resolver) return false;
+    const auto resolved = resolver(enumTypeIndex);
+    if (!resolved) return false;
+    underlyingType = *resolved;
     switch (underlyingType) {
         case typeI1:
         case typeU1:
@@ -387,6 +389,7 @@ bool readArray(
 
     uint8_t prefixed = 0;
     if (!reader.readU8(prefixed)) return false;
+    if (prefixed > 1) return false;
     output.elementsAreTypePrefixed = prefixed != 0;
     if (output.elementsAreTypePrefixed && elementType != typeObject) return false;
     if (static_cast<size_t>(length) > reader.remaining()) return false;
@@ -574,6 +577,18 @@ Version31Section Version31::assembliesSection() const {
     return validHeader() ? readHeaderSection(data_, assembliesHeaderOffset) : Version31Section{};
 }
 
+Version31Section Version31::fieldDefaultValuesSection() const {
+    return validHeader() ? readHeaderSection(data_, fieldDefaultsHeaderOffset) : Version31Section{};
+}
+
+Version31Section Version31::parameterDefaultValuesSection() const {
+    return validHeader() ? readHeaderSection(data_, parameterDefaultsHeaderOffset) : Version31Section{};
+}
+
+Version31Section Version31::defaultValueDataSection() const {
+    return validHeader() ? readHeaderSection(data_, defaultValueDataHeaderOffset) : Version31Section{};
+}
+
 Version31Section Version31::attributeDataSection() const {
     return validHeader() ? readHeaderSection(data_, attributeDataHeaderOffset) : Version31Section{};
 }
@@ -585,7 +600,10 @@ Version31Section Version31::attributeDataRangesSection() const {
 std::optional<Version31Metadata> Version31::read() const {
     if (!validHeader()) return std::nullopt;
     Version31Metadata result;
-    if (!readMethods(result.methods) || !readAssemblies(result.assemblies) || !readAttributes(result.attributes)) {
+    if (!readMethods(result.methods) || !readAssemblies(result.assemblies) ||
+        !readFieldDefaultValues(result.fieldDefaultValues) ||
+        !readParameterDefaultValues(result.parameterDefaultValues) ||
+        !readAttributes(result.attributes)) {
         return std::nullopt;
     }
     return result;
@@ -597,6 +615,16 @@ bool Version31::readMethods(std::vector<Version31MethodDefinition>& output) cons
 
 bool Version31::readAssemblies(std::vector<Version31AssemblyDefinition>& output) const {
     return validHeader() && readAssemblies(data_, size_, assembliesSection(), output);
+}
+
+bool Version31::readFieldDefaultValues(std::vector<Version31DefaultValue>& output) const {
+    return validHeader() && readDefaultValues(
+        data_, size_, fieldDefaultValuesSection(), defaultValueDataSection(), output);
+}
+
+bool Version31::readParameterDefaultValues(std::vector<Version31DefaultValue>& output) const {
+    return validHeader() && readDefaultValues(
+        data_, size_, parameterDefaultValuesSection(), defaultValueDataSection(), output);
 }
 
 bool Version31::readAttributes(std::vector<Version31AttributeBlob>& output) const {
@@ -667,6 +695,36 @@ bool Version31::readAssemblies(
     return true;
 }
 
+bool Version31::readDefaultValues(
+    const uint8_t* data,
+    size_t size,
+    Version31Section section,
+    Version31Section valueData,
+    std::vector<Version31DefaultValue>& output) {
+    size_t count = 0;
+    BoundedReader valueReader;
+    if (!tableCount(data, size, section, defaultValueStride, count) ||
+        !sectionReader(data, size, valueData, valueReader)) return false;
+
+    std::vector<Version31DefaultValue> result;
+    result.reserve(count);
+    std::unordered_set<int32_t> seenIndices;
+    for (size_t index = 0; index < count; ++index) {
+        const uint8_t* record = data + section.offset + index * defaultValueStride;
+        Version31DefaultValue value;
+        value.memberIndex = loadI32(record);
+        value.typeIndex = loadI32(record + 4);
+        value.dataIndex = loadI32(record + 8);
+        if (value.memberIndex < 0 || value.typeIndex < 0 || value.dataIndex < -1 ||
+            (value.dataIndex >= 0 && static_cast<size_t>(value.dataIndex) >= valueReader.remaining())) {
+            return false;
+        }
+        if (seenIndices.insert(value.memberIndex).second) result.push_back(value);
+    }
+    output = std::move(result);
+    return true;
+}
+
 bool Version31::readAttributes(
     const uint8_t* data,
     size_t size,
@@ -709,7 +767,6 @@ bool Version31::readAttributes(
     result.reserve(rangeCount - 1);
     std::unordered_set<uint32_t> seenTokens;
     for (size_t index = 0; index + 1 < entries.size(); ++index) {
-        if (!seenTokens.insert(entries[index].token).second) continue;
         const size_t start = entries[index].start;
         const size_t end = entries[index + 1].start;
         BoundedReader blobReader(
@@ -720,7 +777,7 @@ bool Version31::readAttributes(
         blob.startOffset = entries[index].start;
         blob.endOffset = entries[index + 1].start;
         if (!readAttributeBlob(blobReader, enumUnderlyingTypeResolver, blob.attributes)) return false;
-        result.push_back(std::move(blob));
+        if (seenTokens.insert(blob.token).second) result.push_back(std::move(blob));
     }
     output = std::move(result);
     return true;

@@ -37,12 +37,14 @@ uint64_t methodAddress(
     if (method.address != 0) return method.address;
     const auto pointers = metadata.methodPointersByImage.find(method.imageName);
     if (pointers == metadata.methodPointersByImage.end()) return 0;
+    const double version = metadata.versionInfo.preciseVersion != 0
+        ? metadata.versionInfo.preciseVersion : metadata.version;
     int64_t index = -1;
-    if (metadata.version != 0 && metadata.version < 24.2) {
+    if (version != 0 && version < 24.2) {
         index = method.methodIndex;
     } else if ((method.token & 0xFF000000) == 0x06000000 && (method.token & 0x00FFFFFF) != 0) {
         index = static_cast<int64_t>(method.token & 0x00FFFFFF) - 1;
-    } else if (metadata.version == 0 && method.definitionIndex >= 0) {
+    } else if (version == 0 && method.definitionIndex >= 0) {
         const auto first = firstDefinitionByImage.find(method.imageName);
         if (first != firstDefinitionByImage.end()) index = static_cast<int64_t>(method.definitionIndex) - first->second;
     }
@@ -170,6 +172,9 @@ private:
         for (const auto& mapping : metadata_.genericMethodTable) {
             if (mapping.genericMethodIndex >= 0 && mapping.methodPointer != 0) {
                 genericsByAddress_[mapping.methodPointer].push_back({mapping.genericMethodIndex, mapping, false});
+            }
+            if (mapping.genericMethodIndex >= 0 && mapping.adjustorThunk != 0) {
+                genericsByAddress_[mapping.adjustorThunk].push_back({mapping.genericMethodIndex, mapping, true});
             }
         }
         for (const auto& [address, genericIndex] : options_.profile.genericAdjustorTargets) {
@@ -406,7 +411,7 @@ private:
         const auto& method = *resolved.method;
         result.method.token = method.token;
         result.method.definitionIndex = method.definitionIndex;
-        result.method.address = resolved.mapping->methodPointer != 0 ? resolved.mapping->methodPointer : targetAddress;
+        result.method.address = targetAddress;
         result.method.imageName = method.imageName;
         result.method.declaringType = method.declaringType;
         result.method.name = method.name;
@@ -432,7 +437,9 @@ private:
         auto result = operation(ManagedOperationKind::DirectMethodCall, blockIndex, statementIndex, statement);
         result.destination = statement.destination;
         result.targetAddress = targetAddress;
-        if (options_.profile.unresolvedVirtualCallStubs.contains(targetAddress)) {
+        if (options_.profile.unresolvedVirtualCallStubs.contains(targetAddress) ||
+            std::find(metadata_.unresolvedVirtualCallPointers.begin(),
+                      metadata_.unresolvedVirtualCallPointers.end(), targetAddress) != metadata_.unresolvedVirtualCallPointers.end()) {
             result.status = ManagedPatternStatus::Unresolved;
             result.confidence = ManagedPatternConfidence::Medium;
             result.unresolvedStub = true;

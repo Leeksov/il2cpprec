@@ -1,7 +1,6 @@
 #include <il2cpprec/versions/Version24Modular.hpp>
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <limits>
 #include <unordered_set>
@@ -16,7 +15,9 @@ constexpr size_t maxModuleNameLength = 4096;
 constexpr size_t codeGenModuleSlots = 11;
 
 uint64_t normalizePointer(uint64_t value) {
-    return value & 0x0000ffffffffffffULL;
+    // A native address is not necessarily a 48-bit address.  In particular,
+    // masking here can turn a malformed pointer into a valid mapped address.
+    return value;
 }
 
 bool addOverflows(uint64_t left, uint64_t right) {
@@ -151,7 +152,12 @@ public:
         if (index > std::numeric_limits<uint64_t>::max() / (2 * pointerSize_)) {
             return fail("registration pair index overflows");
         }
-        const auto address = owner + index * 2 * pointerSize_;
+        const auto displacement = index * 2 * pointerSize_;
+        if (addOverflows(owner, displacement) ||
+            addOverflows(owner + displacement, pointerSize_)) {
+            return fail("registration pair address overflows");
+        }
+        const auto address = owner + displacement;
         if (!count(address, pair.count, field)) return false;
         size_t offset = 0;
         if (!map(address + pointerSize_, pointerSize_, offset)) {
@@ -205,16 +211,22 @@ public:
 
     bool readModuleName(uint64_t address, std::string& name) {
         if (address == 0) return fail("CodeGenModule has a null moduleName");
-        size_t offset = 0;
-        if (!map(address, 1, offset)) return fail("CodeGenModule moduleName is not file-backed");
-        const auto remaining = binary_.bytes->size() - offset;
-        const auto limit = std::min(remaining, maxModuleNameLength + 1);
-        size_t length = 0;
-        while (length < limit && (*binary_.bytes)[offset + length] != 0) ++length;
-        if (length == 0 || length > maxModuleNameLength || length == remaining) {
+        name.clear();
+        bool terminated = false;
+        for (size_t length = 0; length <= maxModuleNameLength; ++length) {
+            if (addOverflows(address, length)) break;
+            size_t offset = 0;
+            if (!map(address + length, 1, offset)) break;
+            const auto ch = (*binary_.bytes)[offset];
+            if (ch == 0) {
+                terminated = true;
+                break;
+            }
+            name.push_back(static_cast<char>(ch));
+        }
+        if (!terminated || name.empty() || name.size() > maxModuleNameLength) {
             return fail("CodeGenModule moduleName is empty, unterminated, or too long");
         }
-        name.assign(reinterpret_cast<const char*>(binary_.bytes->data() + offset), length);
         if (name.size() < 5 || name.compare(name.size() - 4, 4, ".dll") != 0 ||
             !std::all_of(name.begin(), name.end(), [](unsigned char c) {
                 return c >= 0x20 && c <= 0x7e && c != '/' && c != '\\';
@@ -270,7 +282,8 @@ bool parseModule(Reader& reader, const BinaryImage& binary, uint64_t address, ui
     const auto p = reader.pointerSize();
     const auto& bytes = bytesOf(binary);
     size_t base = 0;
-    if (address == 0 || !reader.map(address, codeGenModuleSlots * p, base)) {
+    if (address == 0 || addOverflows(address, codeGenModuleSlots * p) ||
+        !reader.map(address, codeGenModuleSlots * p, base)) {
         return reader.fail("CodeGenModule is null, truncated, or not file-backed");
     }
     module.address = normalizePointer(address);
@@ -397,6 +410,7 @@ bool parseRegistration(const BinaryImage& binary, uint64_t codeRegistrationAddre
     Reader reader(binary, layout.pointerSize, error);
     size_t registrationOffset = 0;
     if (codeRegistrationAddress == 0 ||
+        addOverflows(codeRegistrationAddress, layout.codeRegistrationSize) ||
         !reader.map(codeRegistrationAddress, layout.codeRegistrationSize, registrationOffset)) {
         error = "CodeRegistration is null, truncated, or not file-backed";
         return false;
@@ -537,7 +551,9 @@ std::optional<uint64_t> Version24ModularResult::methodPointer(
     const auto* module = findModule(imageName);
     const auto index = version24MethodDefIndex(methodDefToken);
     if (!module || !index || *index >= module->methodPointers.size()) return std::nullopt;
-    return module->methodPointers[*index];
+    const auto pointer = module->methodPointers[*index];
+    if (pointer == 0) return std::nullopt;
+    return pointer;
 }
 
 std::optional<uint32_t> version24MethodDefRid(uint32_t token) noexcept {
@@ -558,8 +574,8 @@ bool Version24Modular::supports(double metadataVersion) noexcept {
 }
 
 std::optional<Version24ModularVariant> Version24Modular::variantFor(double metadataVersion) noexcept {
-    if (std::abs(metadataVersion - 24.2) < 0.001) return Version24ModularVariant::V24_2;
-    if (std::abs(metadataVersion - 24.3) < 0.001) return Version24ModularVariant::V24_3;
+    if (metadataVersion == 24.2) return Version24ModularVariant::V24_2;
+    if (metadataVersion == 24.3) return Version24ModularVariant::V24_3;
     return std::nullopt;
 }
 
@@ -665,6 +681,32 @@ Version24ModularResult Version24Modular::apply(
         : std::optional<double>{metadata.version};
     auto result = detect(binary, codeRegistrationAddress, expected, metadataRegistrationAddress);
     if (!result.detected) return result;
+
+    // ImageModel stores these starts and counts as signed 32-bit values.
+    // Validate the whole concatenation before changing the caller's model.
+    size_t invokerTotal = 0;
+    size_t rangeTotal = 0;
+    size_t valueTotal = 0;
+    constexpr auto maxIndex = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    for (const auto& module : result.modules) {
+        if (module.invokerIndices.size() > maxIndex - invokerTotal ||
+            module.rgctxRanges.size() > maxIndex - rangeTotal ||
+            module.rgctxValues.size() > maxIndex - valueTotal) {
+            result.detected = false;
+            result.diagnostics.push_back("CodeGenModule aggregate indices exceed signed 32-bit model limits");
+            return result;
+        }
+        for (const auto& range : module.rgctxRanges) {
+            if (range.start < 0 || static_cast<size_t>(range.start) > maxIndex - valueTotal) {
+                result.detected = false;
+                result.diagnostics.push_back("CodeGenModule RGCTX start exceeds signed 32-bit model limits");
+                return result;
+            }
+        }
+        invokerTotal += module.invokerIndices.size();
+        rangeTotal += module.rgctxRanges.size();
+        valueTotal += module.rgctxValues.size();
+    }
 
     MetadataModel updated = metadata;
     updated.version = result.layout.version();

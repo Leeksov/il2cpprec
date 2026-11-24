@@ -412,13 +412,13 @@ private:
         return constant(mask, type);
     }
 
-    std::string temporary(const char* role) const {
+    std::string temporary(const std::string& role) const {
         std::ostringstream name;
         name << "__x86_" << role << '_' << std::hex << (current_ ? current_->address : output_.address);
         return name.str();
     }
 
-    ExpressionPtr saveTemporary(const char* role, ExpressionPtr value) {
+    ExpressionPtr saveTemporary(const std::string& role, ExpressionPtr value) {
         const auto originalType = value->type;
         auto storageType = originalType;
         const bool integer = originalType.kind == ScalarKind::UnsignedInteger ||
@@ -1320,10 +1320,11 @@ private:
         if (id == X86_INS_VINSERTF128 || id == X86_INS_VINSERTI128) {
             if (ops.size() >= 4 && ops[3].kind == OperandKind::Immediate) {
                 const auto firstPart = static_cast<int>(ops[3].immediate & 1) * 2;
+                auto insertedLow = saveTemporary("insert128_low", readVectorRaw(ops[2], 64, 0));
+                auto insertedHigh = saveTemporary("insert128_high", readVectorRaw(ops[2], 64, 1));
                 writeWholeVector(ops[0], ops[1], false);
-                for (int part = 0; part < 2; ++part) {
-                    writeVectorPart(ops[0], firstPart + part, readVectorRaw(ops[2], 64, part));
-                }
+                writeVectorPart(ops[0], firstPart, insertedLow);
+                writeVectorPart(ops[0], firstPart + 1, insertedHigh);
                 finishAvxVector(ops[0]);
             }
             return;
@@ -1573,10 +1574,11 @@ private:
             if (extract) {
                 writeOperand(ops[0], readVectorRaw(ops[1], bits, lane));
             } else {
+                auto inserted = saveTemporary("insert_lane", readVectorRaw(ops[avx ? 2 : 1], bits));
                 if (avx) {
                     writeWholeVector(ops[0], ops[1], false);
                 }
-                writeVectorLane(ops[0], readVectorRaw(ops[avx ? 2 : 1], bits), bits, lane, false);
+                writeVectorLane(ops[0], inserted, bits, lane, false);
                 if (avx) {
                     finishAvxVector(ops[0]);
                 }
@@ -1595,12 +1597,15 @@ private:
                 return;
             }
             const auto immediate = static_cast<uint64_t>(ops[immediateIndex].immediate);
+            const auto sourceLane = static_cast<int>((immediate >> 6) & 3);
+            const auto destinationLane = static_cast<int>((immediate >> 4) & 3);
+            const auto& source = ops[avx ? 2 : 1];
+            auto inserted = saveTemporary("insert_ps", readVectorRaw(source, 32,
+                source.kind == OperandKind::Memory ? 0 : sourceLane));
             if (avx) {
                 writeWholeVector(ops[0], ops[1], false);
             }
-            const auto sourceLane = static_cast<int>((immediate >> 6) & 3);
-            const auto destinationLane = static_cast<int>((immediate >> 4) & 3);
-            writeVectorLane(ops[0], readVectorRaw(ops[avx ? 2 : 1], 32, sourceLane), 32, destinationLane, false);
+            writeVectorLane(ops[0], inserted, 32, destinationLane, false);
             for (int lane = 0; lane < 4; ++lane) {
                 if ((immediate & (uint64_t{1} << lane)) != 0) {
                     writeVectorLane(ops[0], constant(0, uintType(32)), 32, lane, false);
@@ -1625,6 +1630,8 @@ private:
             const auto groupLanes = 128 / bits;
             const auto& left = shuffle && !avx ? ops[0] : ops[1];
             const auto& right = avx ? ops[2] : ops[1];
+            std::vector<ExpressionPtr> lanes;
+            lanes.reserve(vectorLaneCount(ops[0], bits));
             for (int lane = 0; lane < vectorLaneCount(ops[0], bits); ++lane) {
                 const auto groupBase = lane / groupLanes * groupLanes;
                 const auto position = lane % groupLanes;
@@ -1644,7 +1651,13 @@ private:
                     source = position == 0 ? &left : &right;
                     sourceLane = groupBase + static_cast<int>((immediate >> position) & 1);
                 }
-                writeVectorLane(ops[0], saveTemporary("lane_value", readVectorRaw(*source, bits, sourceLane)), bits, lane, false);
+                // A shuffle may read a source lane after the destination lane has
+                // overwritten it. Capture every input before writing any output.
+                lanes.push_back(saveTemporary("lane_value_" + std::to_string(lane),
+                    readVectorRaw(*source, bits, sourceLane)));
+            }
+            for (int lane = 0; lane < static_cast<int>(lanes.size()); ++lane) {
+                writeVectorLane(ops[0], lanes[lane], bits, lane, false);
             }
             if (avx) {
                 finishAvxVector(ops[0]);
@@ -1654,6 +1667,10 @@ private:
 
         const bool variable = id == X86_INS_BLENDVPS || id == X86_INS_BLENDVPD || id == X86_INS_PBLENDVB ||
             id == X86_INS_VBLENDVPS || id == X86_INS_VBLENDVPD || id == X86_INS_VPBLENDVB;
+        if (ops.size() < (avx ? (variable ? 4U : 3U) : 2U)) {
+            unsupported(instruction);
+            return;
+        }
         const auto bits = id == X86_INS_PBLENDW || id == X86_INS_VPBLENDW ? 16 :
             id == X86_INS_PBLENDVB || id == X86_INS_VPBLENDVB ? 8 :
             id == X86_INS_BLENDPD || id == X86_INS_VBLENDPD || id == X86_INS_BLENDVPD || id == X86_INS_VBLENDVPD ? 64 : 32;
@@ -1665,16 +1682,18 @@ private:
         const auto& left = avx ? ops[1] : ops[0];
         const auto& right = avx ? ops[2] : ops[1];
         const auto maskOperand = variable ? (avx ? ops[3] : ops.size() >= 3 ? ops[2] : registerOperand("xmm0")) : Operand{};
-        if (avx) {
-            writeWholeVector(ops[0], left, false);
-        }
+        std::vector<ExpressionPtr> selectedLanes;
+        selectedLanes.reserve(vectorLaneCount(ops[0], bits));
         for (int lane = 0; lane < vectorLaneCount(ops[0], bits); ++lane) {
             auto leftValue = readVectorRaw(left, bits, lane);
             auto rightValue = readVectorRaw(right, bits, lane);
             auto selected = variable
                 ? select(bitAt(readVectorRaw(maskOperand, bits, lane), bits - 1), rightValue, leftValue, uintType(bits))
                 : ((immediate & (uint64_t{1} << (lane % (128 / bits)))) != 0 ? rightValue : leftValue);
-            writeVectorLane(ops[0], saveTemporary("lane_value", selected), bits, lane, false);
+            selectedLanes.push_back(saveTemporary("lane_value_" + std::to_string(lane), selected));
+        }
+        for (int lane = 0; lane < static_cast<int>(selectedLanes.size()); ++lane) {
+            writeVectorLane(ops[0], selectedLanes[lane], bits, lane, false);
         }
         if (avx) {
             finishAvxVector(ops[0]);
@@ -1726,8 +1745,16 @@ private:
             id == X86_INS_VMINSS || id == X86_INS_VMAXSS || id == X86_INS_VSQRTSS ||
             id == X86_INS_VMINPS || id == X86_INS_VMAXPS || id == X86_INS_VSQRTPS;
         const auto bits = bits32 ? 32 : 64;
+        const bool squareRoot = id == X86_INS_SQRTSS || id == X86_INS_SQRTSD ||
+            id == X86_INS_SQRTPS || id == X86_INS_SQRTPD || id == X86_INS_VSQRTSS ||
+            id == X86_INS_VSQRTSD || id == X86_INS_VSQRTPS || id == X86_INS_VSQRTPD;
+        if (avx && ops.size() < (squareRoot && !scalar ? 2U : 3U)) {
+            unsupported(instruction);
+            return;
+        }
         const auto& leftOperand = avx ? ops[1] : ops[0];
-        const auto& rightOperand = avx ? ops[2] : ops[1];
+        const auto& rightOperand = avx && !squareRoot ? ops[2] :
+            avx && scalar ? ops[2] : ops[1];
         const bool minimum = id == X86_INS_MINSS || id == X86_INS_MINSD || id == X86_INS_MINPS || id == X86_INS_MINPD ||
             id == X86_INS_VMINSS || id == X86_INS_VMINSD || id == X86_INS_VMINPS || id == X86_INS_VMINPD;
         const bool maximum = id == X86_INS_MAXSS || id == X86_INS_MAXSD || id == X86_INS_MAXPS || id == X86_INS_MAXPD ||

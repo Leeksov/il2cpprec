@@ -30,8 +30,12 @@ struct RecoverySourceProfile {
     int32_t rawMetadataVersion = 0;
     double preciseMetadataVersion = 0;
     double registrationVersion = 0;
+    MetadataVersionConfidence versionConfidence = MetadataVersionConfidence::Unknown;
+    std::string versionProvenance;
+    MetadataSectionModel methodSignatures;
     MetadataSectionModel generatedMethodTypeInfos;
     MetadataSectionModel generatedMethodTokens;
+    int32_t generatedMethodsStart = -1;
     uint64_t exceptionSemanticsVersion = 1;
     uint64_t vectorSemanticsVersion = 1;
 };
@@ -95,8 +99,12 @@ enum class RecoveryExactMismatchKind {
     RawMetadataVersion,
     PreciseMetadataVersion,
     RegistrationVersion,
+    VersionConfidence,
+    VersionProvenance,
+    MethodSignatures,
     GeneratedMethodTypeInfos,
     GeneratedMethodTokens,
+    GeneratedMethodsStart,
     LifterSemanticsVersion,
     ExceptionSemanticsVersion,
     VectorSemanticsVersion

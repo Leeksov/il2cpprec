@@ -36,12 +36,14 @@ uint64_t methodAddress(
     if (method.address != 0) return method.address;
     const auto pointers = metadata.methodPointersByImage.find(method.imageName);
     if (pointers == metadata.methodPointersByImage.end()) return 0;
+    const double version = metadata.versionInfo.preciseVersion != 0
+        ? metadata.versionInfo.preciseVersion : metadata.version;
     int64_t index = -1;
-    if (metadata.version != 0 && metadata.version < 24.2) {
+    if (version != 0 && version < 24.2) {
         index = method.methodIndex;
     } else if ((method.token & 0xFF000000) == 0x06000000 && (method.token & 0x00FFFFFF) != 0) {
         index = static_cast<int64_t>(method.token & 0x00FFFFFF) - 1;
-    } else if (metadata.version == 0 && method.definitionIndex >= 0) {
+    } else if (version == 0 && method.definitionIndex >= 0) {
         const auto first = firstDefinitionByImage.find(method.imageName);
         if (first != firstDefinitionByImage.end()) index = static_cast<int64_t>(method.definitionIndex) - first->second;
     }
@@ -156,22 +158,28 @@ private:
         return options_.interfaceOffsetValueOffset == 0 ? static_cast<uint32_t>(pointerSize_) : options_.interfaceOffsetValueOffset;
     }
 
+    bool legacyLayout() const {
+        const double version = metadata_.versionInfo.preciseVersion != 0
+            ? metadata_.versionInfo.preciseVersion : metadata_.version;
+        return options_.unity2017Layout && version == 24.0;
+    }
+
     std::optional<uint64_t> vtableOffset() const {
         if (options_.vtableOffset) return options_.vtableOffset;
         if (options_.vtablePointer) return uint64_t{0};
-        if (options_.unity2017Layout && pointerBits_ == 64) return 272;
+        if (legacyLayout() && pointerBits_ == 64) return 272;
         return std::nullopt;
     }
 
     std::optional<uint64_t> interfaceOffsetsPointerOffset() const {
         if (options_.classInterfaceOffsetsPointerOffset) return options_.classInterfaceOffsetsPointerOffset;
-        if (options_.unity2017Layout && pointerBits_ == 64) return 152;
+        if (legacyLayout() && pointerBits_ == 64) return 152;
         return std::nullopt;
     }
 
     std::optional<uint64_t> interfaceOffsetsCountOffset() const {
         if (options_.classInterfaceOffsetsCountOffset) return options_.classInterfaceOffsetsCountOffset;
-        if (options_.unity2017Layout && pointerBits_ == 64) return 258;
+        if (legacyLayout() && pointerBits_ == 64) return 258;
         return std::nullopt;
     }
 
@@ -459,6 +467,9 @@ private:
             if (mapping.methodPointer == address && mapping.genericMethodIndex >= 0) {
                 candidates.emplace_back(mapping.genericMethodIndex, mapping);
             }
+            if (mapping.adjustorThunk == address && address != 0 && mapping.genericMethodIndex >= 0) {
+                candidates.emplace_back(mapping.genericMethodIndex, mapping);
+            }
         }
         const auto adjustor = options_.profile.genericAdjustorTargets.find(address);
         if (adjustor != options_.profile.genericAdjustorTargets.end() &&
@@ -484,7 +495,7 @@ private:
         reference.isStatic = resolved.method->isStatic;
         result.methodCandidates.push_back(reference);
         result.genericTarget.present = true;
-        result.genericTarget.adjustor = adjustor != options_.profile.genericAdjustorTargets.end();
+        result.genericTarget.adjustor = mapping.adjustorThunk == address || adjustor != options_.profile.genericAdjustorTargets.end();
         result.genericTarget.genericMethodIndex = index;
         result.genericTarget.mapping = mapping;
         if (static_cast<size_t>(index) < metadata_.methodSpecs.size()) {
@@ -518,6 +529,15 @@ private:
 
     void resolveManaged(VirtualDispatchOperation& result) const {
         result.methodCandidates.clear();
+        if (result.invokeData.methodPointer != 0 &&
+            (options_.profile.unresolvedVirtualCallStubs.contains(result.invokeData.methodPointer) ||
+             std::find(metadata_.unresolvedVirtualCallPointers.begin(), metadata_.unresolvedVirtualCallPointers.end(),
+                       result.invokeData.methodPointer) != metadata_.unresolvedVirtualCallPointers.end())) {
+            result.status = ManagedPatternStatus::Unresolved;
+            result.confidence = ManagedPatternConfidence::Medium;
+            result.reason = "VirtualInvokeData points to an unresolved virtual-call stub.";
+            return;
+        }
         appendMethods(result.invokeData.methodPointer, result.methodCandidates);
         appendGenerics(result, result.invokeData.methodPointer);
         const auto inflated = options_.methodInfoTargets.find(result.invokeData.methodInfo);

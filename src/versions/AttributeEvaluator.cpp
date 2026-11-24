@@ -488,13 +488,95 @@ private:
         return true;
     }
 
-    bool readValue(BlobReader& reader, CustomAttributeValue& output) {
+    bool readArray(BlobReader& reader, CustomAttributeValue& output, size_t depth) {
+        int32_t length = 0;
+        if (!compressedInt(reader, length, "array length")) return false;
+        if (length == -1) {
+            output.arrayNull = true;
+            output.value = std::monostate{};
+            return true;
+        }
+        if (length < 0) {
+            fail("invalid-array-length", "Array constant has an invalid negative length", reader.position());
+            return false;
+        }
+        if (static_cast<size_t>(length) > options_.maxArrayElements) {
+            fail("array-element-limit", "Array constant exceeds the configured element limit", reader.position());
+            return false;
+        }
+        if (!require(reader, 1, "array element type")) return false;
+        const auto elementKind = static_cast<CustomAttributeValueKind>(reader.byte());
+        output.elementKind = elementKind;
+        std::optional<uint32_t> enumTypeIndex;
+        std::optional<CustomAttributeValueKind> enumUnderlying;
+        std::string enumTypeName;
+        if (elementKind == CustomAttributeValueKind::Enum) {
+            int32_t typeIndex = 0;
+            if (!compressedInt(reader, typeIndex, "array enum type")) return false;
+            if (typeIndex < 0) {
+                fail("invalid-enum-type", "Array enum type index is negative", reader.position());
+                return false;
+            }
+            TypeResolution type;
+            if (!resolveType(static_cast<uint32_t>(typeIndex), type, reader.position())) return false;
+            enumUnderlying = enumUnderlyingKind(type);
+            if (!enumUnderlying) {
+                unsupported("enum-underlying-unavailable", "Cannot determine underlying type for enum " + type.name,
+                    reader.position());
+                return false;
+            }
+            enumTypeIndex = static_cast<uint32_t>(typeIndex);
+            enumTypeName = std::move(type.name);
+            output.typeIndex = enumTypeIndex;
+            output.typeName = enumTypeName;
+            output.enumUnderlyingKind = enumUnderlying;
+        }
+        if (!require(reader, 1, "array prefix flag")) return false;
+        const uint8_t prefixed = reader.byte();
+        if (prefixed > 1 || (prefixed != 0 && static_cast<uint8_t>(elementKind) != 0x1c)) {
+            fail("invalid-array-prefix", "Only object arrays may contain type-prefixed elements", reader.position() - 1);
+            return false;
+        }
+        if (static_cast<size_t>(length) > reader.remaining()) {
+            fail("truncated-array", "Array element count exceeds the remaining blob bytes", reader.position());
+            return false;
+        }
+        output.elements.reserve(static_cast<size_t>(length));
+        for (int32_t index = 0; index < length; ++index) {
+            CustomAttributeValue element;
+            if (prefixed != 0) {
+                if (!require(reader, 1, "object array element type")) return false;
+                const auto actual = static_cast<CustomAttributeValueKind>(reader.byte());
+                if (!readValueOfType(reader, actual, element, depth + 1)) return false;
+            } else if (elementKind == CustomAttributeValueKind::Enum) {
+                element.kind = CustomAttributeValueKind::Enum;
+                element.typeIndex = enumTypeIndex;
+                element.typeName = enumTypeName;
+                element.enumUnderlyingKind = enumUnderlying;
+                if (!readPrimitive(reader, *enumUnderlying, element.value)) return false;
+            } else if (!readValueOfType(reader, elementKind, element, depth + 1)) {
+                return false;
+            }
+            output.elements.push_back(std::move(element));
+        }
+        return true;
+    }
+
+    bool readValueOfType(
+        BlobReader& reader,
+        CustomAttributeValueKind kind,
+        CustomAttributeValue& output,
+        size_t depth) {
+        if (depth > options_.maxValueDepth) {
+            fail("value-depth-limit", "Custom attribute value nesting exceeds the configured limit", reader.position());
+            return false;
+        }
         const size_t typeOffset = reader.position();
-        if (!require(reader, 1, "constant type")) return false;
-        const uint8_t rawKind = reader.byte();
-        output.kind = static_cast<CustomAttributeValueKind>(rawKind);
+        const uint8_t rawKind = static_cast<uint8_t>(kind);
+        output.kind = kind;
 
         if (output.kind == CustomAttributeValueKind::String) return readString(reader, output);
+        if (output.kind == CustomAttributeValueKind::SzArray) return readArray(reader, output, depth);
         if (output.kind == CustomAttributeValueKind::Type) {
             int32_t typeIndex = 0;
             if (!compressedInt(reader, typeIndex, "type constant")) return false;
@@ -559,6 +641,12 @@ private:
                 std::to_string(static_cast<unsigned>(rawKind)) + " is not supported", typeOffset);
         }
         return false;
+    }
+
+    bool readValue(BlobReader& reader, CustomAttributeValue& output) {
+        if (!require(reader, 1, "constant type")) return false;
+        const auto kind = static_cast<CustomAttributeValueKind>(reader.byte());
+        return readValueOfType(reader, kind, output, 0);
     }
 
     bool accountArguments(uint64_t amount, size_t offset) {
@@ -757,7 +845,9 @@ private:
             return std::move(result_);
         }
 
-        result_.attributes.reserve(typeCount);
+        // Legacy ranges identify attribute types, but their constructor arguments and
+        // named members live in native generator code. A type match alone cannot
+        // establish an attribute invocation.
         for (size_t index = 0; index < typeCount; ++index) {
             currentAttribute_ = index;
             const int32_t typeIndex = input_.attributeTypeIndices[typeStart + index];
@@ -772,40 +862,10 @@ private:
                 return std::move(result_);
             }
 
-            const auto& definition = metadata_->types[static_cast<size_t>(type.definitionIndex)];
-            std::vector<const MethodModel*> constructors;
-            for (const auto& method : definition.methods) {
-                if (method.name == ".ctor") constructors.push_back(&method);
-            }
-            const MethodModel* constructor = nullptr;
-            for (const auto* candidate : constructors) {
-                if (candidate->parameters.empty()) {
-                    if (constructor != nullptr) {
-                        unsupported("legacy-constructor-ambiguous", "Legacy attribute has multiple parameterless constructors");
-                        return std::move(result_);
-                    }
-                    constructor = candidate;
-                }
-            }
-            if (constructor == nullptr && constructors.size() == 1) constructor = constructors.front();
-            if (constructor == nullptr) {
-                unsupported("legacy-constructor-unavailable", "Cannot select a unique legacy attribute constructor");
-                return std::move(result_);
-            }
-
-            EvaluatedCustomAttribute attribute;
-            attribute.constructorIndex = constructor->definitionIndex < 0
-                ? 0
-                : static_cast<uint32_t>(constructor->definitionIndex);
-            attribute.constructor = *constructor;
-            attribute.attributeTypeDefinitionIndex = type.definitionIndex;
-            attribute.attributeTypeName = type.name;
-            result_.attributes.push_back(std::move(attribute));
+            unsupported("legacy-arguments-unsupported", "Legacy attribute " + type.name +
+                " requires native generator analysis to recover constructor and named arguments");
         }
         currentAttribute_.reset();
-        if (typeCount != 0) {
-            unsupported("legacy-arguments-unsupported", "Version 27 constructor and named arguments require native attribute generator analysis");
-        }
         return std::move(result_);
     }
 
@@ -826,7 +886,7 @@ private:
 } // namespace
 
 bool CustomAttributeValue::isNull() const noexcept {
-    return std::holds_alternative<std::monostate>(value);
+    return kind == CustomAttributeValueKind::SzArray ? arrayNull : std::holds_alternative<std::monostate>(value);
 }
 
 bool CustomAttributeEvaluationResult::ok() const noexcept {

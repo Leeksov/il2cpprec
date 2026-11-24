@@ -55,6 +55,22 @@ struct Version24EarlyCodeRegistration {
     bool codeGenModules = false;
 };
 
+struct Version24EarlyMethodInfo {
+    std::size_t pointerSize = 0;
+    std::size_t size = 0;
+    std::uint32_t methodPointerOffset = 0;
+    std::uint32_t invokerOffset = 0;
+    std::uint32_t declaringTypeOffset = 0;
+    std::uint32_t rgctxOrDefinitionOffset = 0;
+    std::uint32_t genericMethodOrContainerOffset = 0;
+    std::uint32_t customAttributeIndexOffset = 0;
+    bool hasCustomAttributeIndex = false;
+    std::uint32_t tokenOffset = 0;
+    std::uint32_t flagsOffset = 0;
+    std::uint32_t parameterCountOffset = 0;
+    std::uint32_t bitfieldOffset = 0;
+};
+
 struct Version24EarlyProfile {
     Version24EarlyKind kind;
     double version;
@@ -68,6 +84,7 @@ struct Version24EarlyProfile {
     Version24EarlyTable images;
     Version24EarlyTable assemblies;
     Version24EarlyTable rgctxEntries;
+    std::uint32_t customAttributeRangeStride;
     bool globalMethodIndex;
     std::uint32_t methodIndexOffset;
     std::uint32_t imageTokenOffset;
@@ -94,6 +111,10 @@ const Version24EarlyProfile* findVersion24EarlyProfile(double version) noexcept;
 const Version24EarlyProfile* detectVersion24EarlyProfile(std::span<const std::uint8_t> metadata) noexcept;
 
 Version24EarlyCodeRegistration makeVersion24EarlyCodeRegistration(std::size_t pointerSize) noexcept;
+Version24EarlyMethodInfo makeVersion24EarlyMethodInfo(
+    Version24EarlyKind kind, std::size_t pointerSize) noexcept;
+std::vector<std::string> validateVersion24EarlyMethodInfo(
+    Version24EarlyKind kind, const Version24EarlyMethodInfo& layout);
 std::vector<std::string> validateVersion24EarlyCodeRegistration(
     const Version24EarlyCodeRegistration& layout);
 std::vector<std::string> validateVersion24EarlyProfile(const Version24EarlyProfile& profile);

@@ -3,9 +3,11 @@
 #include <il2cpprec/metadata/CodeGenModules.hpp>
 #include <il2cpprec/metadata/MetadataRegistration.hpp>
 #include <il2cpprec/metadata/TypeSystem.hpp>
+#include <il2cpprec/metadata/UniversalGenericResolver.hpp>
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <iomanip>
 #include <map>
 #include <optional>
@@ -29,6 +31,7 @@ struct PendingCall {
     size_t helperArgumentPrefix = 0;
     bool helperCall = false;
     bool prepare = false;
+    std::vector<std::string> methodTypeArguments;
 };
 
 uint16_t pointerBits(Architecture architecture) {
@@ -86,17 +89,46 @@ std::string csharpType(std::string type, const MetadataModel& metadata) {
         "void", "bool", "char", "sbyte", "byte", "short", "ushort", "int", "uint", "long", "ulong",
         "float", "double", "string", "object", "nint", "nuint"
     };
-    if (type.empty()) return "object";
+    if (type.empty()) return {};
     type = resolveTypeName(std::move(type), metadata);
     if (type.empty()) return {};
     if (primitives.contains(type)) return type;
     if (type.starts_with("global::")) type.erase(0, 8);
+    // Match the metadata generic name to the declaration spelling used by ProjectWriter.
+    for (size_t open = type.find('<'); open != std::string::npos; open = type.find('<', open + 1)) {
+        size_t start = open;
+        while (start != 0 && type[start - 1] != '<' && type[start - 1] != ',' && type[start - 1] != ' ') --start;
+        const auto name = type.substr(start, open - start);
+        std::optional<std::string> declaration;
+        for (const auto& definition : metadata.types) {
+            const auto tick = definition.name.rfind('`');
+            if (tick == std::string::npos && definition.genericContainerIndex < 0) continue;
+            const auto base = definition.nameSpace.empty()
+                ? definition.name.substr(0, tick)
+                : definition.nameSpace + "." + definition.name.substr(0, tick);
+            if (base != name) continue;
+            const auto candidate = tick == std::string::npos ? base : definition.nameSpace.empty()
+                ? definition.name.substr(0, tick) + "_" + definition.name.substr(tick + 1)
+                : definition.nameSpace + "." + definition.name.substr(0, tick) + "_" + definition.name.substr(tick + 1);
+            if (declaration && *declaration != candidate) return {};
+            declaration = candidate;
+        }
+        if (!declaration) return {};
+        type.replace(start, open - start, *declaration);
+        open = start + declaration->size();
+    }
+    int genericDepth = 0;
     for (const auto character : type) {
+        if (character == '<') { ++genericDepth; continue; }
+        if (character == '>') { if (--genericDepth < 0) return {}; continue; }
         if (!std::isalnum(static_cast<unsigned char>(character)) && character != '_' && character != '.' &&
-            character != '[' && character != ']' && character != '*' && character != '&' && character != ',') {
+            character != '[' && character != ']' && character != '*' && character != '&' &&
+            character != ',' && character != ' ') {
             return {};
         }
     }
+    if (genericDepth != 0 || type.find("<unresolved") != std::string::npos ||
+        type.find('!') != std::string::npos || type.find('`') != std::string::npos) return {};
     return "global::" + type;
 }
 
@@ -266,7 +298,7 @@ bool buildWrapper(PendingCall& call, Architecture architecture, const MetadataMo
     }
 
     std::string invocation;
-    if (method.isStatic && model.kind == CallSiteKind::GeneratedDirect) {
+    if (method.isStatic && model.kind != CallSiteKind::Virtual && model.kind != CallSiteKind::Interface) {
         invocation = declaringType + "." + *methodName;
     } else {
         if (!receiver) {
@@ -282,6 +314,14 @@ bool buildWrapper(PendingCall& call, Architecture architecture, const MetadataMo
         invocation = model.kind == CallSiteKind::Interface
             ? "((" + declaringType + ")" + receiverValue + ")." + *methodName
             : receiverValue + "." + *methodName;
+    }
+    if (!call.methodTypeArguments.empty()) {
+        invocation += '<';
+        for (size_t index = 0; index < call.methodTypeArguments.size(); ++index) {
+            if (index != 0) invocation += ", ";
+            invocation += call.methodTypeArguments[index];
+        }
+        invocation += '>';
     }
     invocation += '(';
     for (size_t index = 0; index < arguments.size(); ++index) {
@@ -337,6 +377,9 @@ ManagedEmitResult ManagedEmitter::emit(
     const ManagedEmitterOptions& options) const {
     ManagedEmitResult result;
     auto resolvedMetadata = metadata;
+    if (resolvedMetadata.version == 0 && resolvedMetadata.versionInfo.preciseVersion != 0) {
+        resolvedMetadata.version = resolvedMetadata.versionInfo.preciseVersion;
+    }
     const auto* binary = options.patterns.binary ? options.patterns.binary : options.dispatch.binary;
     if (binary && resolvedMetadata.methodPointersByImage.empty()) discoverCodeGenModules(*binary, resolvedMetadata);
     if (binary && resolvedMetadata.typeReferences.empty() && resolvedMetadata.metadataRegistrationAddress != 0) {
@@ -345,8 +388,16 @@ ManagedEmitResult ManagedEmitter::emit(
         } catch (const std::exception&) {
         }
     }
-    result.managedAnalysis = ManagedPatterns{}.analyze(function, resolvedMetadata, options.patterns);
-    result.dispatchAnalysis = VirtualDispatch{}.analyze(function, resolvedMetadata, options.dispatch);
+    auto patternOptions = options.patterns;
+    auto dispatchOptions = options.dispatch;
+    patternOptions.profile.genericAdjustorTargets.insert(options.profile.genericAdjustorTargets.begin(), options.profile.genericAdjustorTargets.end());
+    patternOptions.profile.unresolvedVirtualCallStubs.insert(options.profile.unresolvedVirtualCallStubs.begin(), options.profile.unresolvedVirtualCallStubs.end());
+    patternOptions.profile.genericTypeAddresses.insert(options.profile.genericTypeAddresses.begin(), options.profile.genericTypeAddresses.end());
+    dispatchOptions.profile.genericAdjustorTargets.insert(options.profile.genericAdjustorTargets.begin(), options.profile.genericAdjustorTargets.end());
+    dispatchOptions.profile.unresolvedVirtualCallStubs.insert(options.profile.unresolvedVirtualCallStubs.begin(), options.profile.unresolvedVirtualCallStubs.end());
+    dispatchOptions.profile.genericTypeAddresses.insert(options.profile.genericTypeAddresses.begin(), options.profile.genericTypeAddresses.end());
+    result.managedAnalysis = ManagedPatterns{}.analyze(function, resolvedMetadata, patternOptions);
+    result.dispatchAnalysis = VirtualDispatch{}.analyze(function, resolvedMetadata, dispatchOptions);
 
     std::map<StatementKey, PendingCall> pending;
     std::vector<StatementKey> order;
@@ -370,6 +421,8 @@ ManagedEmitResult ManagedEmitter::emit(
         call.blockIndex = operation.blockIndex;
         call.statementIndex = operation.statementIndex;
         call.method = operation.method;
+        call.genericTarget = operation.genericTarget;
+        call.unresolvedStub = operation.unresolvedStub;
         call.reason = operation.reason;
         call.nativeStatements = operation.nativeStatements;
         addCall(std::move(call), false);
@@ -384,6 +437,7 @@ ManagedEmitResult ManagedEmitter::emit(
         call.blockIndex = operation.blockIndex;
         call.statementIndex = operation.statementIndex;
         call.method = operation.method;
+        call.genericTarget = operation.genericTarget;
         call.reason = operation.reason;
         call.nativeStatements = operation.nativeStatements;
         addCall(std::move(call), true);
@@ -393,7 +447,7 @@ ManagedEmitResult ManagedEmitter::emit(
     auto copy = function;
     for (size_t index = 0; index < order.size(); ++index) {
         auto& call = pending.at(order[index]);
-        if (call.output.status != ManagedPatternStatus::Resolved) {
+        if (call.output.unresolvedStub || call.output.status != ManagedPatternStatus::Resolved) {
             if (call.output.reason.empty()) call.output.reason = "The managed target is unresolved; native IR remains in use.";
             continue;
         }
@@ -404,8 +458,75 @@ ManagedEmitResult ManagedEmitter::emit(
             continue;
         }
         call.method = *method;
+        if (call.output.genericTarget.present) {
+            const auto genericIndex = call.output.genericTarget.genericMethodIndex;
+            if (genericIndex < 0) {
+                call.output.status = ManagedPatternStatus::Placeholder;
+                call.output.reason = "The generic method index is invalid.";
+                continue;
+            }
+            const auto inflated = UniversalGenericResolver(resolvedMetadata).resolve(static_cast<uint32_t>(genericIndex));
+            if (!inflated.ok() || !inflated.method || inflated.methodPointer == 0 ||
+                (call.output.genericTarget.adjustor && inflated.adjustorThunk != call.output.method.address)) {
+                call.output.status = ManagedPatternStatus::Placeholder;
+                call.output.reason = "The closed generic signature or native target is unresolved.";
+                continue;
+            }
+            call.method = *inflated.method;
+            for (const auto typeIndex : inflated.substitution.methodArguments) {
+                const auto type = UniversalGenericResolver(resolvedMetadata).substitute(typeIndex);
+                const auto syntax = type.ok() ? csharpType(type.name, resolvedMetadata) : std::string{};
+                if (syntax.empty()) break;
+                call.methodTypeArguments.push_back(syntax);
+            }
+            if (call.methodTypeArguments.size() != inflated.substitution.methodArguments.size()) {
+                call.output.status = ManagedPatternStatus::Placeholder;
+                call.output.reason = "A generic method argument has no C# type representation.";
+                continue;
+            }
+            const auto arity = call.method.name.find('`');
+            if (arity != std::string::npos) {
+                const auto suffix = call.method.name.substr(arity + 1);
+                unsigned parsedArity = 0;
+                const auto parsed = std::from_chars(suffix.data(), suffix.data() + suffix.size(), parsedArity);
+                if (suffix.empty() || parsed.ec != std::errc{} || parsed.ptr != suffix.data() + suffix.size() ||
+                    parsedArity != call.methodTypeArguments.size()) {
+                    call.output.status = ManagedPatternStatus::Placeholder;
+                    call.output.reason = "The generic method name does not match its instantiation.";
+                    continue;
+                }
+                // ProjectWriter spells metadata backticks as underscores in declarations.
+                call.method.name[arity] = '_';
+            }
+        }
+        if (call.method.name.empty() || call.method.declaringType.empty() || call.method.returnType.empty() ||
+            std::any_of(call.method.parameters.begin(), call.method.parameters.end(),
+                        [](const ParameterModel& parameter) { return parameter.type.empty(); })) {
+            call.output.status = ManagedPatternStatus::Placeholder;
+            call.output.reason = "The MethodModel has an incomplete managed signature.";
+            continue;
+        }
         call.spec.kind = call.output.kind;
         call.spec.methodPointer = constant(call.output.method.address, ScalarType::pointer(pointerBits(function.architecture)));
+        if (call.output.genericTarget.present) {
+            call.spec.genericInstance = true;
+            const auto& target = call.output.genericTarget;
+            if (target.mapping.methodPointer != 0) {
+                call.spec.methodPointer = constant(target.mapping.methodPointer,
+                    ScalarType::pointer(pointerBits(function.architecture)));
+            }
+            if (target.classInstIndex >= 0 && static_cast<size_t>(target.classInstIndex) < resolvedMetadata.genericInsts.size()) {
+                call.spec.genericClassInstance = constant(resolvedMetadata.genericInsts[static_cast<size_t>(target.classInstIndex)].address,
+                    ScalarType::pointer(pointerBits(function.architecture)));
+            }
+            if (target.methodInstIndex >= 0 && static_cast<size_t>(target.methodInstIndex) < resolvedMetadata.genericInsts.size()) {
+                call.spec.genericMethodInstance = constant(resolvedMetadata.genericInsts[static_cast<size_t>(target.methodInstIndex)].address,
+                    ScalarType::pointer(pointerBits(function.architecture)));
+            }
+            if (target.adjustor) {
+                call.spec.adjustorThunk = constant(call.output.method.address, ScalarType::pointer(pointerBits(function.architecture)));
+            }
+        }
         const auto& native = call.output.nativeStatements;
         if (!native.empty()) {
             const auto& statement = native.back();
@@ -428,7 +549,8 @@ ManagedEmitResult ManagedEmitter::emit(
             call.spec.methodPointer = constant(operation->invokeData.methodPointer, ScalarType::pointer(pointerBits(function.architecture)));
             if (operation->hasMethodInfo) call.spec.methodInfo = constant(operation->invokeData.methodInfo, ScalarType::pointer(pointerBits(function.architecture)));
             else if (operation->methodInfoExpression) call.spec.methodInfo = operation->methodInfoExpression;
-            call.spec.genericInstance = operation->kind == VirtualDispatchKind::GenericVirtual || operation->kind == VirtualDispatchKind::GenericInterface;
+            call.spec.genericInstance = call.spec.genericInstance ||
+                operation->kind == VirtualDispatchKind::GenericVirtual || operation->kind == VirtualDispatchKind::GenericInterface;
             if (!native.empty() && native.back().target && native.back().target->kind == Expression::Kind::Constant) {
                 const auto target = native.back().target->constant;
                 const bool interfaceHelper = options.dispatch.interfaceHelperAddresses.contains(target) ||

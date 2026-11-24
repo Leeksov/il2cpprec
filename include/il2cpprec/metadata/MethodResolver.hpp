@@ -23,6 +23,8 @@ enum class MethodResolutionError {
     UnsupportedLegacyMapping,
     MissingMethodIndex,
     InvalidMethodToken,
+    InvalidGeneratedMethodToken,
+    DuplicateMethodToken,
     PointerIndexOutOfRange,
     NullPointer,
     UnmappedAddress,
@@ -45,6 +47,7 @@ struct UnresolvedMethod {
 enum class DeclarationOnlyReason {
     ExpectedNoNativeBody,
     EmptyAssembly,
+    GeneratedWithoutNativePointer,
 };
 
 struct DeclarationOnlyMethod {
@@ -66,6 +69,7 @@ struct MethodResolutionReport {
     size_t adjustorThunks = 0;
     size_t unresolvedStubs = 0;
     size_t duplicateAddresses = 0;
+    size_t duplicateMethodTokens = 0;
     size_t sizeLimitedFunctions = 0;
     std::vector<DeclarationOnlyMethod> declarations;
     std::vector<UnresolvedMethod> unresolved;

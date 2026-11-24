@@ -5,7 +5,6 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
-#include <limits>
 #include <utility>
 
 namespace il2cpprec {
@@ -76,6 +75,14 @@ struct VectorShape {
 };
 
 VectorShape vectorShape(const NativeInstruction& instruction) {
+    if (!instruction.operands.empty()) {
+        const auto& arrangement = instruction.operands[0].arrangement;
+        const auto bits = static_cast<uint16_t>(arrangement.elementSize * 8);
+        if ((bits == 8 || bits == 16 || bits == 32 || bits == 64) &&
+            arrangement.elementCount != 0 && bits * arrangement.elementCount <= 128) {
+            return {bits, arrangement.elementCount};
+        }
+    }
     const auto vector = instruction.text.find('v');
     if (vector == std::string::npos) return {};
     const auto dot = instruction.text.find('.', vector);
@@ -719,7 +726,7 @@ bool Arm64Lifter::liftMove(const NativeInstruction& instruction) {
         if (shape.laneCount == 0) return false;
         const auto sourceInfo = registerInfo(ops[1].reg);
         ExpressionPtr source;
-        const auto laneIndex = vectorLaneIndex(instruction);
+        const auto laneIndex = ops[1].laneIndex >= 0 ? ops[1].laneIndex : vectorLaneIndex(instruction);
         if (laneIndex >= 0) {
             if (sourceInfo.bits != 128 || laneIndex >= shape.laneCount) return false;
             source = readRegister(ops[1].reg);
@@ -727,9 +734,9 @@ bool Arm64Lifter::liftMove(const NativeInstruction& instruction) {
             if (shift != 0) source = binary(">>", source, constant(shift, intType(32)), ScalarType::vectorBits(128));
             source = coerce(source, uintType(shape.laneBits));
         } else {
-            if (sourceInfo.bits != shape.laneBits) return false;
-            source = valueOf(ops[1]);
-            if (sourceInfo.floatingPoint) source = floatToRaw(source, shape.laneBits);
+            if (sourceInfo.floatingPoint || sourceInfo.bits < shape.laneBits ||
+                (sourceInfo.bits != 32 && sourceInfo.bits != 64)) return false;
+            source = coerce(valueOf(ops[1]), uintType(shape.laneBits));
         }
         return addVectorAssignment(ops[0], replicateLane(source, shape.laneBits, shape.laneCount));
     }
@@ -859,13 +866,38 @@ bool Arm64Lifter::liftArithmetic(const NativeInstruction& instruction) {
         const auto width = static_cast<uint16_t>(shape.laneBits * shape.laneCount);
         if ((width != 64 && width != 128) || ops[3].immediate < 0 || ops[3].immediate >= width / 8) return false;
         const auto amount = static_cast<uint16_t>(ops[3].immediate * 8);
-        auto first = valueOf(ops[1], ScalarType::vectorBits(128));
-        if (amount == 0) return addVectorAssignment(ops[0], first);
-        auto second = valueOf(ops[2], ScalarType::vectorBits(128));
         const auto vectorType = ScalarType::vectorBits(128);
-        auto low = binary(">>", first, constant(amount, intType(32)), vectorType);
-        auto high = binary("<<", second, constant(width - amount, intType(32)), vectorType);
-        return addVectorAssignment(ops[0], binary("|", low, high, vectorType));
+        const auto u64 = uintType(64);
+        auto first = saveTemporary("ext_first", valueOf(ops[1], vectorType));
+        auto second = saveTemporary("ext_second", valueOf(ops[2], vectorType));
+        const auto half = [u64, vectorType](ExpressionPtr value, bool upper) {
+            if (upper) value = binary(">>", value, constant(64, intType(32)), vectorType);
+            return cast(value, u64);
+        };
+        const auto splice = [u64](ExpressionPtr lower, ExpressionPtr upper, uint16_t shift) {
+            if (shift == 0) return lower;
+            return binary("|", binary(">>", lower, constant(shift, intType(32)), u64),
+                binary("<<", upper, constant(64 - shift, intType(32)), u64), u64);
+        };
+        auto firstLow = half(first, false);
+        auto secondLow = half(second, false);
+        if (width == 64) {
+            return addVectorAssignment(ops[0], cast(splice(firstLow, secondLow, amount), vectorType));
+        }
+        auto firstHigh = half(first, true);
+        auto secondHigh = half(second, true);
+        ExpressionPtr low;
+        ExpressionPtr high;
+        if (amount < 64) {
+            low = splice(firstLow, firstHigh, amount);
+            high = splice(firstHigh, secondLow, amount);
+        } else {
+            low = splice(firstHigh, secondLow, amount - 64);
+            high = splice(secondLow, secondHigh, amount - 64);
+        }
+        auto result = binary("|", cast(low, vectorType),
+            binary("<<", cast(high, vectorType), constant(64, intType(32)), vectorType), vectorType);
+        return addVectorAssignment(ops[0], result);
     }
     default:
         return false;
@@ -1031,6 +1063,13 @@ bool Arm64Lifter::liftFloatingPoint(const NativeInstruction& instruction) {
         auto rightNaN = binary("!=", right, right, boolean);
         auto ordered = binary(instruction.id == ARM64_INS_FMAX ? ">=" : "<=", left, right, boolean);
         auto result = select(ordered, left, right, type);
+        auto zero = floatingConstant(0.0, type);
+        auto bothZero = binary("&&", binary("==", left, zero, boolean),
+            binary("==", right, zero, boolean), boolean);
+        const auto rawType = uintType(type.bits);
+        auto zeroBits = binary(instruction.id == ARM64_INS_FMAX ? "&" : "|",
+            floatToRaw(left, type.bits), floatToRaw(right, type.bits), rawType);
+        result = select(bothZero, rawToFloat(zeroBits, type.bits), result, type);
         result = select(rightNaN, right, result, type);
         result = select(leftNaN, left, result, type);
         return addAssignment(ops[0], result);
@@ -1040,38 +1079,7 @@ bool Arm64Lifter::liftFloatingPoint(const NativeInstruction& instruction) {
         const auto type = operandType(ops[0]);
         if (type.kind != ScalarKind::FloatingPoint || (type.bits != 32 && type.bits != 64) ||
             operandType(ops[1]).kind != ScalarKind::FloatingPoint || operandType(ops[1]).bits != type.bits) return false;
-        const auto boolean = ScalarType::boolean();
-        auto source = saveTemporary("fsqrt_source", valueOf(ops[1], type));
-        auto zero = floatingConstant(0.0, type);
-        auto minimumNormal = floatingConstant(type.bits == 32
-            ? static_cast<double>(std::numeric_limits<float>::min())
-            : std::numeric_limits<double>::min(), type);
-        auto positive = binary(">", source, zero, boolean);
-        auto small = binary("&&", positive, binary("<", source, minimumNormal, boolean), boolean);
-        const int scaleExponent = type.bits == 32 ? 64 : 128;
-        auto scale = floatingConstant(std::ldexp(1.0, scaleExponent), type);
-        auto scaled = saveTemporary("fsqrt_scaled", select(small, binary("*", source, scale, type), source, type));
-        auto raw = floatToRaw(scaled, type.bits);
-        const auto rawType = uintType(type.bits);
-        raw = binary(">>", raw, constant(1, rawType), rawType);
-        const auto magic = type.bits == 32 ? uint64_t{0x1fc00000} : uint64_t{0x1ff8000000000000};
-        raw = binary("+", raw, constant(magic, rawType), rawType);
-        auto guess = rawToFloat(raw, type.bits);
-        auto half = floatingConstant(0.5, type);
-        const int iterations = type.bits == 32 ? 12 : 16;
-        for (int iteration = 0; iteration < iterations; ++iteration) {
-            auto quotient = binary("/", scaled, guess, type);
-            guess = saveTemporary("fsqrt_step", binary("*", binary("+", guess, quotient, type), half, type));
-        }
-        auto downscale = floatingConstant(std::ldexp(1.0, -scaleExponent / 2), type);
-        auto normal = saveTemporary("fsqrt_result", select(small, binary("*", guess, downscale, type), guess, type));
-        auto infinity = floatingConstant(std::numeric_limits<double>::infinity(), type);
-        auto notANumber = binary("/", zero, zero, type);
-        auto result = select(binary("==", source, infinity, boolean), infinity, normal, type);
-        result = select(binary("<", source, zero, boolean), notANumber, result, type);
-        result = select(binary("==", source, zero, boolean), source, result, type);
-        result = select(binary("!=", source, source, boolean), source, result, type);
-        return addAssignment(ops[0], result);
+        return addAssignment(ops[0], unary("fsqrt", valueOf(ops[1], type), type));
     }
     case ARM64_INS_FABS: {
         if (!hasOperands(instruction, 2)) return false;

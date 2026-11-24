@@ -155,6 +155,9 @@ BinaryImage parseELF(std::shared_ptr<std::vector<uint8_t>> bytes) {
         if (virtualAddress > std::numeric_limits<uint64_t>::max() - segmentMemorySize) {
             throw std::runtime_error("ELF loadable segment virtual address range overflows");
         }
+        if (!is64 && virtualAddress + segmentMemorySize > uint64_t{1} << 32) {
+            throw std::runtime_error("ELF 32-bit loadable segment extends beyond the address space");
+        }
 
         Section section;
         section.name = "LOAD" + std::to_string(i);

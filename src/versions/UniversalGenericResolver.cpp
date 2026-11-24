@@ -56,12 +56,7 @@ std::optional<uint16_t> genericParameterPosition(
     bool methodParameter) {
     if (reference.definitionIndex >= 0) {
         const auto index = static_cast<size_t>(reference.definitionIndex);
-        if (index < metadata.genericParameters.size()) {
-            return metadata.genericParameters[index].num;
-        }
-        if (index <= std::numeric_limits<uint16_t>::max()) {
-            return static_cast<uint16_t>(index);
-        }
+        if (index < metadata.genericParameters.size()) return metadata.genericParameters[index].num;
         return std::nullopt;
     }
 
@@ -242,7 +237,10 @@ private:
         size_t depth) {
         UniversalGenericTypeResolution result;
         result.sourceTypeIndex = sourceIndex;
-        result.type = reference;
+        // Interning a nested substitution can grow types_. Keep this source independent
+        // of that vector so later reads of reference remain valid.
+        const TypeReferenceModel stableReference = reference;
+        result.type = stableReference;
         result.status = MetadataUsageStatus::Resolved;
         result.confidence = UniversalGenericConfidence::Resolved;
         if (depth > maxTypeDepth) {
@@ -257,14 +255,14 @@ private:
             }
         }
 
-        const auto code = static_cast<Il2CppTypeCode>(reference.code);
+        const auto code = static_cast<Il2CppTypeCode>(stableReference.code);
         if (code == Il2CppTypeCode::Var || code == Il2CppTypeCode::MVar) {
             const bool method = code == Il2CppTypeCode::MVar;
             const auto& arguments = method ? substitution_.methodArguments : substitution_.classArguments;
-            const auto position = genericParameterPosition(reference, metadata_, method);
+            const auto position = genericParameterPosition(stableReference, metadata_, method);
             if (!position) {
                 fail(result, std::string("Cannot determine ") + (method ? "MVAR" : "VAR") +
-                    " position for " + (reference.name.empty() ? std::string("an unnamed parameter") : reference.name));
+                    " position for " + (stableReference.name.empty() ? std::string("an unnamed parameter") : stableReference.name));
             } else if (*position >= arguments.size() || arguments[*position] < 0) {
                 fail(result, std::string(method ? "MVAR" : "VAR") + " " + std::to_string(*position) +
                     " has no resolved generic argument");
@@ -277,7 +275,7 @@ private:
                         types_[static_cast<size_t>(argument)], argument, depth + 1);
                     nested.sourceTypeIndex = sourceIndex;
                     nested.substituted = true;
-                    if (reference.byRef && nested.type.code != static_cast<uint8_t>(Il2CppTypeCode::ByRef)) {
+                    if (stableReference.byRef && nested.type.code != static_cast<uint8_t>(Il2CppTypeCode::ByRef)) {
                         nested.type.byRef = true;
                     }
                     mergeStatus(result.status, nested.status);
@@ -294,18 +292,19 @@ private:
                 code == Il2CppTypeCode::Pinned || code == Il2CppTypeCode::Internal ||
                 code == Il2CppTypeCode::TypeIndex;
             if (hasElement) {
-                if (reference.elementTypeIndex < 0 ||
-                    static_cast<size_t>(reference.elementTypeIndex) >= types_.size()) {
-                    fail(result, "Type element " + typeToken(reference.elementTypeIndex) +
+                if (stableReference.elementTypeIndex < 0 ||
+                    static_cast<size_t>(stableReference.elementTypeIndex) >= types_.size()) {
+                    fail(result, "Type element " + typeToken(stableReference.elementTypeIndex) +
                         " is outside the type table");
                 } else {
                     auto nested = resolveReference(
-                        types_[static_cast<size_t>(reference.elementTypeIndex)],
-                        reference.elementTypeIndex,
+                        types_[static_cast<size_t>(stableReference.elementTypeIndex)],
+                        stableReference.elementTypeIndex,
                         depth + 1);
                     result.type.elementTypeIndex = nested.sourceTypeIndex;
                     if (nested.substituted) {
                         result.type.elementTypeIndex = intern(nested.type);
+                        if (result.type.elementTypeIndex < 0) fail(result, "Too many substituted type references");
                         result.substituted = true;
                     }
                     mergeStatus(result.status, nested.status);
@@ -323,27 +322,28 @@ private:
                         types_[static_cast<size_t>(argument)], argument, depth + 1);
                     if (nested.substituted) {
                         argument = intern(nested.type);
+                        if (argument < 0) fail(result, "Too many substituted type references");
                         result.substituted = true;
                     }
                     mergeStatus(result.status, nested.status);
                     appendDiagnostics(result.diagnostics, nested.diagnostics);
                 }
-                if (qualifiedDefinitionName(reference, metadata_).empty()) {
+                if (qualifiedDefinitionName(stableReference, metadata_).empty()) {
                     fail(result, "Generic class instance has no type definition or reference name");
                 }
             }
 
             if ((code == Il2CppTypeCode::Class || code == Il2CppTypeCode::ValueType ||
-                 code == Il2CppTypeCode::Enum) && qualifiedDefinitionName(reference, metadata_).empty()) {
+                 code == Il2CppTypeCode::Enum) && qualifiedDefinitionName(stableReference, metadata_).empty()) {
                 fail(result, "Named type has no type definition or reference name");
             }
-            if (code == Il2CppTypeCode::Array && reference.rank > maxArrayRank) {
-                fail(result, "Array rank " + std::to_string(reference.rank) + " exceeds the supported maximum");
+            if (code == Il2CppTypeCode::Array && stableReference.rank > maxArrayRank) {
+                fail(result, "Array rank " + std::to_string(stableReference.rank) + " exceeds the supported maximum");
             }
             if (!TypeSystem::primitiveType(code) && !hasElement && code != Il2CppTypeCode::GenericInst &&
                 code != Il2CppTypeCode::Class && code != Il2CppTypeCode::ValueType &&
                 code != Il2CppTypeCode::Enum) {
-                fail(result, "Unsupported IL2CPP type code " + std::to_string(reference.code));
+                fail(result, "Unsupported IL2CPP type code " + std::to_string(stableReference.code));
             }
         }
 
@@ -607,6 +607,16 @@ UniversalGenericMethodResolution resolveMethod(
         fail(result, "Generic method is absent from genericMethodTable");
     } else {
         result.mapping = *mapping;
+        if (mapping->classInstAddress != 0 && spec.classInstAddress != 0 &&
+            mapping->classInstAddress != spec.classInstAddress) {
+            fail(result, "Generic class instantiation conflicts with the method spec",
+                 MetadataUsageStatus::Ambiguous);
+        }
+        if (mapping->methodInstAddress != 0 && spec.methodInstAddress != 0 &&
+            mapping->methodInstAddress != spec.methodInstAddress) {
+            fail(result, "Generic method instantiation conflicts with the method spec",
+                 MetadataUsageStatus::Ambiguous);
+        }
     }
 
     std::vector<MethodRecord> methods;
@@ -620,17 +630,40 @@ UniversalGenericMethodResolution resolveMethod(
     }
 
     UniversalGenericResolver resolver(metadata, options);
-    result.classInst = resolver.resolveGenericInst(spec.classInstIndex, spec.classInstAddress);
-    result.methodInst = resolver.resolveGenericInst(spec.methodInstIndex, spec.methodInstAddress);
-    if (explicitSubstitution == nullptr) {
-        result.substitution.classArguments = result.classInst.typeArgumentIndices;
-        result.substitution.methodArguments = result.methodInst.typeArgumentIndices;
-        mergeStatus(result.status, result.classInst.status);
-        mergeStatus(result.status, result.methodInst.status);
-        appendDiagnostics(result.diagnostics, result.classInst.diagnostics);
-        appendDiagnostics(result.diagnostics, result.methodInst.diagnostics);
-    } else {
+    result.classInst = resolver.resolveGenericInst(
+        spec.classInstIndex, spec.classInstAddress != 0 ? spec.classInstAddress :
+            (mapping != nullptr ? mapping->classInstAddress : 0));
+    result.methodInst = resolver.resolveGenericInst(
+        spec.methodInstIndex, spec.methodInstAddress != 0 ? spec.methodInstAddress :
+            (mapping != nullptr ? mapping->methodInstAddress : 0));
+    result.substitution.classArguments = result.classInst.typeArgumentIndices;
+    result.substitution.methodArguments = result.methodInst.typeArgumentIndices;
+    mergeStatus(result.status, result.classInst.status);
+    mergeStatus(result.status, result.methodInst.status);
+    appendDiagnostics(result.diagnostics, result.classInst.diagnostics);
+    appendDiagnostics(result.diagnostics, result.methodInst.diagnostics);
+    if (explicitSubstitution != nullptr) {
+        const auto compareArguments = [&](const std::vector<int32_t>& resolved,
+                                          const std::vector<int32_t>& supplied,
+                                          std::string_view kind) {
+            if (!resolved.empty() && resolved != supplied) {
+                fail(result, std::string("Explicit ") + std::string(kind) +
+                    " arguments conflict with the method spec", MetadataUsageStatus::Ambiguous);
+            }
+        };
+        compareArguments(result.substitution.classArguments, explicitSubstitution->classArguments, "class");
+        compareArguments(result.substitution.methodArguments, explicitSubstitution->methodArguments, "method");
         result.substitution = *explicitSubstitution;
+    }
+    for (const auto& [kind, arguments] : {
+             std::pair<std::string_view, const std::vector<int32_t>&>{"class", result.substitution.classArguments},
+             {"method", result.substitution.methodArguments}}) {
+        for (const int32_t argument : arguments) {
+            if (argument < 0 || static_cast<size_t>(argument) >= metadata.typeReferences.size()) {
+                fail(result, std::string("Generic ") + std::string(kind) + " argument " +
+                    typeToken(argument) + " is outside the type table");
+            }
+        }
     }
 
     if (methods.size() == 1) {
@@ -723,6 +756,8 @@ UniversalGenericMethodResolution resolveMethod(
                     result.entryPoint = result.adjustorThunk;
                     result.adjustorThunkSelected = true;
                 }
+            } else if (mapping->adjustorThunk != 0 || mapping->adjustorThunkIndex >= 0) {
+                fail(result, "Generic method has an adjustor thunk in a version without adjustor support");
             }
             if (result.methodPointer == 0) fail(result, "Generic method has no resolved native method pointer");
             if (result.invokerPointer == 0) fail(result, "Generic method has no resolved invoker pointer");
@@ -734,6 +769,8 @@ UniversalGenericMethodResolution resolveMethod(
     } else {
         result.confidence = UniversalGenericConfidence::Unresolved;
         if (result.status == MetadataUsageStatus::Resolved) result.status = MetadataUsageStatus::Unresolved;
+        result.entryPoint = 0;
+        result.adjustorThunkSelected = false;
     }
     return result;
 }
@@ -768,12 +805,14 @@ UniversalGenericVersionProfile UniversalGenericResolver::versionProfile(double v
     const bool v27 = version >= 27.0 && version <= 27.2;
     const bool v29 = version >= 29.0 && version <= 29.1;
     const bool v31 = version == 31.0;
-    const bool modern = version >= 33.0;
+    const bool modern = version == 33.0 || version == 35.0 || version == 38.0 ||
+        version == 39.0 || version == 104.0 || version == 105.0 ||
+        version == 106.0 || version == 106.1 || version == 107.0 ||
+        version == 108.0 || version == 109.0 || version == 110.0 || version == 111.0;
     profile.supported = legacy || v27 || v29 || v31 || modern;
     if (!profile.supported) return profile;
     profile.adjustorThunks = version == 24.5 || (v27 && version >= 27.1) || v29 || v31 || modern;
-    profile.perImageInvokerIndices = (legacy && version >= 24.2) || v27 || v29 || v31 ||
-        (modern && version < 108.0);
+    profile.perImageInvokerIndices = (legacy && version >= 24.2) || v27 || v29 || v31 || modern;
     return profile;
 }
 
@@ -859,6 +898,22 @@ UniversalGenericInstResolution UniversalGenericResolver::resolveGenericInst(
 
     if (explicitArguments != nullptr) {
         result.typeArgumentIndices = *explicitArguments;
+        if (inst != nullptr && !inst->typeAddresses.empty()) {
+            if (inst->typeAddresses.size() != explicitArguments->size()) {
+                result.status = MetadataUsageStatus::Ambiguous;
+                result.diagnostics.push_back("Explicit generic arguments conflict with the native instantiation count");
+            } else {
+                for (size_t index = 0; index < inst->typeAddresses.size(); ++index) {
+                    const auto mapped = options_.typeReferencesByAddress.find(inst->typeAddresses[index]);
+                    if (mapped != options_.typeReferencesByAddress.end() &&
+                        mapped->second != (*explicitArguments)[index]) {
+                        result.status = MetadataUsageStatus::Ambiguous;
+                        result.diagnostics.push_back("Explicit generic arguments conflict with native type addresses");
+                        break;
+                    }
+                }
+            }
+        }
     } else if (inst != nullptr) {
         result.typeArgumentIndices.reserve(inst->typeAddresses.size());
         for (const uint64_t address : inst->typeAddresses) {

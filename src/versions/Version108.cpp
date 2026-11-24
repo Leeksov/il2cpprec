@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 namespace il2cpprec {
@@ -278,7 +279,9 @@ void requireSection(
     size_t expectedStride,
     const char* name) {
     const size_t stride = strideOf(section, name);
-    if (stride != expectedStride) invalid(std::string(name) + " has an unexpected element size");
+    if (section.count != 0 && stride != expectedStride) {
+        invalid(std::string(name) + " has an unexpected element size");
+    }
     const auto offset = static_cast<size_t>(section.offset);
     const auto size = static_cast<size_t>(section.sectionSize);
     reader.require(offset, size);
@@ -306,8 +309,15 @@ void validateDefinitionIndex(int32_t index, int32_t methodCount) {
 }
 
 void validateRange(int32_t start, int32_t count, size_t available, const char* name) {
-    if (count == 0) return;
-    if (start < 0 || count < 0) invalid(std::string(name) + " has a negative range");
+    if (count < 0 || start < -1 || (count != 0 && start < 0)) {
+        invalid(std::string(name) + " has a negative range");
+    }
+    if (count == 0) {
+        if (start >= 0 && static_cast<size_t>(start) > available) {
+            invalid(std::string(name) + " starts beyond its target table");
+        }
+        return;
+    }
     const auto begin = static_cast<size_t>(start);
     const auto length = static_cast<size_t>(count);
     if (begin > available || length > available - begin) {
@@ -404,10 +414,12 @@ Version108Header Version108::readHeader(const uint8_t* data, size_t size) {
     auto& widths = header.indices;
     widths.methodDefinition = Version108Header::indexWidth(sections.methods.count);
     widths.typeDefinition = Version108Header::indexWidth(sections.typeDefinitions.count);
-    widths.methodSpec = Version108Header::indexWidth(
-        sections.methodSpecsOnGenericType.count +
-        sections.genericMethodSpecsOnType.count +
-        sections.methodSpecs.count);
+    const int64_t specCount = static_cast<int64_t>(sections.methodSpecsOnGenericType.count) +
+        sections.genericMethodSpecsOnType.count + sections.methodSpecs.count;
+    if (specCount > std::numeric_limits<int32_t>::max()) {
+        invalid("normalized method spec count exceeds supported index range");
+    }
+    widths.methodSpec = Version108Header::indexWidth(static_cast<int32_t>(specCount));
 
     const size_t interfaceStride = strideOf(sections.interfaceOffsets, "interface offsets");
     if (interfaceStride != 0) {
@@ -415,13 +427,11 @@ Version108Header Version108::readHeader(const uint8_t* data, size_t size) {
         widths.type = derivedWidth(interfaceStride - sizeof(int32_t), "type index");
     }
 
-    const size_t shortStride = widths.methodDefinition + widths.genericInst;
-    const size_t fullStride = widths.methodDefinition + 2 * widths.genericInst;
     bool genericInstKnown = false;
     const auto deriveGenericInst = [&](const MetadataSectionModel& section, bool full, const char* name) {
         const size_t stride = strideOf(section, name);
         if (stride == 0) return;
-        const size_t fixed = full ? widths.methodDefinition : widths.methodDefinition;
+        const size_t fixed = widths.methodDefinition;
         if (stride <= fixed || (full && (stride - fixed) % 2 != 0)) {
             invalid(std::string(name) + " has an invalid element size");
         }
@@ -459,8 +469,6 @@ Version108Header Version108::readHeader(const uint8_t* data, size_t size) {
         widths.adjustorThunk = derivedWidth(adjustorStride - fixed, "adjustor thunk index");
     }
 
-    (void)shortStride;
-    (void)fullStride;
     return header;
 }
 
@@ -595,6 +603,7 @@ MetadataModel Version108::read(const uint8_t* data, size_t size) const {
         model.methodSpecs.push_back(spec);
     }
 
+    std::unordered_map<int32_t, GenericMethodPointerModel> functionsBySpec;
     const auto readFunctionTable = [&](const MetadataSectionModel& section, bool withAdjustor) {
         const size_t stride = widths.methodSpec + widths.genericMethodPointer + widths.invoker +
             (withAdjustor ? widths.adjustorThunk : 0);
@@ -614,6 +623,16 @@ MetadataModel Version108::read(const uint8_t* data, size_t size) const {
             if (mapping.genericMethodIndex < 0 ||
                 static_cast<size_t>(mapping.genericMethodIndex) >= model.methodSpecs.size()) {
                 invalid("generic method table index is outside the normalized method spec table");
+            }
+            const auto [previous, inserted] = functionsBySpec.emplace(
+                mapping.genericMethodIndex, mapping);
+            if (!inserted) {
+                if (previous->second.methodIndex != mapping.methodIndex ||
+                    previous->second.invokerIndex != mapping.invokerIndex ||
+                    previous->second.adjustorThunkIndex != mapping.adjustorThunkIndex) {
+                    invalid("conflicting generic method functions for a normalized method spec");
+                }
+                invalid("duplicate generic method function for a normalized method spec");
             }
             model.genericMethodTable.push_back(mapping);
         }
@@ -641,11 +660,11 @@ MetadataModel Version108::read(const uint8_t* data, size_t size) const {
             reader.i32(offset + 8)});
     }
 
-    requireSection(reader, sections.rgctxValues, 5, "RGCTX values");
+    requireSection(reader, sections.rgctxValues, 8, "RGCTX values");
     model.rgctxValues.reserve(static_cast<size_t>(sections.rgctxValues.count));
     for (int32_t index = 0; index < sections.rgctxValues.count; ++index) {
         const size_t offset = static_cast<size_t>(sections.rgctxValues.offset) +
-            static_cast<size_t>(index) * 5;
+            static_cast<size_t>(index) * 8;
         model.rgctxValues.push_back({reader.u8(offset), reader.u32(offset + 1)});
     }
     validateRgctxRanges(model.rgctxRanges, model.rgctxValues.size());
@@ -662,7 +681,7 @@ MetadataModel Version108::read(const uint8_t* data, size_t size) const {
             static_cast<size_t>(sections.staticConstructorTypeIndices.offset) +
                 static_cast<size_t>(index) * widths.typeDefinition,
             widths.typeDefinition);
-        if (type < 0 || type >= sections.typeDefinitions.count) {
+        if (type < -1 || type >= sections.typeDefinitions.count) {
             invalid("static constructor type index is outside the type table");
         }
         model.staticConstructorTypeIndices.push_back(type);
@@ -705,13 +724,19 @@ MetadataModel Version108::read(const uint8_t* data, size_t size) const {
         offset += widths.typeDefinition;
         image.staticConstructorCount = reader.u32(offset);
 
+        if (image.typeCount > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+            invalid("image type range is too large");
+        }
         validateRange(image.typeStart, static_cast<int32_t>(image.typeCount),
                       sections.typeDefinitions.count, "image type range");
+        if (image.invokerIndicesStart < -1 ||
+            (image.invokerIndicesStart >= 0 &&
+             static_cast<size_t>(image.invokerIndicesStart) > model.invokerIndices.size())) {
+            invalid("image invoker index start is outside the invoker index table");
+        }
         validateRange(image.rgctxRangesStart, image.rgctxRangesCount,
                       model.rgctxRanges.size(), "image RGCTX range");
-        if (image.staticConstructorCount > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
-            invalid("image static constructor range is too large");
-        }
+        if (image.staticConstructorCount < 0) invalid("negative image static constructor count");
         validateRange(image.staticConstructorStart,
                       static_cast<int32_t>(image.staticConstructorCount),
                       model.staticConstructorTypeIndices.size(),
@@ -930,6 +955,8 @@ Version108Registration Version108::readRegistration(
             metadata.adjustorThunks.push_back({token, thunk});
         }
 
+        module.reversePInvokeWrapperIndices = readNativeTable(
+            reader, checkedAdd(moduleAddress, 5 * p), p);
         module.debuggerMetadata = reader.pointer(checkedAdd(moduleAddress, 7 * p));
         module.moduleInitializer = reader.pointer(checkedAdd(moduleAddress, 8 * p));
         module.metadataRegistration = reader.pointer(checkedAdd(moduleAddress, 9 * p));

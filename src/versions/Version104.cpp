@@ -135,8 +135,9 @@ std::size_t validateTable(
 
 std::size_t indexWidth(int32_t count) {
     if (count < 0) invalid("negative element count used for index width");
-    if (count <= std::numeric_limits<uint8_t>::max()) return 1;
-    if (count <= std::numeric_limits<uint16_t>::max()) return 2;
+    // The all-ones value is reserved for -1, so it cannot name an element.
+    if (count < std::numeric_limits<uint8_t>::max()) return 1;
+    if (count < std::numeric_limits<uint16_t>::max()) return 2;
     return 4;
 }
 
@@ -174,8 +175,18 @@ struct TypeDefinition {
     uint32_t flags = 0;
     int32_t fieldStart = -1;
     int32_t methodStart = -1;
+    int32_t eventStart = -1;
+    int32_t propertyStart = -1;
+    int32_t nestedTypeStart = -1;
+    int32_t interfacesStart = -1;
+    int32_t interfaceOffsetsStart = -1;
     uint16_t methodCount = 0;
+    uint16_t propertyCount = 0;
     uint16_t fieldCount = 0;
+    uint16_t eventCount = 0;
+    uint16_t nestedTypeCount = 0;
+    uint16_t interfacesCount = 0;
+    uint16_t interfaceOffsetsCount = 0;
     uint32_t bitfield = 0;
     uint32_t token = 0;
 };
@@ -380,30 +391,59 @@ Version104Layout Version104::layout(const MetadataSectionsModel& sections) const
 
     if (options_.typeIndexWidth) {
         result.typeIndex = *options_.typeIndexWidth;
-    } else {
-        if (sections.interfaceOffsets.count == 0 || sections.interfaceOffsets.sectionSize < 0 ||
+        result.typeIndexWidthKnown = true;
+    } else if (sections.interfaceOffsets.count != 0) {
+        if (sections.interfaceOffsets.sectionSize < 0 ||
             sections.interfaceOffsets.sectionSize % sections.interfaceOffsets.count != 0) {
-            invalid("type index width requires a non-empty, aligned interfaceOffsets table or an explicit width");
+            invalid("interfaceOffsets table has an unaligned element width");
         }
         const int32_t stride = sections.interfaceOffsets.sectionSize / sections.interfaceOffsets.count;
         if (stride != 5 && stride != 6 && stride != 8) {
             invalid("interfaceOffsets element width does not contain a valid type index");
         }
         result.typeIndex = static_cast<std::size_t>(stride - 4);
+        result.typeIndexWidthKnown = true;
+    } else {
+        const bool hasTypeIndices = sections.typeDefinitions.count != 0 || sections.methods.count != 0 ||
+            sections.parameters.count != 0 || sections.fields.count != 0 || sections.events.count != 0 ||
+            sections.fieldDefaultValues.count != 0 || sections.parameterDefaultValues.count != 0 ||
+            sections.interfaces.count != 0 || sections.genericParameterConstraints.count != 0 ||
+            sections.typeInlineArrays.count != 0 || sections.unresolvedIndirectCallParameterTypes.count != 0 ||
+            sections.fieldRefs.count != 0;
+        if (hasTypeIndices) {
+            invalid("type index width requires a non-empty interfaceOffsets table or an explicit width");
+        }
+        // No record can consume a TypeIndex. Keep a nonzero internal stride for
+        // empty-table validation while recording that the width was not inferred.
     }
 
-    const bool v105 = options_.version >= 105.0;
-    const bool v106 = options_.version >= 106.0;
+    const bool v105 = versionIs(options_.version, 105.0);
+    const bool v106 = versionIs(options_.version, 106.0) || versionIs(options_.version, 106.1);
+    const bool v107 = versionIs(options_.version, 107.0);
     result.eventIndex = indexWidth(sections.events.count);
     result.interfaceIndex = indexWidth(sections.interfaceOffsets.count);
     result.nestedTypeIndex = indexWidth(sections.nestedTypes.count);
     result.propertyIndex = indexWidth(sections.properties.count);
-    result.methodIndex = v105 ? indexWidth(sections.methods.count) : 4;
-    result.genericParameterIndex = v106 ? indexWidth(sections.genericParameters.count) : 4;
-    result.fieldIndex = v106 ? indexWidth(sections.fields.count) : 4;
-    result.defaultValueDataIndex = v106 ? indexWidth(sections.defaultValueData.count) : 4;
-    result.compactGenericContainers = v106;
+    result.methodIndex = (v105 || v106 || v107) ? indexWidth(sections.methods.count) : 4;
+    result.genericParameterIndex = (v106 || v107) ? indexWidth(sections.genericParameters.count) : 4;
+    result.fieldIndex = (v106 || v107) ? indexWidth(sections.fields.count) : 4;
+    result.defaultValueDataIndex = (v106 || v107) ? indexWidth(sections.defaultValueData.count) : 4;
+    result.compactGenericContainers = v106 || v107;
     result.hasAlwaysInitMetadataUsages = registrationVersion() >= 106.1;
+
+    // The flat nestedTypes array has its own on-disk width. Its elements do
+    // not necessarily use the width of a TypeDefinitionIndex in a record.
+    if (sections.nestedTypes.count != 0) {
+        if (sections.nestedTypes.sectionSize % sections.nestedTypes.count != 0) {
+            invalid("nested types table has an unaligned element width");
+        }
+        result.nestedTypeTableIndex = static_cast<std::size_t>(
+            sections.nestedTypes.sectionSize / sections.nestedTypes.count);
+        if (result.nestedTypeTableIndex != 1 && result.nestedTypeTableIndex != 2 &&
+            result.nestedTypeTableIndex != 4) {
+            invalid("nested types table has an unsupported element width");
+        }
+    }
 
     result.typeDefinitionSize = 40 + 3 * result.typeIndex + result.genericContainerIndex + result.fieldIndex +
         result.methodIndex + result.eventIndex + result.propertyIndex + result.nestedTypeIndex +
@@ -413,7 +453,20 @@ Version104Layout Version104::layout(const MetadataSectionsModel& sections) const
     result.parameterDefinitionSize = 8 + result.typeIndex;
     result.fieldDefinitionSize = 8 + result.typeIndex;
     result.genericParameterSize = 12 + result.genericContainerIndex;
-    result.genericContainerSize = (v106 ? 7 : 12) + result.genericParameterIndex;
+    result.genericContainerSize = ((v106 || v107) ? 7 : 12) + result.genericParameterIndex;
+    if (result.compactGenericContainers && sections.genericContainers.count != 0) {
+        if (sections.genericContainers.sectionSize % sections.genericContainers.count != 0) {
+            invalid("generic containers have an unaligned element width");
+        }
+        const auto recordedSize = static_cast<std::size_t>(
+            sections.genericContainers.sectionSize / sections.genericContainers.count);
+        // Unity may pad the compact 7-byte prefix before its final index.
+        if (recordedSize < result.genericContainerSize ||
+            recordedSize - result.genericContainerSize > 4) {
+            invalid("generic container element width is outside the compact layout");
+        }
+        result.genericContainerSize = recordedSize;
+    }
     result.fieldDefaultValueSize = result.fieldIndex + result.typeIndex + result.defaultValueDataIndex;
     result.parameterDefaultValueSize = result.parameterIndex + result.typeIndex + result.defaultValueDataIndex;
     result.eventDefinitionSize = 8 + result.typeIndex + 3 * result.methodIndex;
@@ -501,7 +554,7 @@ Version104Metadata Version104::read(const uint8_t* data, std::size_t size) const
         reader, sections.parameterDefaultValues, widths.parameterDefaultValueSize, "parameter default values");
     validateTable(reader, sections.events, widths.eventDefinitionSize, "events");
     validateTable(reader, sections.properties, widths.propertyDefinitionSize, "properties");
-    validateTable(reader, sections.nestedTypes, 4, "nested types");
+    validateTable(reader, sections.nestedTypes, widths.nestedTypeTableIndex, "nested types");
     validateTable(reader, sections.interfaces, widths.typeIndex, "interfaces");
     validateTable(reader, sections.interfaceOffsets, widths.typeIndex + 4, "interface offsets");
     validateTable(reader, sections.typeInlineArrays, widths.inlineArraySize, "type inline arrays");
@@ -509,6 +562,38 @@ Version104Metadata Version104::read(const uint8_t* data, std::size_t size) const
     validateTable(reader, sections.assemblies, widths.assemblyDefinitionSize, "assemblies");
     validateTable(reader, sections.genericParameterConstraints, widths.typeIndex, "generic parameter constraints");
     validateTable(reader, sections.vtableMethods, 4, "vtable methods");
+    const std::size_t unresolvedTypeCount = validateTable(
+        reader, sections.unresolvedIndirectCallParameterTypes, widths.typeIndex,
+        "unresolved indirect call parameter types");
+    const std::size_t unresolvedRangeCount = validateTable(
+        reader, sections.unresolvedIndirectCallParameterRanges, 8,
+        "unresolved indirect call parameter ranges");
+
+    std::vector<int32_t> unresolvedTypes;
+    unresolvedTypes.reserve(unresolvedTypeCount);
+    for (std::size_t index = 0; index < unresolvedTypeCount; ++index) {
+        unresolvedTypes.push_back(reader.index(
+            static_cast<std::size_t>(sections.unresolvedIndirectCallParameterTypes.offset) +
+                index * widths.typeIndex,
+            widths.typeIndex));
+    }
+    model.unresolvedSignatures.reserve(unresolvedRangeCount);
+    for (std::size_t index = 0; index < unresolvedRangeCount; ++index) {
+        const std::size_t cursor =
+            static_cast<std::size_t>(sections.unresolvedIndirectCallParameterRanges.offset) + index * 8;
+        UnresolvedSignatureModel signature;
+        signature.start = reader.i32(cursor);
+        signature.count = reader.i32(cursor + 4);
+        if (signature.start < 0 || signature.count < 0 ||
+            static_cast<std::size_t>(signature.start) > unresolvedTypes.size() ||
+            static_cast<std::size_t>(signature.count) >
+                unresolvedTypes.size() - static_cast<std::size_t>(signature.start)) {
+            invalid("unresolved signature range is outside the type index table");
+        }
+        const auto begin = unresolvedTypes.begin() + signature.start;
+        signature.parameterTypeIndices.assign(begin, begin + signature.count);
+        model.unresolvedSignatures.push_back(std::move(signature));
+    }
 
     std::vector<TypeDefinition> types;
     types.reserve(typeCount);
@@ -530,10 +615,24 @@ Version104Metadata Version104::read(const uint8_t* data, std::size_t size) const
         definition.fieldStart = reader.index(cursor, widths.fieldIndex);
         cursor += widths.fieldIndex;
         definition.methodStart = reader.index(cursor, widths.methodIndex);
-        cursor += widths.methodIndex + widths.eventIndex + widths.propertyIndex + widths.nestedTypeIndex +
-            widths.interfaceIndex + 4 + widths.interfaceIndex;
+        cursor += widths.methodIndex;
+        definition.eventStart = reader.index(cursor, widths.eventIndex);
+        cursor += widths.eventIndex;
+        definition.propertyStart = reader.index(cursor, widths.propertyIndex);
+        cursor += widths.propertyIndex;
+        definition.nestedTypeStart = reader.index(cursor, widths.nestedTypeIndex);
+        cursor += widths.nestedTypeIndex;
+        definition.interfacesStart = reader.index(cursor, widths.interfaceIndex);
+        cursor += widths.interfaceIndex + 4;
+        definition.interfaceOffsetsStart = reader.index(cursor, widths.interfaceIndex);
+        cursor += widths.interfaceIndex;
         definition.methodCount = reader.u16(cursor);
+        definition.propertyCount = reader.u16(cursor + 2);
         definition.fieldCount = reader.u16(cursor + 4);
+        definition.eventCount = reader.u16(cursor + 6);
+        definition.nestedTypeCount = reader.u16(cursor + 8);
+        definition.interfacesCount = reader.u16(cursor + 12);
+        definition.interfaceOffsetsCount = reader.u16(cursor + 14);
         cursor += 16;
         definition.bitfield = reader.u32(cursor);
         definition.token = reader.u32(cursor + 4);
@@ -607,7 +706,7 @@ Version104Metadata Version104::read(const uint8_t* data, std::size_t size) const
         if (widths.compactGenericContainers) {
             container.typeArgumentCount = reader.u16(cursor);
             container.isMethod = reader.u8(cursor + 2);
-            cursor += 3;
+            cursor += 3 + widths.genericContainerSize - (7 + widths.genericParameterIndex);
         } else {
             container.typeArgumentCount = reader.i32(cursor);
             container.isMethod = reader.i32(cursor + 4);
@@ -676,7 +775,9 @@ Version104Metadata Version104::read(const uint8_t* data, std::size_t size) const
 
     model.nestedTypes.reserve(static_cast<std::size_t>(sections.nestedTypes.count));
     for (std::size_t index = 0; index < static_cast<std::size_t>(sections.nestedTypes.count); ++index) {
-        const int32_t nested = reader.i32(static_cast<std::size_t>(sections.nestedTypes.offset) + index * 4);
+        const int32_t nested = reader.index(
+            static_cast<std::size_t>(sections.nestedTypes.offset) + index * widths.nestedTypeTableIndex,
+            widths.nestedTypeTableIndex);
         if (nested < 0 || static_cast<std::size_t>(nested) >= typeCount) invalid("nested type index is out of range");
         model.nestedTypes.push_back(nested);
     }
@@ -696,8 +797,27 @@ Version104Metadata Version104::read(const uint8_t* data, std::size_t size) const
     model.typeInlineArrays.reserve(static_cast<std::size_t>(sections.typeInlineArrays.count));
     for (std::size_t index = 0; index < static_cast<std::size_t>(sections.typeInlineArrays.count); ++index) {
         const std::size_t cursor = static_cast<std::size_t>(sections.typeInlineArrays.offset) + index * widths.inlineArraySize;
-        model.typeInlineArrays.push_back({reader.index(cursor, widths.typeIndex), reader.i32(cursor + widths.typeIndex)});
+        const auto typeIndex = reader.index(cursor, widths.typeIndex);
+        const auto length = reader.i32(cursor + widths.typeIndex);
+        if (typeIndex < 0 || length < 0) invalid("type inline array has an invalid type or length");
+        model.typeInlineArrays.push_back({typeIndex, length});
     }
+
+    // Keep the common metadata view populated as well as the version-specific
+    // records, since callers may hold this result through MetadataModel&.
+    model.MetadataModel::events.reserve(model.events.size());
+    for (const auto& event : model.events) {
+        model.MetadataModel::events.push_back({
+            readString(reader, sections.strings, event.nameIndex).value_or(""),
+            event.typeIndex, event.add, event.remove, event.raise, event.token});
+    }
+    model.MetadataModel::properties.reserve(model.properties.size());
+    for (const auto& property : model.properties) {
+        model.MetadataModel::properties.push_back({
+            readString(reader, sections.strings, property.nameIndex).value_or(""),
+            property.get, property.set, property.attrs, property.token});
+    }
+    model.MetadataModel::nestedTypes = model.nestedTypes;
 
     model.images.reserve(static_cast<std::size_t>(sections.images.count));
     for (std::size_t index = 0; index < static_cast<std::size_t>(sections.images.count); ++index) {
@@ -799,6 +919,12 @@ Version104Metadata Version104::read(const uint8_t* data, std::size_t size) const
         type.flags = definition.flags;
         type.bitfield = definition.bitfield;
         type.token = definition.token;
+        type.eventStart = definition.eventStart;
+        type.eventCount = definition.eventCount;
+        type.propertyStart = definition.propertyStart;
+        type.propertyCount = definition.propertyCount;
+        type.nestedTypeStart = definition.nestedTypeStart;
+        type.nestedTypeCount = definition.nestedTypeCount;
         declaringNames.push_back(qualifiedName(type));
         model.types.push_back(std::move(type));
     }
@@ -806,6 +932,19 @@ Version104Metadata Version104::read(const uint8_t* data, std::size_t size) const
     for (std::size_t typeIndex = 0; typeIndex < typeCount; ++typeIndex) {
         const auto& definition = types[typeIndex];
         auto& outputType = model.types[typeIndex];
+        const auto validRange = [](int32_t start, uint16_t count, std::size_t total) {
+            return count == 0 ||
+                (start >= 0 && static_cast<std::size_t>(start) <= total &&
+                 count <= total - static_cast<std::size_t>(start));
+        };
+        if (!validRange(definition.eventStart, definition.eventCount, model.events.size()) ||
+            !validRange(definition.propertyStart, definition.propertyCount, model.properties.size()) ||
+            !validRange(definition.nestedTypeStart, definition.nestedTypeCount, model.nestedTypes.size()) ||
+            !validRange(definition.interfacesStart, definition.interfacesCount, model.interfaces.size()) ||
+            !validRange(definition.interfaceOffsetsStart, definition.interfaceOffsetsCount,
+                        model.interfaceOffsets.size())) {
+            invalid("type event, property, nested, or interface range is outside its table");
+        }
         if (definition.fieldCount != 0 &&
             (definition.fieldStart < 0 ||
              static_cast<uint64_t>(static_cast<uint32_t>(definition.fieldStart)) + definition.fieldCount > fieldCount)) {

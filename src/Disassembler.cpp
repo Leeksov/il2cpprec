@@ -198,7 +198,8 @@ uint16_t arm64RegisterSize(const cs_arm64_op& input, const std::string& name) {
 }
 
 bool isArm64ReplicateLoad(uint32_t id) {
-    return id == ARM64_INS_LD1R || id == ARM64_INS_LD2R || id == ARM64_INS_LD3R || id == ARM64_INS_LD4R;
+    return id == ARM64_INS_LD1R || id == ARM64_INS_LD2R ||
+        id == ARM64_INS_LD3R || id == ARM64_INS_LD4R;
 }
 
 VectorArrangement arm64Arrangement(
@@ -427,6 +428,30 @@ uint16_t arm64MemorySize(const cs_insn& input, const std::vector<Operand>& opera
     const auto& detail = input.detail->arm64;
     const auto id = input.id;
     if (id == ARM64_INS_LDRAA || id == ARM64_INS_LDRAB) return 8;
+    switch (id) {
+    case ARM64_INS_LDRB:
+    case ARM64_INS_LDURB:
+    case ARM64_INS_LDTRB:
+    case ARM64_INS_LDRSB:
+    case ARM64_INS_LDURSB:
+    case ARM64_INS_LDTRSB:
+    case ARM64_INS_STRB:
+    case ARM64_INS_STURB:
+    case ARM64_INS_STTRB:
+        return 1;
+    case ARM64_INS_LDRH:
+    case ARM64_INS_LDURH:
+    case ARM64_INS_LDTRH:
+    case ARM64_INS_LDRSH:
+    case ARM64_INS_LDURSH:
+    case ARM64_INS_LDTRSH:
+    case ARM64_INS_STRH:
+    case ARM64_INS_STURH:
+    case ARM64_INS_STTRH:
+        return 2;
+    default:
+        break;
+    }
     if (id == ARM64_INS_LD64B || id == ARM64_INS_ST64B || id == ARM64_INS_ST64BV ||
         id == ARM64_INS_ST64BV0) return 64;
     const bool structure = id == ARM64_INS_LD1 || id == ARM64_INS_LD2 || id == ARM64_INS_LD3 ||
@@ -524,7 +549,9 @@ uint16_t arm32MemorySize(const cs_insn& input, const std::vector<Operand>& opera
         uint16_t size = 0;
         for (uint8_t i = 0; i < detail.op_count; ++i) {
             const auto& operand = detail.operands[i];
+            if (structure && operand.type == ARM_OP_MEM) break;
             if (operand.type != ARM_OP_REG) continue;
+            if (multiple && i == 0) continue; // base register is not transferred
             if (structure && (replicate || operand.neon_lane >= 0 || operand.vector_index >= 0) && detail.vector_size > 0) {
                 size += static_cast<uint16_t>(detail.vector_size / 8);
             } else {
@@ -837,10 +864,13 @@ NativeInstruction convertInstruction(const cs_insn& input, Architecture architec
                 if ((input.id == ARM64_INS_MOVI || input.id == ARM64_INS_MVNI) && elementSize != 0) {
                     operand.size = elementSize;
                     operand.arrangement = makeArrangement(elementSize, 1);
-                } else if (input.id == ARM64_INS_EXT || input.id == ARM64_INS_CCMP ||
-                    input.id == ARM64_INS_CCMN || input.id == ARM64_INS_FCCMP || input.id == ARM64_INS_FCCMPE) {
+                } else if (input.id == ARM64_INS_EXT ||
+                    ((input.id == ARM64_INS_CCMP || input.id == ARM64_INS_CCMN ||
+                      input.id == ARM64_INS_FCCMP || input.id == ARM64_INS_FCCMPE) && i == 2)) {
                     operand.size = 1;
                     operand.arrangement = makeArrangement(1, 1);
+                } else if ((input.id == ARM64_INS_CCMP || input.id == ARM64_INS_CCMN) && i == 1) {
+                    operand.size = output.operands[0].size;
                 }
             }
             output.operands.push_back(std::move(operand));
@@ -876,16 +906,7 @@ NativeInstruction convertInstruction(const cs_insn& input, Architecture architec
             }
             output.operands.push_back(std::move(operand));
         }
-        if (detail.writeback) {
-            output.writeback = detail.post_index ? WritebackMode::PostIndex : WritebackMode::PreIndex;
-        } else {
-            for (size_t i = 0; i + 1 < output.operands.size(); ++i) {
-                if (output.operands[i].kind == OperandKind::Memory) {
-                    output.writeback = WritebackMode::PostIndex;
-                    break;
-                }
-            }
-        }
+        applyArm32Writeback(input, output);
     } else {
         output.operands.reserve(input.detail->x86.op_count);
         for (uint8_t i = 0; i < input.detail->x86.op_count; ++i) {

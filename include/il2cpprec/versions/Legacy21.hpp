@@ -161,6 +161,7 @@ struct Legacy21DetectionEvidence {
     std::optional<Legacy21TypeDefinitionSizeStorage> typeDefinitionSizes;
     std::optional<Legacy21VTableKind> vtable;
     std::optional<bool> hasGenericRecursionDepth;
+    std::optional<Legacy21ReversePInvokeName> reversePInvokeName;
 };
 
 enum class Legacy21DetectionStatus {

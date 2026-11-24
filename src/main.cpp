@@ -114,7 +114,9 @@ struct SourceProfileReport {
     std::string sourceSet;
     std::string confidence;
     std::string confidenceReason;
+    std::string provenance;
     std::string methodMapping;
+    il2cpprec::ida::NativeProfileCapabilities capabilities;
     double detectedMetadataVersion = 0;
     double selectedMetadataVersion = 0;
     bool supported = false;
@@ -124,6 +126,41 @@ struct SourceProfileReport {
     RegistrationFieldReport invokerPointers;
     RegistrationFieldReport codeGenModules;
 };
+
+std::string versionConfidenceName(il2cpprec::MetadataVersionConfidence confidence) {
+    using Confidence = il2cpprec::MetadataVersionConfidence;
+    switch (confidence) {
+    case Confidence::Unknown: return "unknown";
+    case Confidence::RawHeader: return "raw-header";
+    case Confidence::InferredLayout: return "inferred-layout";
+    case Confidence::Registration: return "registration";
+    case Confidence::Explicit: return "explicit";
+    }
+    return "unknown";
+}
+
+std::string invokerName(il2cpprec::ida::NativeInvokerSignature signature) {
+    using Signature = il2cpprec::ida::NativeInvokerSignature;
+    switch (signature) {
+    case Signature::Unknown: return "unknown";
+    case Signature::LegacyThreeArguments: return "legacy-three-arguments";
+    case Signature::FourArguments: return "four-arguments";
+    case Signature::FiveArguments: return "five-arguments";
+    }
+    return "unknown";
+}
+
+std::string profileConfidenceName(il2cpprec::ida::NativeProfileConfidence confidence) {
+    using Confidence = il2cpprec::ida::NativeProfileConfidence;
+    switch (confidence) {
+    case Confidence::Exact: return "exact";
+    case Confidence::High: return "high";
+    case Confidence::Compatible: return "compatible";
+    case Confidence::Override: return "override";
+    case Confidence::Unsupported: return "unsupported";
+    }
+    return "unsupported";
+}
 
 struct IdaMcpSession {
     std::unique_ptr<il2cpprec::ida::McpClient> client;
@@ -510,6 +547,29 @@ std::string metadataVersionText(double version) {
     return text;
 }
 
+void populateRecoveryProfile(SourceProfileReport& report, const il2cpprec::MetadataModel& metadata) {
+    auto& recovery = report.recovery;
+    recovery.profileIdentity = report.id;
+    recovery.layoutIdentity = report.layoutHash;
+    recovery.rawMetadataVersion = metadata.versionInfo.rawVersion;
+    recovery.preciseMetadataVersion = report.selectedMetadataVersion;
+    recovery.registrationVersion = metadata.versionInfo.registrationVersion;
+    recovery.versionConfidence = metadata.versionInfo.confidence;
+    recovery.versionProvenance = metadata.versionInfo.provenance;
+    recovery.methodSignatures = metadata.sections.methodSignatures;
+    recovery.generatedMethodTypeInfos = metadata.sections.generatedMethodTypeInfos;
+    recovery.generatedMethodTokens = metadata.sections.generatedMethodTokens;
+    recovery.generatedMethodsStart = metadata.generatedMethodsStart;
+}
+
+void markVersionOverride(SourceProfileReport& report, const Arguments& arguments) {
+    if (arguments.il2cppVersion.empty() && arguments.layout.empty()) return;
+    report.recovery.versionConfidence = il2cpprec::MetadataVersionConfidence::Explicit;
+    report.recovery.versionProvenance = "CLI override";
+    if (!arguments.il2cppVersion.empty()) report.recovery.versionProvenance += " --il2cpp-version=" + arguments.il2cppVersion;
+    if (!arguments.layout.empty()) report.recovery.versionProvenance += " --layout=" + arguments.layout;
+}
+
 SourceProfileReport makeVersion24ModularReport(
     const il2cpprec::BinaryImage& binary,
     const il2cpprec::MetadataModel& metadata,
@@ -528,8 +588,9 @@ SourceProfileReport makeVersion24ModularReport(
     result.detectedMetadataVersion = metadata.version;
     result.selectedMetadataVersion = layout.version();
     result.supported = true;
-    result.confidence = "high";
-    result.confidenceReason = "version-specific modular registration layout";
+    result.confidence = "compatible";
+    result.confidenceReason = "version-specific modular registration layout selected from metadata version";
+    result.provenance = result.sourceSet;
     result.methodMapping = "per-image-token-row-id";
     const auto pair = [&](size_t index) {
         return RegistrationFieldReport{index * 2 * pointerSize, true};
@@ -547,6 +608,7 @@ SourceProfileReport makeVersion24ModularReport(
     result.recovery.binaryIdentity = binaryIdentity(binary);
     result.recovery.codeRegistrationIdentity = result.layoutHash + "@" + hexAddress(metadata.codeRegistrationAddress);
     result.recovery.methodPointersIdentity = methodPointersIdentity(metadata);
+    populateRecoveryProfile(result, metadata);
     return result;
 }
 
@@ -556,68 +618,91 @@ SourceProfileReport makeSourceProfileReport(
     const Arguments& arguments) {
     SourceProfileReport result;
     result.detectedMetadataVersion = metadata.version;
-    double selectedVersion = metadata.version;
-    const il2cpprec::ida::SourceProfile* profile = nullptr;
+    il2cpprec::ida::SourceDetectionInput detection;
+    detection.metadataVersion = metadata.version;
+    detection.binary = &binary;
+    if (metadata.codeRegistrationAddress != 0) {
+        detection.registration.codeRegistrationAddress = metadata.codeRegistrationAddress;
+    }
+    if (metadata.metadataRegistrationAddress != 0) {
+        detection.registration.metadataRegistrationAddress = metadata.metadataRegistrationAddress;
+    }
+    if (!arguments.protectedProfile) detection.rawMetadata = readFile(arguments.metadataPath);
 
+    const auto setVersion = [&](double version, const char* option) {
+        if (detection.overrides.metadataVersion && *detection.overrides.metadataVersion != version) {
+            throw std::invalid_argument(std::string("Conflicting IL2CPP version overrides: ") + option);
+        }
+        detection.overrides.metadataVersion = version;
+    };
+    const auto setProfile = [&](const il2cpprec::ida::SourceProfile& profile, const char* option) {
+        if (!detection.overrides.profileId.empty() && detection.overrides.profileId != profile.id) {
+            throw std::invalid_argument(std::string("Conflicting IL2CPP profile overrides: ") + option);
+        }
+        detection.overrides.profileId = profile.id;
+    };
+    const auto profileFor = [](const std::string& value) {
+        if (const auto* profile = il2cpprec::ida::Il2CppNativeProfileRegistry::find(value)) return profile;
+        return il2cpprec::ida::findSourceProfile(value);
+    };
     if (!arguments.il2cppVersion.empty()) {
         result.selectionMode = "il2cpp-version-override";
-        profile = il2cpprec::ida::findSourceProfile(arguments.il2cppVersion);
-        if (!profile) {
-            selectedVersion = parseMetadataVersion(arguments.il2cppVersion, "--il2cpp-version");
-            profile = selectedVersion == 24.1
-                ? &il2cpprec::ida::unity2017_4_11f1Profile()
-                : &il2cpprec::ida::metadata24BaseProfile();
-        } else if (profile->exact) {
-            selectedVersion = 24.1;
+        if (const auto* profile = profileFor(arguments.il2cppVersion)) {
+            setProfile(*profile, "--il2cpp-version");
+        } else {
+            setVersion(parseMetadataVersion(arguments.il2cppVersion, "--il2cpp-version"), "--il2cpp-version");
         }
     }
     if (!arguments.layout.empty()) {
         result.selectionMode = result.selectionMode.empty() ? "layout-override" : "combined-override";
         if (arguments.layout == "legacy" || arguments.layout == "modern") {
-            selectedVersion = arguments.layout == "legacy" ? 24.1 : 24.5;
-            profile = &il2cpprec::ida::metadata24BaseProfile();
-        } else if (const auto* layoutProfile = il2cpprec::ida::findSourceProfile(arguments.layout)) {
-            profile = layoutProfile;
-            if (profile->exact) selectedVersion = 24.1;
+            setVersion(arguments.layout == "legacy" ? 24.1 : 24.5, "--layout");
+        } else if (const auto* profile = profileFor(arguments.layout)) {
+            setProfile(*profile, "--layout");
         } else {
-            selectedVersion = parseMetadataVersion(arguments.layout, "--layout");
-            profile = &il2cpprec::ida::metadata24BaseProfile();
+            setVersion(parseMetadataVersion(arguments.layout, "--layout"), "--layout");
         }
     }
-    if (!profile) {
-        result.selectionMode = arguments.protectedProfile ? "protected-researched" : "auto";
-        profile = metadata.version == 24.1
-            ? &il2cpprec::ida::unity2017_4_11f1Profile()
-            : &il2cpprec::ida::metadata24BaseProfile();
-    }
+    if (result.selectionMode.empty()) result.selectionMode = arguments.protectedProfile ? "protected-researched" : "auto";
+    const double selectedVersion = detection.overrides.metadataVersion.value_or(metadata.version);
     if (il2cpprec::versions::Version24Modular::supports(selectedVersion)) {
-        return makeVersion24ModularReport(binary, metadata, selectedVersion, result.selectionMode);
+        if (!detection.overrides.profileId.empty()) {
+            throw std::invalid_argument("Unsupported IL2CPP layout override for modular metadata " +
+                metadataVersionText(selectedVersion) + ": no validated matching profile");
+        }
+        auto modular = makeVersion24ModularReport(binary, metadata, selectedVersion, result.selectionMode);
+        markVersionOverride(modular, arguments);
+        return modular;
     }
 
-    const auto selection = profile->resolve(selectedVersion, binary);
+    const auto detected = il2cpprec::ida::Il2CppNativeProfileRegistry::detect(detection);
+    if (!arguments.protectedProfile && !detected.supported()) {
+        throw std::invalid_argument("Unsupported IL2CPP profile/layout for metadata " +
+            metadataVersionText(selectedVersion) + ": " + detected.error);
+    }
+    const auto& selection = detected.selection;
     const auto validation = validateSourceLayout(selection);
-    if (!arguments.protectedProfile && (!selection.supported || !validation.empty())) {
+    if (!arguments.protectedProfile &&
+        (!selection.supported || !selection.nativeRuntimeAvailable || !validation.empty())) {
         const auto detail = !validation.empty() ? validation.front() : selection.diagnostics();
         throw std::invalid_argument(
             "Unsupported IL2CPP profile/layout for metadata " + std::to_string(selectedVersion) + ": " + detail);
     }
 
-    result.id = profile->id;
-    result.unityVersion = profile->unityVersion;
+    result.id = selection.profile ? selection.profile->id : "unknown";
+    result.unityVersion = selection.profile ? selection.profile->unityVersion : "";
     result.variant = selection.variant;
-    result.layoutHash = selection.layoutHash();
+    result.layoutHash = selection.supported ? selection.layoutHash() : "";
     result.supported = selection.supported;
-    result.sourceSet = profile->sourceSet;
+    result.sourceSet = selection.profile ? selection.profile->sourceSet : "";
     result.selectedMetadataVersion = selection.supported ? selection.metadataVersion : selectedVersion;
-    result.methodMapping = selection.methodMapping == il2cpprec::ida::MethodMapping::PerImageTokenRowId
-        ? "per-image-token-row-id"
-        : "global-method-index";
-    result.confidence = profile->exact && selection.supported ? "high" : (selection.supported ? "medium" : "low");
-    result.confidenceReason = profile->exact
-        ? "exact Unity source profile and validated native layout"
-        : (selection.supported
-            ? "metadata-version-selected base layout and successful native layout validation"
-            : "protected metadata is decoded, but the native source layout is not confirmed");
+    result.methodMapping = !selection.supported ? "unknown" :
+        (selection.methodMapping == il2cpprec::ida::MethodMapping::PerImageTokenRowId
+            ? "per-image-token-row-id" : "global-method-index");
+    result.confidence = profileConfidenceName(selection.confidence);
+    result.confidenceReason = detected.error.empty() ? selection.diagnostics() : detected.error;
+    result.provenance = selection.provenance;
+    result.capabilities = selection.capabilities;
     result.methodPointers = registrationField(selection.codeRegistration.methodPointers);
     result.reversePInvokeWrappers = registrationField(selection.codeRegistration.reversePInvokeWrappers);
     result.genericMethodPointers = registrationField(selection.codeRegistration.genericMethodPointers);
@@ -627,9 +712,13 @@ SourceProfileReport makeSourceProfileReport(
         ? std::to_string(selectedVersion)
         : selection.variant;
     result.recovery.binaryIdentity = binaryIdentity(binary);
-    result.recovery.codeRegistrationIdentity = selection.layoutHash() + "@" +
+    result.recovery.codeRegistrationIdentity = result.layoutHash + "@" +
         hexAddress(metadata.codeRegistrationAddress);
     result.recovery.methodPointersIdentity = methodPointersIdentity(metadata);
+    populateRecoveryProfile(result, metadata);
+    if (selection.rawVersion != 0) result.recovery.rawMetadataVersion = selection.rawVersion;
+    if (selection.registrationVersion != 0) result.recovery.registrationVersion = selection.registrationVersion;
+    markVersionOverride(result, arguments);
     return result;
 }
 
@@ -1150,6 +1239,21 @@ void writeJsonReport(
            << "    \"methodMapping\": " << jsonString(sourceProfile.methodMapping) << ",\n"
            << "    \"confidence\": " << jsonString(sourceProfile.confidence) << ",\n"
            << "    \"confidenceReason\": " << jsonString(sourceProfile.confidenceReason) << ",\n"
+           << "    \"provenance\": " << jsonString(sourceProfile.provenance) << ",\n"
+           << "    \"rawMetadataVersion\": " << sourceProfile.recovery.rawMetadataVersion << ",\n"
+           << "    \"registrationVersion\": " << sourceProfile.recovery.registrationVersion << ",\n"
+           << "    \"versionConfidence\": " << jsonString(versionConfidenceName(sourceProfile.recovery.versionConfidence)) << ",\n"
+           << "    \"versionProvenance\": " << jsonString(sourceProfile.recovery.versionProvenance) << ",\n"
+           << "    \"capabilities\": {\n"
+           << "      \"invoker\": " << jsonString(invokerName(sourceProfile.capabilities.invoker)) << ",\n"
+           << "      \"hiddenMethodInfo\": " << (sourceProfile.capabilities.hiddenMethodInfo ? "true" : "false") << ",\n"
+           << "      \"virtualMethodPointer\": " << (sourceProfile.capabilities.virtualMethodPointer ? "true" : "false") << ",\n"
+           << "      \"genericContexts\": " << (sourceProfile.capabilities.genericContexts ? "true" : "false") << ",\n"
+           << "      \"adjustorThunks\": " << (sourceProfile.capabilities.adjustorThunks ? "true" : "false") << ",\n"
+           << "      \"unresolvedReducedSignatures\": " << (sourceProfile.capabilities.unresolvedReducedSignatures ? "true" : "false") << ",\n"
+           << "      \"generatedMethods\": " << (sourceProfile.capabilities.generatedMethods ? "true" : "false") << ",\n"
+           << "      \"managedObjectLayout\": " << (sourceProfile.capabilities.managedObjectLayout ? "true" : "false") << "\n"
+           << "    },\n"
            << "    \"unityMetadataVersion\": " << jsonString(sourceProfile.recovery.unityMetadataVersion) << ",\n"
            << "    \"binaryIdentity\": " << jsonString(sourceProfile.recovery.binaryIdentity) << ",\n"
            << "    \"codeRegistrationIdentity\": " << jsonString(sourceProfile.recovery.codeRegistrationIdentity) << ",\n"
@@ -1538,12 +1642,19 @@ int main(int argc, char** argv) {
                         (void)name;
                         count += pointers.size();
                     }
-                    registration.methodPointerCount = count;
-                    if (registration.countsProvenance.empty()) registration.countsProvenance = "resolved-image-tables";
+                    if (!resolution.metadata.methodPointersByImage.empty()) {
+                        registration.methodPointerCount = count;
+                        if (registration.countsProvenance.empty()) registration.countsProvenance = "resolved-image-tables";
+                        else registration.countsProvenance += "+resolved-image-tables";
+                    } else {
+                        registration.reasons.push_back("methodPointerCount is unavailable: no registration count or resolved image pointer table");
+                    }
                 }
-                if (!registration.codeGenModuleCount &&
-                    sourceProfile.methodMapping == "per-image-token-row-id") {
-                    registration.codeGenModuleCount = resolution.metadata.methodPointersByImage.size();
+                if (resolution.metadata.codeRegistrationAddress == 0) {
+                    registration.reasons.push_back("native code registration counts are unavailable: code registration address was not discovered");
+                }
+                if (!registration.codeGenModuleCount && sourceProfile.methodMapping == "per-image-token-row-id") {
+                    registration.reasons.push_back("codeGenModuleCount is unavailable: no validated code registration count");
                 }
                 if (legacy && resolution.metadata.metadataRegistrationAddress == 0 &&
                     !registration.metadataUsageCount) {
@@ -1552,6 +1663,10 @@ int main(int argc, char** argv) {
                 }
                 registration.reasons.insert(
                     registration.reasons.end(), registrationReasons.begin(), registrationReasons.end());
+                std::sort(registration.reasons.begin(), registration.reasons.end());
+                registration.reasons.erase(
+                    std::unique(registration.reasons.begin(), registration.reasons.end()),
+                    registration.reasons.end());
                 writeJsonReport(
                     arguments.reportPath, outcome, arguments, idaSession.instanceId, registration, sourceProfile);
             }

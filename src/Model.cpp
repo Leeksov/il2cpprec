@@ -13,11 +13,17 @@ uint64_t fileBackedSize(const Section& section) {
     return std::min(section.fileSize, section.virtualSize);
 }
 
+bool isFileBacked(const BinaryImage& image, const Section& section, uint64_t offset) {
+    if (!image.bytes || offset >= fileBackedSize(section) ||
+        section.fileOffset > image.bytes->size()) return false;
+    return offset < image.bytes->size() - section.fileOffset;
+}
+
 std::optional<uint64_t> mapAddressDirect(const BinaryImage& image, uint64_t virtualAddress) {
     for (const auto& section : image.sections) {
         if (virtualAddress < section.virtualAddress) continue;
         const auto offset = virtualAddress - section.virtualAddress;
-        if (offset >= fileBackedSize(section)) continue;
+        if (!isFileBacked(image, section, offset)) continue;
         if (section.fileOffset > std::numeric_limits<uint64_t>::max() - offset) {
             throw std::overflow_error("Binary image VA-to-file mapping overflows");
         }
@@ -49,7 +55,7 @@ uint64_t BinaryImage::mapRTVA(uint64_t fileOffset) const {
     for (const auto& section : sections) {
         if (fileOffset < section.fileOffset) continue;
         const auto offset = fileOffset - section.fileOffset;
-        if (offset >= fileBackedSize(section)) continue;
+        if (!isFileBacked(*this, section, offset)) continue;
         if (section.virtualAddress > std::numeric_limits<uint64_t>::max() - offset) {
             throw std::overflow_error("Binary image file-to-VA mapping overflows");
         }

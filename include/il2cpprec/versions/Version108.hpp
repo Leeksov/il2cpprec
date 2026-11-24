@@ -90,6 +90,7 @@ struct Version108CodeGenModule {
     std::vector<uint64_t> methodPointers;
     std::vector<int32_t> invokerIndices;
     std::unordered_map<uint32_t, uint64_t> adjustorThunks;
+    Version108NativeTable reversePInvokeWrapperIndices;
     uint64_t debuggerMetadata = 0;
     uint64_t moduleInitializer = 0;
     uint64_t metadataRegistration = 0;

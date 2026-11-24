@@ -330,8 +330,11 @@ double contextMetadataVersion(const TypeLayoutContext& context) {
 ida::SourceLayoutSelection sourceSelection(const TypeLayoutContext& context) {
     const double version = contextMetadataVersion(context);
     if (context.sourceProfile != nullptr) return context.sourceProfile->resolve(version, context.pointerSize);
-    if (version != 0) return ida::metadata24BaseProfile().resolve(version, context.pointerSize);
-    return ida::metadata24BaseProfile().resolve(24.1, context.pointerSize);
+    if (version == 0) return ida::metadata24BaseProfile().resolve(24.1, context.pointerSize);
+    if (const auto* profile = ida::Il2CppNativeProfileRegistry::findMetadata(version)) {
+        return profile->resolve(version, context.pointerSize);
+    }
+    return ida::metadata24BaseProfile().resolve(version, context.pointerSize);
 }
 
 enum class ManagedLayoutKind {
@@ -342,7 +345,7 @@ enum class ManagedLayoutKind {
 
 std::optional<size_t> managedLayoutSize(ManagedLayoutKind kind, const TypeLayoutContext& context) {
     const auto selection = sourceSelection(context);
-    if (!selection.supported || !selection.nativeRuntimeAvailable) return std::nullopt;
+    if (!selection.supported || !selection.capabilities.managedObjectLayout) return std::nullopt;
     size_t size = 0;
     switch (kind) {
     case ManagedLayoutKind::Object: size = selection.object.size; break;
@@ -395,9 +398,9 @@ NativeLayout nativeLayoutName(std::string type, const TypeLayoutContext& context
     if (type == "decimal" || type == "System.Decimal") return {size_t{16}, size_t{4}, size_t{4}};
     if (type == "System.TypedReference") {
         const auto selection = sourceSelection(context);
-        if (!selection.supported) return {};
-        const size_t pointers = selection.metadataVersion <= 24.1 ? 3 : 2;
-        return {pointers * pointerSize, pointerSize, pointerSize};
+        if (!selection.supported || selection.typedReferencePointers == 0 ||
+            selection.typedReferencePointers > std::numeric_limits<size_t>::max() / pointerSize) return {};
+        return {selection.typedReferencePointers * pointerSize, pointerSize, pointerSize};
     }
     if (type == "nint" || type == "nuint" || type == "System.IntPtr" || type == "System.UIntPtr" ||
         type == "string" || type == "System.String" || type == "object" || type == "System.Object") {
@@ -516,7 +519,7 @@ NativeLayout valueTypeLayout(const TypeReferenceModel& reference, const TypeLayo
     NativeLayout result;
     const auto header = objectHeaderSize(context);
     if (const TypeLayoutInfo* layout = definitionLayout(reference.definitionIndex, context)) {
-        if (header && layout->instanceSize >= *header) {
+        if (!layout->generic && header && layout->instanceSize >= *header) {
             const uint64_t valueSize = layout->instanceSize - *header;
             if (valueSize <= std::numeric_limits<size_t>::max()) result.size = static_cast<size_t>(valueSize);
         }
@@ -617,6 +620,9 @@ NativeLayout nativeLayout(std::string_view type, const TypeLayoutContext& contex
         diagnostic.pointerBits = static_cast<uint16_t>(context.pointerSize * 8);
         diagnostic.message = "native size or alignment is unknown at " + std::to_string(diagnostic.pointerBits) +
             "-bit pointer size; no width was assumed";
+        if (!sourceSelection(context).supported) {
+            diagnostic.message += "; no supported source profile matches the metadata version";
+        }
         if (value.starts_with("type[") && context.metadata == nullptr) {
             diagnostic.message += "; type reference metadata is unavailable";
         }
@@ -806,33 +812,22 @@ std::optional<Il2CppTypeBitLayout> TypeSystem::il2CppTypeLayout(const TypeLayout
         throw std::invalid_argument("IL2CPP pointer size must be 4 or 8 bytes");
     }
     const auto selection = sourceSelection(context);
-    if (!selection.supported || !selection.nativeRuntimeAvailable) return std::nullopt;
+    if (!selection.supported || !selection.typeBits.present) return std::nullopt;
 
-    const size_t pointerSize = context.pointerSize;
+    const auto& source = selection.typeBits;
     Il2CppTypeBitLayout result;
-    result.dataOffset = 0;
-    result.bitsOffset = pointerSize;
-    if (selection.metadataVersion <= 24.1) {
-        result.size = 2 * pointerSize;
-        result.bitsSize = 1;
-        result.codeOffset = pointerSize + 2;
-        result.codeSize = 1;
-        result.byRefOffset = pointerSize + 3;
-        result.byRefSize = 1;
-        result.pinnedOffset = pointerSize + 3;
-        result.pinnedSize = 1;
-        result.byRefMask = 0x40;
-        result.pinnedMask = 0x20;
-    } else {
-        result.size = ((pointerSize + 10 + pointerSize - 1) / pointerSize) * pointerSize;
-        result.bitsSize = sizeof(uint32_t);
-        result.codeOffset = pointerSize + 4;
-        result.codeSize = sizeof(uint32_t);
-        result.byRefOffset = pointerSize + 8;
-        result.byRefSize = 1;
-        result.pinnedOffset = pointerSize + 9;
-        result.pinnedSize = 1;
-    }
+    result.size = source.size;
+    result.dataOffset = source.dataOffset;
+    result.bitsOffset = source.bitsOffset;
+    result.bitsSize = source.bitsSize;
+    result.codeOffset = source.codeOffset;
+    result.codeSize = source.codeSize;
+    result.byRefOffset = source.byRefOffset;
+    result.byRefSize = source.byRefMask != 0 ? 1 : 0;
+    result.pinnedOffset = source.pinnedOffset;
+    result.pinnedSize = source.pinnedMask != 0 ? 1 : 0;
+    result.byRefMask = source.byRefMask;
+    result.pinnedMask = source.pinnedMask;
     return result;
 }
 

@@ -14,8 +14,8 @@ namespace il2cpprec {
 namespace {
 
 constexpr uint32_t metadataSanity = 0xFAB11BAF;
-constexpr size_t legacyHeaderSize = 192;
-constexpr size_t legacyUsageHeaderSize = 208;
+constexpr size_t legacy19HeaderSize = 216;
+constexpr size_t legacy20HeaderSize = 224;
 
 class Error final : public std::runtime_error {
 public:
@@ -108,7 +108,7 @@ struct Table {
 struct Header {
     int32_t version = 0;
     bool usages = false;
-    size_t size = legacyHeaderSize;
+    size_t size = legacy19HeaderSize;
     Table stringLiterals;
     Table stringLiteralData;
     Table strings;
@@ -180,13 +180,8 @@ Header readHeader(const MetadataReader& reader, Legacy19Profile& profile) {
     header.size = profile.headerSize;
     reader.require(0, header.size);
     header.stringLiterals = readTableHeader(reader, 8);
-    if (header.stringLiterals.offset != header.size) {
-        failAt(
-            "invalid-header-size",
-            "Metadata " + std::to_string(header.version) + " string literal table must start at " +
-                std::to_string(header.size),
-            8);
-    }
+    // The first payload need not be the string literal table. Empty tables may
+    // also have a zero offset, so validate every nonempty table by its own range.
 
     header.stringLiteralData = readTableHeader(reader, 16);
     header.strings = readTableHeader(reader, 24);
@@ -458,6 +453,16 @@ MetadataModel readGlobal(const uint8_t* data, size_t size, Legacy19ReadResult& r
                 "Referenced assembly index is outside the assembly table",
                 header.referencedAssemblies.offset + index * 4);
         }
+        result.referencedAssemblies.push_back(assembly);
+    }
+    for (size_t index = 0; index < counts.fieldRefs; ++index) {
+        const size_t base = header.fieldRefs.offset + index * 8;
+        const int32_t typeIndex = reader.i32(base);
+        const int32_t fieldIndex = reader.i32(base + 4);
+        if (typeIndex < 0 || fieldIndex < 0) {
+            failAt("invalid-field-reference", "FieldRef type and local field indices must be nonnegative", base);
+        }
+        result.fieldRefs.push_back({typeIndex, fieldIndex});
     }
     for (const auto& image : images) {
         metadataString(reader, header, image.nameIndex);
@@ -585,6 +590,19 @@ MetadataModel readGlobal(const uint8_t* data, size_t size, Legacy19ReadResult& r
     model.versionInfo.rawVersion = header.version;
     model.versionInfo.preciseVersion = header.version;
     model.versionInfo.confidence = MetadataVersionConfidence::RawHeader;
+    model.versionInfo.provenance = "IL2CPP global metadata header";
+    if (header.fieldRefs.offset > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
+        header.referencedAssemblies.offset > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+        fail("section-offset-overflow", "Legacy metadata section offset exceeds the shared model range");
+    }
+    model.sections.fieldRefs = {
+        static_cast<int32_t>(header.fieldRefs.offset), header.fieldRefs.size,
+        static_cast<int32_t>(counts.fieldRefs)};
+    if (header.version == 20) {
+        model.sections.referencedAssemblies = {
+            static_cast<int32_t>(header.referencedAssemblies.offset), header.referencedAssemblies.size,
+            static_cast<int32_t>(counts.referencedAssemblies)};
+    }
     model.images.reserve(images.size());
     for (const auto& definition : images) {
         ImageModel image;
@@ -801,6 +819,9 @@ public:
 
     std::vector<uint64_t> pointerTable(uint64_t address, uint64_t count, const char* name) const {
         const size_t byteSize = checkedSize(count, pointerSize_, name);
+        if (byteSize != 0 && address == 0) {
+            fail("null-native-table", std::string(name) + " has a nonzero count and a null address");
+        }
         if (byteSize != 0) require(address, byteSize);
         std::vector<uint64_t> result;
         result.reserve(static_cast<size_t>(count));
@@ -1051,8 +1072,8 @@ MetadataModel readNative(
     uint64_t codeRegistrationAddress,
     size_t pointerSize,
     Legacy19ReadResult& result) {
-    if (input.version != 16.0 && input.version != 18.0) {
-        fail("unsupported-model-version", "Legacy19 native registration requires a metadata 16 or 18 model");
+    if (input.version != 19.0 && input.version != 20.0) {
+        fail("unsupported-model-version", "Legacy19 native registration requires a metadata 19 or 20 model");
     }
     result.profile = describeLegacy19Profile(static_cast<int32_t>(input.version));
     ImageReader reader(binary, pointerSize);
@@ -1074,6 +1095,7 @@ MetadataModel readNative(
     }
     const auto fieldOffsets = readPair(reader, metadataRegistrationAddress, result.profile.fieldOffsetsPair, "field offsets");
     readPair(reader, metadataRegistrationAddress, result.profile.fieldOffsetsPair + 1, "type definition sizes");
+    const auto metadataUsages = readPair(reader, metadataRegistrationAddress, 7, "metadata usages");
 
     NativePair methodPointers;
     NativePair genericMethodPointers;
@@ -1094,12 +1116,25 @@ MetadataModel readNative(
     MetadataModel metadata = input;
     metadata.metadataRegistrationAddress = metadataRegistrationAddress;
     metadata.codeRegistrationAddress = codeRegistrationAddress;
+    metadata.versionInfo.registrationVersion = input.version;
     result.registration.methodReferencesAddress = methodReferences.address;
     result.registration.methodReferencesCount = methodReferences.count;
     result.registration.methodReferences = reader.pointerTable(
         methodReferences.address,
         methodReferences.count,
         "method references");
+    result.registration.metadataUsagesAddress = metadataUsages.address;
+    result.registration.metadataUsagesCount = metadataUsages.count;
+    result.registration.metadataUsages = reader.pointerTable(
+        metadataUsages.address,
+        metadataUsages.count,
+        "metadata usages");
+    metadata.metadataUsagesCount = std::max(metadata.metadataUsagesCount, metadataUsages.count);
+    for (const auto& usage : metadata.metadataUsagePairs) {
+        if (usage.destinationIndex >= metadataUsages.count) {
+            fail("metadata-usage-destination-out-of-bounds", "MetadataUsage destination is outside native metadata usages");
+        }
+    }
 
     const auto methodPointerValues = reader.pointerTable(methodPointers.address, methodPointers.count, "method pointers");
     if (!methodPointerValues.empty()) {
@@ -1252,26 +1287,38 @@ std::string Legacy19ReadResult::diagnosticText() const {
 Legacy19Profile describeLegacy19Profile(int32_t metadataVersion) noexcept {
     Legacy19Profile profile;
     profile.version = metadataVersion;
-    profile.supported = metadataVersion == 16 || metadataVersion == 18;
+    profile.supported = metadataVersion == 19 || metadataVersion == 20;
     if (!profile.supported) return profile;
-    profile.headerSize = legacyHeaderSize;
-    profile.metadataUsageHeaderSize = metadataVersion == 18 ? legacyUsageHeaderSize : 0;
-    profile.typeDefinitionStride = 108;
+    profile.headerSize = metadataVersion == 19 ? legacy19HeaderSize : legacy20HeaderSize;
+    profile.metadataUsageHeaderSize = profile.headerSize;
+    profile.typeDefinitionStride = 112;
     profile.methodDefinitionStride = 56;
     profile.parameterDefinitionStride = 16;
-    profile.fieldDefinitionStride = 12;
-    profile.imageDefinitionStride = 20;
-    profile.assemblyDefinitionStride = 60;
-    profile.metadataRegistrationPairs = metadataVersion == 16 ? 8 : 7;
+    profile.fieldDefinitionStride = 16;
+    profile.eventDefinitionStride = 28;
+    profile.propertyDefinitionStride = 24;
+    profile.imageDefinitionStride = 24;
+    profile.assemblyDefinitionStride = metadataVersion == 19 ? 60 : 68;
+    profile.metadataRegistrationPairs = 8;
     profile.codeRegistrationPairs = 7;
-    profile.fieldOffsetsPair = metadataVersion == 16 ? 6 : 5;
-    profile.methodReferencesPair = metadataVersion == 16 ? 5 : -1;
-    profile.metadataUsage18 = metadataVersion == 18;
+    profile.fieldOffsetsPair = 5;
+    profile.methodReferencesPair = -1;
+    profile.genericMethodPointersPair = 4;
+    profile.invokerPointersPair = 5;
+    profile.methodIndexOffset = 24;
+    profile.invokerIndexOffset = 28;
+    profile.methodTokenOffset = 44;
+    profile.typeTokenOffset = 108;
+    profile.fieldTokenOffset = 12;
+    profile.imageTokenOffset = 20;
+    profile.referencedAssemblies = metadataVersion == 20;
+    profile.invokerArgumentCount = 3;
+    profile.invokerTakesMethodInfo = true;
     return profile;
 }
 
 std::string describeLegacy19Profile(const Legacy19Profile& profile) {
-    if (!profile.supported) return "metadata " + std::to_string(profile.version) + ": unsupported (expected 16 or 18)";
+    if (!profile.supported) return "metadata " + std::to_string(profile.version) + ": unsupported (expected 19 or 20)";
     std::ostringstream stream;
     stream << "metadata " << profile.version << ": header=" << profile.headerSize
            << ", type=" << profile.typeDefinitionStride << ", method=" << profile.methodDefinitionStride
@@ -1283,6 +1330,33 @@ std::string describeLegacy19Profile(const Legacy19Profile& profile) {
     if (profile.methodReferencesPair >= 0) stream << ", methodReferencesPair=" << profile.methodReferencesPair;
     if (profile.metadataUsage18) stream << ", optionalMetadataUsageHeader=" << profile.metadataUsageHeaderSize;
     return stream.str();
+}
+
+Legacy19MethodInfoLayout makeLegacy19MethodInfoLayout(size_t pointerSize) {
+    if (pointerSize != 4 && pointerSize != 8) {
+        throw std::invalid_argument("IL2CPP pointer size must be 4 or 8");
+    }
+    Legacy19MethodInfoLayout layout;
+    layout.alignment = pointerSize;
+    layout.size = 8 * pointerSize + 16;
+    auto pointerField = [pointerSize](size_t index) { return Legacy19FieldLayout{index * pointerSize, pointerSize}; };
+    layout.methodPointer = pointerField(0);
+    layout.invokerMethod = pointerField(1);
+    layout.name = pointerField(2);
+    layout.declaringType = pointerField(3);
+    layout.returnType = pointerField(4);
+    layout.parameters = pointerField(5);
+    layout.rgctxData = pointerField(6);
+    layout.genericMethod = pointerField(7);
+    const size_t tail = 8 * pointerSize;
+    layout.customAttributeIndex = {tail, 4};
+    layout.token = {tail + 4, 4};
+    layout.flags = {tail + 8, 2};
+    layout.iflags = {tail + 10, 2};
+    layout.slot = {tail + 12, 2};
+    layout.parametersCount = {tail + 14, 1};
+    layout.methodFlags = {tail + 15, 1};
+    return layout;
 }
 
 const char* toString(Legacy19DiagnosticSeverity severity) noexcept {
@@ -1298,6 +1372,10 @@ Legacy19Reader::Legacy19Reader(size_t pointerSize) : pointerSize_(pointerSize) {
     if (pointerSize != 0 && pointerSize != 4 && pointerSize != 8) {
         throw std::invalid_argument("IL2CPP pointer size must be 0, 4, or 8");
     }
+}
+
+bool Legacy19Reader::supports(double metadataVersion) noexcept {
+    return metadataVersion == 19.0 || metadataVersion == 20.0;
 }
 
 Legacy19Profile Legacy19Reader::describe(int32_t metadataVersion) const noexcept {
@@ -1325,6 +1403,7 @@ Legacy19ReadResult Legacy19Reader::read(
     uint64_t codeRegistrationAddress) const {
     Legacy19ReadResult result;
     try {
+        result.methodInfo = makeLegacy19MethodInfoLayout(inferredPointerSize(binary, pointerSize_));
         result.metadata = readNative(
             binary,
             metadata,
@@ -1347,7 +1426,34 @@ Legacy19ReadResult Legacy19Reader::read(
     if (!result.ok()) return result;
     Legacy19ReadResult native = read(binary, result.metadata, metadataRegistrationAddress, codeRegistrationAddress);
     native.profile = result.profile;
+    native.fieldRefs = std::move(result.fieldRefs);
+    native.referencedAssemblies = std::move(result.referencedAssemblies);
     return native;
+}
+
+Legacy19MethodInfo Legacy19Reader::readMethodInfo(const BinaryImage& binary, uint64_t address) const {
+    const size_t pointerSize = inferredPointerSize(binary, pointerSize_);
+    const auto layout = makeLegacy19MethodInfoLayout(pointerSize);
+    ImageReader reader(binary, pointerSize);
+    reader.require(address, layout.size);
+    const auto at = [address](const Legacy19FieldLayout& field) { return checkedAdd(address, field.offset); };
+    Legacy19MethodInfo info;
+    info.methodPointer = reader.pointer(at(layout.methodPointer));
+    info.invokerMethod = reader.pointer(at(layout.invokerMethod));
+    info.name = reader.pointer(at(layout.name));
+    info.declaringType = reader.pointer(at(layout.declaringType));
+    info.returnType = reader.pointer(at(layout.returnType));
+    info.parameters = reader.pointer(at(layout.parameters));
+    info.rgctxData = reader.pointer(at(layout.rgctxData));
+    info.genericMethod = reader.pointer(at(layout.genericMethod));
+    info.customAttributeIndex = reader.i32(at(layout.customAttributeIndex));
+    info.token = reader.u32(at(layout.token));
+    info.flags = reader.u16(at(layout.flags));
+    info.iflags = reader.u16(at(layout.iflags));
+    info.slot = reader.u16(at(layout.slot));
+    info.parametersCount = reader.u8(at(layout.parametersCount));
+    info.methodFlags = reader.u8(at(layout.methodFlags));
+    return info;
 }
 
 } // namespace il2cpprec

@@ -24,6 +24,7 @@ public:
     explicit GenericMethodResolver(const MetadataModel& metadata);
 
     GenericMethodTarget resolve(uint32_t genericMethodIndex) const;
+    GenericMethodTarget resolveSpec(uint32_t genericMethodIndex) const;
     MetadataUsageGenericMethodResolver usageResolver() const;
 
 private:

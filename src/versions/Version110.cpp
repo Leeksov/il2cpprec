@@ -1,6 +1,9 @@
 #include <il2cpprec/versions/Version110.hpp>
 
 #include <bit>
+#include <array>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
@@ -13,6 +16,35 @@ constexpr uint32_t methodTokenType = 0x06000000U;
 constexpr uint32_t tokenRowIdMask = 0x00FFFFFFU;
 constexpr size_t generatedMethodTypeInfoSize = 12;
 constexpr size_t generatedMethodTokenSize = 4;
+using SectionMember = MetadataSectionModel MetadataSectionsModel::*;
+constexpr std::array<SectionMember, Version110Header::sectionCount> sectionOrder = {
+    &MetadataSectionsModel::stringLiterals, &MetadataSectionsModel::stringLiteralData,
+    &MetadataSectionsModel::strings, &MetadataSectionsModel::events,
+    &MetadataSectionsModel::properties, &MetadataSectionsModel::methods,
+    &MetadataSectionsModel::parameterDefaultValues, &MetadataSectionsModel::fieldDefaultValues,
+    &MetadataSectionsModel::defaultValueData, &MetadataSectionsModel::fieldMarshaledSizes,
+    &MetadataSectionsModel::parameters, &MetadataSectionsModel::fields,
+    &MetadataSectionsModel::genericParameters, &MetadataSectionsModel::genericParameterConstraints,
+    &MetadataSectionsModel::genericContainers, &MetadataSectionsModel::nestedTypes,
+    &MetadataSectionsModel::interfaces, &MetadataSectionsModel::vtableMethods,
+    &MetadataSectionsModel::interfaceOffsets, &MetadataSectionsModel::typeDefinitions,
+    &MetadataSectionsModel::typeInlineArrays, &MetadataSectionsModel::images,
+    &MetadataSectionsModel::assemblies, &MetadataSectionsModel::fieldRefs,
+    &MetadataSectionsModel::referencedAssemblies, &MetadataSectionsModel::attributeData,
+    &MetadataSectionsModel::attributeDataRanges,
+    &MetadataSectionsModel::unresolvedIndirectCallParameterTypes,
+    &MetadataSectionsModel::unresolvedIndirectCallParameterRanges,
+    &MetadataSectionsModel::windowsRuntimeTypeNames,
+    &MetadataSectionsModel::windowsRuntimeStrings,
+    &MetadataSectionsModel::exportedTypeDefinitions,
+    &MetadataSectionsModel::methodSpecsOnGenericType,
+    &MetadataSectionsModel::genericMethodSpecsOnType, &MetadataSectionsModel::methodSpecs,
+    &MetadataSectionsModel::genericMethodFunctionsDefinitions,
+    &MetadataSectionsModel::genericMethodFunctionsDefinitionsWithAdjustor,
+    &MetadataSectionsModel::invokerIndices, &MetadataSectionsModel::rgctxRanges,
+    &MetadataSectionsModel::rgctxValues, &MetadataSectionsModel::staticConstructorTypeIndices,
+    &MetadataSectionsModel::generatedMethodTypeInfos, &MetadataSectionsModel::generatedMethodTokens
+};
 
 struct GeneratedView {
     const std::vector<TypeModel>& types;
@@ -54,8 +86,12 @@ void validateToken(uint32_t token) {
 
 void validateTypeInfo(const GeneratedView& generated, const GeneratedMethodTypeInfoModel& info, size_t total) {
     if (info.typeIndex < 0) invalid("generated method type index is negative");
-    if (info.generatedMethodStart < 0) invalid("generated method range has a negative start");
     if (info.generatedMethodCount < 0) invalid("generated method range has a negative count");
+
+    // An empty range may use the usual invalid-index sentinel. It must never
+    // be treated as a method definition or indexed into the token table.
+    if (info.generatedMethodCount == 0 && info.generatedMethodStart == -1) return;
+    if (info.generatedMethodStart < 0) invalid("generated method range has a negative start");
 
     const uint64_t start = static_cast<uint32_t>(info.generatedMethodStart);
     const uint64_t count = static_cast<uint32_t>(info.generatedMethodCount);
@@ -157,7 +193,343 @@ uint32_t ordinaryMethodToken(const ImageModel& image, int32_t methodDefinitionIn
     return methodTokenType | static_cast<uint32_t>(rowId);
 }
 
+size_t recordStride(const MetadataSectionModel& section, size_t expected, const char* name) {
+    if (section.count == 0) {
+        if (section.sectionSize != 0) invalid(std::string(name) + " has bytes but zero records");
+        return 0;
+    }
+    if (section.sectionSize % section.count != 0 ||
+        static_cast<size_t>(section.sectionSize / section.count) != expected) {
+        invalid(std::string(name) + " has an unexpected record stride");
+    }
+    return expected;
+}
+
+size_t indexWidth(int32_t count) {
+    if (count < 0) invalid("negative table count used for index width");
+    if (count <= 255) return 1;
+    if (count <= 65535) return 2;
+    return 4;
+}
+
+int32_t readIndex(const uint8_t* data, size_t offset, size_t width) {
+    if (width == 1) return data[offset] == 0xff ? -1 : data[offset];
+    if (width == 2) {
+        const uint16_t value = static_cast<uint16_t>(data[offset]) |
+            static_cast<uint16_t>(static_cast<uint16_t>(data[offset + 1]) << 8);
+        return value == 0xffff ? -1 : value;
+    }
+    if (width == 4) return readI32(data, offset);
+    invalid("unsupported index width");
+}
+
+uint16_t readU16(const uint8_t* data, size_t offset) {
+    return static_cast<uint16_t>(data[offset]) |
+        static_cast<uint16_t>(static_cast<uint16_t>(data[offset + 1]) << 8);
+}
+
+std::string metadataString(const uint8_t* data, const MetadataSectionModel& section, uint32_t index) {
+    if (index >= static_cast<uint32_t>(section.sectionSize)) invalid("string index is outside string table");
+    const size_t start = static_cast<size_t>(section.offset) + index;
+    const size_t remaining = static_cast<size_t>(section.sectionSize) - index;
+    const auto* begin = reinterpret_cast<const char*>(data + start);
+    const void* end = std::memchr(begin, 0, remaining);
+    if (end == nullptr) invalid("unterminated metadata string");
+    return std::string(begin, static_cast<const char*>(end));
+}
+
+void checkedRange(int32_t start, uint64_t count, size_t available, const char* name) {
+    if (count == 0 && start == -1) return;
+    if (start < 0 || static_cast<uint64_t>(start) > available ||
+        count > available - static_cast<size_t>(start)) {
+        invalid(std::string(name) + " is outside its table");
+    }
+}
+
+std::string typeName(int32_t index) {
+    return index < 0 ? std::string{} : "type[" + std::to_string(index) + "]";
+}
+
 } // namespace
+
+bool Version110::supports(double version) noexcept { return version == 110.0; }
+bool Version110::supports(int32_t rawVersion) noexcept { return rawVersion == 110; }
+
+Version110Header Version110::readHeader(const std::vector<uint8_t>& data) {
+    return readHeader(data.data(), data.size());
+}
+
+Version110Header Version110::readHeader(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < Version110Header::serializedSize) invalid("truncated metadata header");
+    if (readU32(data, 0) != 0xFAB11BAFU) invalid("incorrect metadata sanity value");
+    if (!supports(readI32(data, 4))) invalid("unsupported metadata version");
+
+    Version110Header header;
+    header.version = 110;
+    for (size_t i = 0; i < sectionOrder.size(); ++i) {
+        const size_t offset = 8 + i * 12;
+        auto& section = header.sections.*sectionOrder[i];
+        section = {readI32(data, offset), readI32(data, offset + 4), readI32(data, offset + 8)};
+        if (section.offset < 0 || section.sectionSize < 0 || section.count < 0) {
+            invalid("negative metadata section field");
+        }
+        const size_t start = static_cast<size_t>(section.offset);
+        if (start > size || static_cast<size_t>(section.sectionSize) > size - start) {
+            invalid("metadata section is outside the file");
+        }
+    }
+    header.typeDefinitionIndexWidth = indexWidth(header.sections.typeDefinitions.count);
+    header.methodDefinitionIndexWidth = indexWidth(header.sections.methods.count);
+    const size_t offsetStride = recordStride(header.sections.interfaceOffsets,
+        header.sections.interfaceOffsets.count == 0 ? 0 :
+            static_cast<size_t>(header.sections.interfaceOffsets.sectionSize /
+                header.sections.interfaceOffsets.count), "interface offsets");
+    if (offsetStride != 0) {
+        if (offsetStride <= 4) invalid("interface offset record is too short");
+        header.typeIndexWidth = offsetStride - 4;
+        if (header.typeIndexWidth != 1 && header.typeIndexWidth != 2 && header.typeIndexWidth != 4) {
+            invalid("unsupported TypeIndex width");
+        }
+    }
+    return header;
+}
+
+MetadataModel Version110::read(const std::vector<uint8_t>& data) const {
+    return read(data.data(), data.size());
+}
+
+MetadataModel Version110::read(const uint8_t* data, size_t size) const {
+    const Version110Header header = readHeader(data, size);
+    const auto& s = header.sections;
+    const size_t typeWidth = header.typeIndexWidth;
+    const size_t typeDefWidth = header.typeDefinitionIndexWidth;
+    const size_t methodWidth = header.methodDefinitionIndexWidth;
+    const size_t parameterWidth = indexWidth(s.parameters.count);
+    const size_t genericWidth = indexWidth(s.genericContainers.count);
+    const size_t fieldWidth = indexWidth(s.fields.count);
+    if ((s.methods.count != 0 || s.typeDefinitions.count != 0 || s.parameters.count != 0 ||
+         s.fields.count != 0) && typeWidth == 0) {
+        invalid("cannot determine TypeIndex width");
+    }
+    recordStride(s.methods, 16 + typeDefWidth + typeWidth + parameterWidth + genericWidth, "methods");
+    recordStride(s.parameters, 8 + typeWidth, "parameters");
+    recordStride(s.fields, 4 + typeWidth, "fields");
+    recordStride(s.typeDefinitions, 36 + 3 * typeWidth + genericWidth + fieldWidth +
+        methodWidth + 5 * typeDefWidth, "type definitions");
+    recordStride(s.images, 56 + 3 * typeDefWidth + 2 * methodWidth, "images");
+    recordStride(s.generatedMethodTypeInfos, generatedMethodTypeInfoSize, "generated method type info");
+    recordStride(s.generatedMethodTokens, generatedMethodTokenSize, "generated method tokens");
+
+    MetadataModel metadata;
+    metadata.version = 110;
+    metadata.versionInfo.rawVersion = 110;
+    metadata.versionInfo.preciseVersion = 110;
+    metadata.versionInfo.registrationVersion = 110;
+    metadata.versionInfo.confidence = MetadataVersionConfidence::RawHeader;
+    metadata.versionInfo.provenance = "global-metadata header";
+    metadata.sections = s;
+
+    struct MethodDefinition {
+        uint32_t name = 0;
+        int32_t declaringType = -1;
+        int32_t returnType = -1;
+        uint32_t returnParameterToken = 0;
+        int32_t parameterStart = -1;
+        int32_t genericContainer = -1;
+        uint16_t flags = 0;
+        uint16_t iflags = 0;
+        uint16_t slot = 0;
+        uint16_t parameterCount = 0;
+    };
+    std::vector<MethodDefinition> methods;
+    methods.reserve(static_cast<size_t>(s.methods.count));
+    const size_t methodStride = s.methods.count == 0 ? 0 :
+        static_cast<size_t>(s.methods.sectionSize / s.methods.count);
+    for (int32_t i = 0; i < s.methods.count; ++i) {
+        size_t p = static_cast<size_t>(s.methods.offset) + static_cast<size_t>(i) * methodStride;
+        MethodDefinition method;
+        method.name = readU32(data, p); p += 4;
+        method.declaringType = readIndex(data, p, typeDefWidth); p += typeDefWidth;
+        method.returnType = readIndex(data, p, typeWidth); p += typeWidth;
+        method.returnParameterToken = readU32(data, p); p += 4;
+        method.parameterStart = readIndex(data, p, parameterWidth); p += parameterWidth;
+        method.genericContainer = readIndex(data, p, genericWidth); p += genericWidth;
+        method.flags = readU16(data, p); p += 2;
+        method.iflags = readU16(data, p); p += 2;
+        method.slot = readU16(data, p); p += 2;
+        method.parameterCount = readU16(data, p);
+        if (method.returnType < 0) invalid("method has invalid return TypeIndex");
+        checkedRange(method.parameterStart, method.parameterCount,
+            static_cast<size_t>(s.parameters.count), "method parameter range");
+        methods.push_back(method);
+    }
+
+    struct TypeDefinition {
+        uint32_t name = 0;
+        uint32_t nameSpace = 0;
+        int32_t declaringType = -1;
+        int32_t parent = -1;
+        int32_t fieldStart = -1;
+        int32_t methodStart = -1;
+        uint16_t methodCount = 0;
+        uint16_t fieldCount = 0;
+        uint32_t flags = 0;
+        uint32_t bitfield = 0;
+    };
+    std::vector<TypeDefinition> definitions;
+    definitions.reserve(static_cast<size_t>(s.typeDefinitions.count));
+    const size_t typeStride = s.typeDefinitions.count == 0 ? 0 :
+        static_cast<size_t>(s.typeDefinitions.sectionSize / s.typeDefinitions.count);
+    for (int32_t i = 0; i < s.typeDefinitions.count; ++i) {
+        size_t p = static_cast<size_t>(s.typeDefinitions.offset) + static_cast<size_t>(i) * typeStride;
+        TypeDefinition definition;
+        definition.name = readU32(data, p); p += 4;
+        definition.nameSpace = readU32(data, p); p += 4;
+        p += typeWidth;
+        definition.declaringType = readIndex(data, p, typeWidth); p += typeWidth;
+        definition.parent = readIndex(data, p, typeWidth); p += typeWidth;
+        p += genericWidth;
+        definition.flags = readU32(data, p); p += 4;
+        definition.fieldStart = readIndex(data, p, fieldWidth); p += fieldWidth;
+        definition.methodStart = readIndex(data, p, methodWidth); p += methodWidth;
+        p += 4 * typeDefWidth + 4 + typeDefWidth;
+        definition.methodCount = readU16(data, p); p += 4;
+        definition.fieldCount = readU16(data, p); p += 12;
+        definition.bitfield = readU32(data, p);
+        checkedRange(definition.fieldStart, definition.fieldCount,
+            static_cast<size_t>(s.fields.count), "type field range");
+        definitions.push_back(definition);
+        TypeModel type;
+        type.name = metadataString(data, s.strings, definition.name);
+        type.nameSpace = metadataString(data, s.strings, definition.nameSpace);
+        type.baseType = typeName(definition.parent);
+        type.declaringTypeIndex = definition.declaringType;
+        type.flags = definition.flags;
+        type.bitfield = definition.bitfield;
+        metadata.types.push_back(std::move(type));
+    }
+
+    const size_t imageStride = s.images.count == 0 ? 0 :
+        static_cast<size_t>(s.images.sectionSize / s.images.count);
+    for (int32_t i = 0; i < s.images.count; ++i) {
+        size_t p = static_cast<size_t>(s.images.offset) + static_cast<size_t>(i) * imageStride;
+        ImageModel image;
+        image.name = metadataString(data, s.strings, readU32(data, p)); p += 4;
+        image.assemblyIndex = readI32(data, p); p += 4;
+        image.typeStart = readIndex(data, p, typeDefWidth); p += typeDefWidth;
+        image.typeCount = readU32(data, p); p += 4;
+        image.exportedTypeStart = readIndex(data, p, typeDefWidth); p += typeDefWidth;
+        image.exportedTypeCount = readU32(data, p); p += 4;
+        image.entryPointIndex = readIndex(data, p, methodWidth); p += methodWidth;
+        image.token = readU32(data, p); p += 4;
+        image.customAttributeStart = readI32(data, p); p += 4;
+        image.customAttributeCount = readU32(data, p); p += 4;
+        image.invokerIndicesStart = readI32(data, p); p += 4;
+        image.rgctxRangesStart = readI32(data, p); p += 4;
+        image.rgctxRangesCount = readI32(data, p); p += 4;
+        image.staticConstructorStart = readIndex(data, p, typeDefWidth); p += typeDefWidth;
+        image.staticConstructorCount = readI32(data, p); p += 4;
+        image.fieldStart = readI32(data, p); p += 4;
+        image.propertyStart = readI32(data, p); p += 4;
+        image.eventStart = readI32(data, p); p += 4;
+        image.methodStart = readIndex(data, p, methodWidth);
+        checkedRange(image.typeStart, image.typeCount, metadata.types.size(), "image type range");
+        metadata.images.push_back(std::move(image));
+    }
+
+    readGeneratedMethodTables(data, size, methods.size(), metadata);
+    for (size_t typeIndex = 0; typeIndex < definitions.size(); ++typeIndex) {
+        const auto& definition = definitions[typeIndex];
+        auto& output = metadata.types[typeIndex];
+        const auto range = methodRange(metadata, static_cast<int32_t>(typeIndex),
+            definition.methodStart, definition.methodCount);
+        for (uint32_t offset = 0; offset < definition.methodCount; ++offset) {
+            const int32_t index = methodIndex(metadata, static_cast<int32_t>(typeIndex),
+                range.ordinaryStart, definition.methodCount, offset);
+            if (index < 0 || static_cast<size_t>(index) >= methods.size()) {
+                invalid("type method index is outside method table");
+            }
+            const auto& source = methods[static_cast<size_t>(index)];
+            if (source.declaringType != static_cast<int32_t>(typeIndex)) {
+                invalid("method declaring type does not match its range");
+            }
+            MethodModel method;
+            method.definitionIndex = index;
+            method.name = metadataString(data, s.strings, source.name);
+            method.declaringType = output.nameSpace.empty() ? output.name :
+                output.nameSpace + "." + output.name;
+            method.returnType = typeName(source.returnType);
+            method.returnParameterToken = source.returnParameterToken;
+            method.isStatic = (source.flags & 0x10U) != 0;
+            method.flags = source.flags;
+            method.iflags = source.iflags;
+            method.slot = source.slot;
+            method.genericContainerIndex = source.genericContainer;
+            const size_t parameterStride = 8 + typeWidth;
+            for (uint16_t parameter = 0; parameter < source.parameterCount; ++parameter) {
+                const size_t parameterOffset = static_cast<size_t>(s.parameters.offset) +
+                    (static_cast<size_t>(source.parameterStart) + parameter) * parameterStride;
+                ParameterModel item;
+                item.name = metadataString(data, s.strings, readU32(data, parameterOffset));
+                const int32_t type = readIndex(data, parameterOffset + 8, typeWidth);
+                if (type < 0) invalid("parameter has invalid TypeIndex");
+                item.type = typeName(type);
+                method.parameters.push_back(std::move(item));
+            }
+            output.methods.push_back(std::move(method));
+        }
+        const size_t fieldStride = 4 + typeWidth;
+        for (uint16_t field = 0; field < definition.fieldCount; ++field) {
+            const size_t fieldIndex = static_cast<size_t>(definition.fieldStart) + field;
+            const size_t fieldOffset = static_cast<size_t>(s.fields.offset) + fieldIndex * fieldStride;
+            FieldModel item;
+            item.name = metadataString(data, s.strings, readU32(data, fieldOffset));
+            const int32_t type = readIndex(data, fieldOffset + 4, typeWidth);
+            if (type < 0) invalid("field has invalid TypeIndex");
+            item.type = typeName(type);
+            output.fields.push_back(std::move(item));
+        }
+    }
+    for (const auto& image : metadata.images) {
+        for (uint32_t offset = 0; offset < image.typeCount; ++offset) {
+            const size_t typeIndex = static_cast<size_t>(image.typeStart) + offset;
+            auto& type = metadata.types[typeIndex];
+            type.imageName = image.name;
+            const uint64_t typeRow = static_cast<uint64_t>(offset) + 1;
+            if (typeRow > tokenRowIdMask) invalid("type token row id exceeds 24 bits");
+            type.token = 0x02000000U | static_cast<uint32_t>(typeRow);
+            for (auto& method : type.methods) method.imageName = image.name;
+            if (!type.fields.empty()) {
+                if (image.fieldStart < 0 || definitions[typeIndex].fieldStart < image.fieldStart) {
+                    invalid("field has no valid image-relative token row");
+                }
+                for (size_t field = 0; field < type.fields.size(); ++field) {
+                    const uint64_t row = static_cast<uint64_t>(definitions[typeIndex].fieldStart -
+                        image.fieldStart) + field + 1;
+                    if (row > tokenRowIdMask) invalid("field token row id exceeds 24 bits");
+                    type.fields[field].token = 0x04000000U | static_cast<uint32_t>(row);
+                }
+            }
+        }
+    }
+    reconstructMethodTokens(metadata, methods.size());
+    return metadata;
+}
+
+MetadataModel Version110::readFile(const std::string& path) const {
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) throw std::runtime_error("Cannot open global metadata file: " + path);
+    const auto end = stream.tellg();
+    if (end < 0 || static_cast<uint64_t>(end) > std::numeric_limits<size_t>::max() ||
+        static_cast<uint64_t>(end) > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        invalid("metadata file size is invalid");
+    }
+    std::vector<uint8_t> data(static_cast<size_t>(end));
+    stream.seekg(0);
+    if (!data.empty()) stream.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    if (!stream) invalid("could not read metadata file");
+    return read(data);
+}
 
 bool Version110::hasGeneratedMethods(uint32_t bitfield) noexcept {
     return (bitfield & HasGeneratedMethods) != 0;
@@ -232,7 +604,10 @@ Version110MethodRange Version110::methodRange(
     int32_t ordinaryMethodStart,
     uint32_t methodCount) {
     const auto generated = view(metadata);
-    const auto& type = generated.types.at(static_cast<size_t>(typeDefinitionIndex));
+    if (typeDefinitionIndex < 0 || static_cast<size_t>(typeDefinitionIndex) >= generated.types.size()) {
+        invalid("type definition index is outside the type table");
+    }
+    const auto& type = generated.types[static_cast<size_t>(typeDefinitionIndex)];
     const bool hasGenerated = hasGeneratedMethods(type);
     const auto* info = findTypeInfo(generated, typeDefinitionIndex);
 
@@ -289,7 +664,10 @@ uint32_t Version110::methodToken(
     int32_t methodDefinitionIndex) {
     const auto generated = view(metadata);
     if (methodDefinitionIndex < 0) invalid("method definition index is negative");
-    const auto& type = generated.types.at(static_cast<size_t>(typeDefinitionIndex));
+    if (typeDefinitionIndex < 0 || static_cast<size_t>(typeDefinitionIndex) >= generated.types.size()) {
+        invalid("type definition index is outside the type table");
+    }
+    const auto& type = generated.types[static_cast<size_t>(typeDefinitionIndex)];
     const auto* info = findTypeInfo(generated, typeDefinitionIndex);
     const bool hasGenerated = hasGeneratedMethods(type);
 
@@ -412,6 +790,41 @@ std::optional<uint64_t> Version110::methodPointer(
     const MetadataModel& metadata,
     const std::string& imageName,
     uint32_t token) {
+    // A generated MethodDef token is metadata identity, not proof that its RID
+    // addresses a slot in the image's native method pointer table. Require an
+    // unambiguous ordinary definition in this image before using that table.
+    if (!validMethodToken(token) || metadata.generatedMethodsStart < 0) return std::nullopt;
+    const MethodModel* ordinaryMethod = nullptr;
+    const ImageModel* owningImage = nullptr;
+    for (const auto& candidate : metadata.images) {
+        if (candidate.name != imageName) continue;
+        if (owningImage != nullptr || candidate.typeStart < 0 ||
+            static_cast<size_t>(candidate.typeStart) > metadata.types.size() ||
+            candidate.typeCount > metadata.types.size() - static_cast<size_t>(candidate.typeStart)) {
+            return std::nullopt;
+        }
+        owningImage = &candidate;
+        for (size_t typeOffset = 0; typeOffset < candidate.typeCount; ++typeOffset) {
+            const auto& type = metadata.types[static_cast<size_t>(candidate.typeStart) + typeOffset];
+            for (const auto& method : type.methods) {
+                if (method.token != token) continue;
+                if (ordinaryMethod != nullptr || method.definitionIndex < 0 ||
+                    method.definitionIndex >= metadata.generatedMethodsStart) {
+                    return std::nullopt;
+                }
+                ordinaryMethod = &method;
+            }
+        }
+    }
+    if (owningImage == nullptr || ordinaryMethod == nullptr || owningImage->methodStart < 0) {
+        return std::nullopt;
+    }
+    const int64_t rowId = static_cast<int64_t>(ordinaryMethod->definitionIndex) -
+        owningImage->methodStart + 1;
+    if (rowId <= 0 || rowId > tokenRowIdMask ||
+        token != (methodTokenType | static_cast<uint32_t>(rowId))) {
+        return std::nullopt;
+    }
     const auto image = metadata.methodPointersByImage.find(imageName);
     if (image == metadata.methodPointersByImage.end()) return std::nullopt;
     const auto index = methodPointerIndex(token, image->second.size());

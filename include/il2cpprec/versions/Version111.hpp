@@ -7,6 +7,7 @@
 
 #include <il2cpprec/Model.hpp>
 #include <il2cpprec/versions/Version108.hpp>
+#include <il2cpprec/versions/Version110.hpp>
 
 namespace il2cpprec {
 

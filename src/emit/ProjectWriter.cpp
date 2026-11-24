@@ -17,6 +17,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 namespace il2cpprec {
@@ -464,8 +465,6 @@ GenericDeclarationInfo genericDeclaration(
             continue;
         }
         std::vector<std::string> constraints;
-        if (referenceConstraint) constraints.push_back("class");
-        if (valueConstraint) constraints.push_back("struct");
         if (parameter.constraintsCount < 0) {
             result.partialMetadata = true;
             continue;
@@ -473,20 +472,39 @@ GenericDeclarationInfo genericDeclaration(
         const int64_t constraintBegin = parameter.constraintsStart;
         const int64_t constraintEnd = constraintBegin + parameter.constraintsCount;
         if (constraintBegin < 0 || constraintEnd < constraintBegin ||
-            static_cast<uint64_t>(constraintEnd) > metadata.typeReferences.size()) {
+            static_cast<uint64_t>(constraintEnd) > metadata.genericParameterConstraints.size()) {
             if (parameter.constraintsCount != 0) {
                 result.partialMetadata = true;
                 continue;
             }
         }
+        std::string baseConstraint;
+        std::vector<std::string> interfaceConstraints;
         for (int64_t constraint = constraintBegin; constraint < constraintEnd; ++constraint) {
-            auto resolved = TypeSystem::resolve(static_cast<size_t>(constraint), metadata);
+            const int32_t referenceIndex = metadata.genericParameterConstraints[static_cast<size_t>(constraint)];
+            if (referenceIndex < 0 || static_cast<size_t>(referenceIndex) >= metadata.typeReferences.size()) {
+                result.partialMetadata = true;
+                continue;
+            }
+            auto resolved = TypeSystem::resolve(static_cast<size_t>(referenceIndex), metadata);
             if (resolved == "object" || resolved == "System.Object" || resolved == "System.ValueType") {
                 result.partialMetadata = true;
                 continue;
             }
-            constraints.push_back(std::move(resolved));
+            if (isClassConstraint(metadata, referenceIndex)) {
+                if (!baseConstraint.empty() && baseConstraint != resolved) {
+                    result.partialMetadata = true;
+                    continue;
+                }
+                baseConstraint = std::move(resolved);
+            } else if (std::find(interfaceConstraints.begin(), interfaceConstraints.end(), resolved) == interfaceConstraints.end()) {
+                interfaceConstraints.push_back(std::move(resolved));
+            }
         }
+        if (valueConstraint) constraints.push_back("struct");
+        else if (!baseConstraint.empty()) constraints.push_back(std::move(baseConstraint));
+        else if (referenceConstraint) constraints.push_back("class");
+        constraints.insert(constraints.end(), interfaceConstraints.begin(), interfaceConstraints.end());
         if ((parameter.flags & 0x10) != 0 && !valueConstraint) constraints.push_back("new()");
         if (!constraints.empty()) {
             result.constraints += " where " + name + " : ";
@@ -1441,6 +1459,132 @@ std::string stringLiteralContent(const std::string& value) {
     return result;
 }
 
+using AttributeBlobSizes = std::unordered_map<std::string, std::unordered_map<uint32_t, size_t>>;
+
+AttributeBlobSizes indexAttributeBlobs(const MetadataModel& metadata) {
+    AttributeBlobSizes result;
+    for (const auto& image : metadata.images) {
+        if (image.customAttributeStart < 0 || image.customAttributeCount == 0) continue;
+        const size_t begin = static_cast<size_t>(image.customAttributeStart);
+        const size_t count = image.customAttributeCount;
+        if (begin > metadata.attributeDataRanges.size() ||
+            count > metadata.attributeDataRanges.size() - begin) continue;
+        auto& sizes = result[image.name];
+        for (size_t index = begin; index < begin + count; ++index) {
+            if (index + 1 >= metadata.attributeDataRanges.size()) break;
+            const auto& range = metadata.attributeDataRanges[index];
+            const size_t end = metadata.attributeDataRanges[index + 1].start;
+            if (range.token == 0 || range.start > end || end > metadata.attributeData.size()) continue;
+            sizes.try_emplace(range.token, end - range.start);
+        }
+    }
+    return result;
+}
+
+std::optional<size_t> attributeBlobSize(
+    const AttributeBlobSizes& blobs,
+    const std::string& imageName,
+    uint32_t token) {
+    if (token == 0) return std::nullopt;
+    const auto image = blobs.find(imageName);
+    if (image == blobs.end()) return std::nullopt;
+    const auto entry = image->second.find(token);
+    return entry == image->second.end() ? std::nullopt : std::optional<size_t>(entry->second);
+}
+
+const MethodModel* accessorMethod(const TypeModel& type, int32_t index, const std::string& expectedName) {
+    if (index < 0) return nullptr;
+    if (static_cast<size_t>(index) < type.methods.size() &&
+        type.methods[static_cast<size_t>(index)].name == expectedName) {
+        return &type.methods[static_cast<size_t>(index)];
+    }
+    const auto method = std::find_if(type.methods.begin(), type.methods.end(), [index](const MethodModel& candidate) {
+        return candidate.definitionIndex == index;
+    });
+    return method == type.methods.end() || method->name != expectedName ? nullptr : &*method;
+}
+
+bool appendProperty(
+    std::ostringstream& output,
+    const TypeModel& type,
+    const PropertyModel& property,
+    const MetadataModel& metadata,
+    const TypeDeclarationInfo& declaringType,
+    const std::string& name,
+    const std::string& indentation,
+    std::set<int>& reservedMethods) {
+    const MethodModel* getter = accessorMethod(type, property.get, "get_" + property.name);
+    const MethodModel* setter = accessorMethod(type, property.set, "set_" + property.name);
+    if (!getter && !setter) return false;
+    if (getter && !getter->parameters.empty()) return false; // Indexers need parameterized C# syntax.
+    if (setter && setter->parameters.size() != 1) return false;
+    const std::string propertyType = getter
+        ? TypeSystem::returnType(*getter, &metadata)
+        : managedTypeName(setter->parameters.front().type, metadata);
+    if (propertyType.empty() || propertyType == "void") return false;
+    if (getter && setter && managedTypeName(setter->parameters.front().type, metadata) != propertyType) return false;
+    if (getter && setter && getter->isStatic != setter->isStatic) return false;
+    const MethodModel* principal = getter ? getter : setter;
+    if (declaringType.kind != ManagedTypeKind::Interface) {
+        output << indentation << memberVisibility(principal->flags) << ' ';
+        if (principal->isStatic || declaringType.modifiers == "static ") output << "static ";
+    }
+    output << propertyType << ' ' << name << "\n" << indentation << "{\n";
+    if (getter) {
+        output << indentation << "    get";
+        if (declaringType.kind == ManagedTypeKind::Interface) output << ";\n";
+        else output << " => throw new global::System.NotSupportedException(\"Recovered property accessor body is unavailable.\");\n";
+        reservedMethods.insert(getter->definitionIndex);
+    }
+    if (setter) {
+        output << indentation << "    set";
+        if (declaringType.kind == ManagedTypeKind::Interface) output << ";\n";
+        else output << " => throw new global::System.NotSupportedException(\"Recovered property accessor body is unavailable.\");\n";
+        reservedMethods.insert(setter->definitionIndex);
+    }
+    output << indentation << "}\n";
+    return true;
+}
+
+bool appendEvent(
+    std::ostringstream& output,
+    const TypeModel& type,
+    const EventModel& event,
+    const MetadataModel& metadata,
+    const TypeDeclarationInfo& declaringType,
+    const std::string& name,
+    const std::string& indentation,
+    std::set<int>& reservedMethods) {
+    if (event.typeIndex < 0 || static_cast<size_t>(event.typeIndex) >= metadata.typeReferences.size()) return false;
+    const auto& reference = metadata.typeReferences[static_cast<size_t>(event.typeIndex)];
+    const std::string eventType = TypeSystem::resolve(static_cast<size_t>(event.typeIndex), metadata);
+    // Only the framework delegate families are known to be legal C# event
+    // types here. Other metadata references need a proven delegate definition.
+    const bool frameworkDelegate = reference.definitionIndex < 0 &&
+        (eventType == "System.Action" || eventType == "System.EventHandler" ||
+         eventType.starts_with("System.Action<") || eventType.starts_with("System.EventHandler<"));
+    if (!frameworkDelegate) return false;
+    const MethodModel* add = accessorMethod(type, event.add, "add_" + event.name);
+    const MethodModel* remove = accessorMethod(type, event.remove, "remove_" + event.name);
+    if (!add || !remove || add->parameters.size() != 1 || remove->parameters.size() != 1 ||
+        add->isStatic != remove->isStatic) return false;
+    if (declaringType.kind != ManagedTypeKind::Interface) {
+        output << indentation << memberVisibility(add->flags) << ' ';
+        if (add->isStatic || declaringType.modifiers == "static ") output << "static ";
+    }
+    if (declaringType.kind == ManagedTypeKind::Interface) {
+        output << "event " << eventType << ' ' << name << ";\n";
+    } else {
+        output << "event " << eventType << ' ' << name << "\n" << indentation << "{\n";
+        output << indentation << "    add { throw new global::System.NotSupportedException(\"Recovered event accessor body is unavailable.\"); }\n";
+        output << indentation << "    remove { throw new global::System.NotSupportedException(\"Recovered event accessor body is unavailable.\"); }\n";
+        output << indentation << "}\n";
+    }
+    reservedMethods.insert(add->definitionIndex);
+    reservedMethods.insert(remove->definitionIndex);
+    return true;
+}
+
 void appendMethod(
     std::ostringstream& output,
     const MethodEntry& entry,
@@ -1561,6 +1705,7 @@ void ProjectWriter::write(
     std::filesystem::create_directories(outputDirectory);
 
     const MetadataIndex index(metadata);
+    const auto attributeBlobs = indexAttributeBlobs(metadata);
     const std::set<std::string> includedImages(options_.includedImages.begin(), options_.includedImages.end());
     std::vector<bool> includedTypes(metadata.types.size(), true);
     if (!includedImages.empty()) {
@@ -1620,8 +1765,25 @@ void ProjectWriter::write(
                    std::tie(right.metadataName, right.baseName, right.token, right.definitionIndex, right.function->address, right.function->name);
         });
 
+        const TypeModel* nestedParent = nullptr;
+        if (group.metadataTypes.size() == 1) {
+            const auto* child = group.metadataTypes.front();
+            if (child->declaringTypeIndex >= 0 &&
+                static_cast<size_t>(child->declaringTypeIndex) < metadata.types.size()) {
+                const auto& parent = metadata.types[static_cast<size_t>(child->declaringTypeIndex)];
+                const bool simpleParent = parent.declaringTypeIndex < 0 && parent.genericContainerIndex < 0 &&
+                    parent.nameSpace == child->nameSpace && parent.name.find('`') == std::string::npos;
+                const auto duplicates = std::count_if(metadata.types.begin(), metadata.types.end(), [&](const TypeModel& candidate) {
+                    return candidate.declaringTypeIndex < 0 && candidate.nameSpace == parent.nameSpace &&
+                           candidate.name == parent.name;
+                });
+                if (simpleParent && duplicates == 1 &&
+                    (parent.flags & 0x20) == 0 && (parent.bitfield & 0x2) == 0) nestedParent = &parent;
+            }
+        }
         const bool staticType = isStaticType(group, key == TypeKey{"Il2CppRecovered", "UnmatchedMethods"});
-        auto declaringType = typeDeclaration(group.metadataTypes.empty() ? nullptr : group.metadataTypes.front(), staticType, false);
+        auto declaringType = typeDeclaration(group.metadataTypes.empty() ? nullptr : group.metadataTypes.front(),
+                                             staticType, nestedParent != nullptr);
         const auto generic = group.metadataTypes.empty() ? GenericDeclarationInfo{} : genericDeclaration(
             metadata,
             group.metadataTypes.front()->genericContainerIndex,
@@ -1649,9 +1811,19 @@ void ProjectWriter::write(
         }
 
         std::ostringstream output;
-        const std::string typeIndent = nameSpace.empty() ? "" : "    ";
+        const std::string outerIndent = nameSpace.empty() ? "" : "    ";
+        const std::string typeIndent = outerIndent + (nestedParent ? "    " : "");
         const std::string bodyIndent = typeIndent + "    ";
         if (!nameSpace.empty()) output << "namespace " << nameSpace << "\n{\n";
+        if (nestedParent) {
+            TypeGroup parentGroup;
+            parentGroup.metadataTypes.push_back(nestedParent);
+            const auto parentDeclaration = typeDeclaration(nestedParent, isStaticType(parentGroup, false), false);
+            output << outerIndent << parentDeclaration.visibility << ' ' << parentDeclaration.modifiers
+                   << "unsafe partial " << typeKindName(parentDeclaration.kind) << ' '
+                   << safeName(nestedParent->name, "OuterType") << "\n"
+                   << outerIndent << "{\n";
+        }
         output << typeIndent << declaringType.visibility << " " << declaringType.modifiers;
         if (declaringType.kind != ManagedTypeKind::Enum) output << "unsafe partial ";
         output << typeKindName(declaringType.kind) << " " << typeName << generic.parameters;
@@ -1677,6 +1849,14 @@ void ProjectWriter::write(
         if (declaringType.partialMetadata) {
             output << bodyIndent << "// Partial recovery: native type flags or layout are unavailable or unsupported.\n";
         }
+        if (!group.metadataTypes.empty()) {
+            if (const auto blobSize = attributeBlobSize(attributeBlobs,
+                                                        group.metadataTypes.front()->imageName,
+                                                        group.metadataTypes.front()->token)) {
+                output << bodyIndent << "// Custom attribute blob: " << *blobSize
+                       << " bytes; constructor and arguments are not decoded.\n";
+            }
+        }
 
         std::set<std::string> fieldNames;
         bool first = true;
@@ -1685,6 +1865,10 @@ void ProjectWriter::write(
                 if (!first) output << '\n';
                 first = false;
                 const auto fieldName = uniqueFieldName(field, typeName, fieldNames);
+                if (const auto blobSize = attributeBlobSize(attributeBlobs, type->imageName, field.token)) {
+                    output << bodyIndent << "// Custom attribute blob: " << *blobSize
+                           << " bytes; constructor and arguments are not decoded.\n";
+                }
                 auto declaration = fieldDeclaration(field);
                 if (declaringType.kind == ManagedTypeKind::Class && declaringType.modifiers == "static " &&
                     !declaration.isStatic && !declaration.literal) {
@@ -1722,6 +1906,81 @@ void ProjectWriter::write(
             }
         }
 
+        std::set<int> reservedMethodDefinitions;
+        std::set<std::string> reservedAccessorNames;
+        if (declaringType.kind != ManagedTypeKind::Enum) {
+            for (const auto* type : group.metadataTypes) {
+                if (type->propertyCount == 0) continue;
+                if (type->propertyStart < 0 ||
+                    static_cast<size_t>(type->propertyStart) > metadata.properties.size() ||
+                    type->propertyCount > metadata.properties.size() - static_cast<size_t>(type->propertyStart)) {
+                    output << bodyIndent << "// Partial recovery: property metadata range is invalid.\n";
+                    continue;
+                }
+                for (size_t offset = 0; offset < type->propertyCount; ++offset) {
+                    const auto& property = metadata.properties[static_cast<size_t>(type->propertyStart) + offset];
+                    const auto name = safeName(property.name, "Property_0x" + hexAddress(property.token));
+                    const bool methodConflict = std::any_of(methods.begin(), methods.end(), [&](const MethodEntry& entry) {
+                        return entry.baseName == name && entry.definitionIndex != property.get &&
+                               entry.definitionIndex != property.set;
+                    });
+                    if (name == typeName || fieldNames.contains(name) || methodConflict) {
+                        output << bodyIndent << "// Partial recovery: property name conflicts with another member.\n";
+                        continue;
+                    }
+                    if (!first) output << '\n';
+                    if (const auto blobSize = attributeBlobSize(attributeBlobs, type->imageName, property.token)) {
+                        output << bodyIndent << "// Custom attribute blob: " << *blobSize
+                               << " bytes; constructor and arguments are not decoded.\n";
+                    }
+                    if (appendProperty(output, *type, property, metadata, declaringType, name, bodyIndent,
+                                       reservedMethodDefinitions)) {
+                        fieldNames.insert(name);
+                        if (property.get >= 0) reservedAccessorNames.insert("get_" + property.name);
+                        if (property.set >= 0) reservedAccessorNames.insert("set_" + property.name);
+                        first = false;
+                    } else {
+                        output << bodyIndent << "// Partial recovery: property accessor metadata is incomplete.\n";
+                    }
+                }
+            }
+            for (const auto* type : group.metadataTypes) {
+                if (type->eventCount == 0) continue;
+                if (type->eventStart < 0 ||
+                    static_cast<size_t>(type->eventStart) > metadata.events.size() ||
+                    type->eventCount > metadata.events.size() - static_cast<size_t>(type->eventStart)) {
+                    output << bodyIndent << "// Partial recovery: event metadata range is invalid.\n";
+                    continue;
+                }
+                for (size_t offset = 0; offset < type->eventCount; ++offset) {
+                    const auto& event = metadata.events[static_cast<size_t>(type->eventStart) + offset];
+                    const auto name = safeName(event.name, "Event_0x" + hexAddress(event.token));
+                    const bool methodConflict = std::any_of(methods.begin(), methods.end(), [&](const MethodEntry& entry) {
+                        return entry.baseName == name && entry.definitionIndex != event.add &&
+                               entry.definitionIndex != event.remove && entry.definitionIndex != event.raise;
+                    });
+                    if (name == typeName || fieldNames.contains(name) || methodConflict) {
+                        output << bodyIndent << "// Partial recovery: event name conflicts with another member.\n";
+                        continue;
+                    }
+                    if (!first) output << '\n';
+                    if (const auto blobSize = attributeBlobSize(attributeBlobs, type->imageName, event.token)) {
+                        output << bodyIndent << "// Custom attribute blob: " << *blobSize
+                               << " bytes; constructor and arguments are not decoded.\n";
+                    }
+                    if (appendEvent(output, *type, event, metadata, declaringType, name, bodyIndent,
+                                    reservedMethodDefinitions)) {
+                        fieldNames.insert(name);
+                        reservedAccessorNames.insert("add_" + event.name);
+                        reservedAccessorNames.insert("remove_" + event.name);
+                        first = false;
+                    } else {
+                        output << bodyIndent << "// Partial recovery: event delegate or accessor metadata is incomplete.\n";
+                    }
+                }
+            }
+        }
+
         std::set<std::string> usedMethodSignatures;
         std::set<std::string> usedConstructors;
         std::set<std::string> emittedSupport;
@@ -1748,12 +2007,32 @@ void ProjectWriter::write(
                 continue;
             }
 
-            const auto functionName = uniqueMethodName(entry, typeName, signatureKey, fieldNames, usedMethodSignatures);
+            MethodEntry namingEntry = entry;
+            if (reservedMethodDefinitions.contains(entry.definitionIndex) ||
+                reservedAccessorNames.contains(entry.baseName)) {
+                // A C# property reserves get_/set_ accessor names. Keep any
+                // recovered native method body under a stable, explicit name.
+                namingEntry.baseName += stableMethodSuffix(entry);
+            }
+            const auto functionName = uniqueMethodName(namingEntry, typeName, signatureKey, fieldNames, usedMethodSignatures);
             if (!first) output << '\n';
             first = false;
+            if (entry.method) {
+                if (const auto blobSize = attributeBlobSize(attributeBlobs, entry.method->imageName,
+                                                            entry.method->token)) {
+                    output << bodyIndent << "// Custom attribute blob: " << *blobSize
+                           << " bytes; constructor and arguments are not decoded.\n";
+                }
+            }
+            if (metadata.generatedMethodsStart >= 0 &&
+                entry.definitionIndex >= metadata.generatedMethodsStart) {
+                output << bodyIndent << "// Generated method metadata token: 0x"
+                       << hexAddress(entry.token) << ".\n";
+            }
             appendMethod(output, entry, functionName, typeName, parameters, metadata, declaringType, bodyAdapter, emittedSupport, bodyIndent);
         }
         output << typeIndent << "}\n";
+        if (nestedParent) output << outerIndent << "}\n";
         if (!nameSpace.empty()) output << "}\n";
         writeFile(filePath, output.str());
     }

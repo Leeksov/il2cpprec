@@ -162,8 +162,8 @@ bool parseVersionedHeader(
     double version,
     MetadataUsageHeaderInfo& info,
     std::vector<MetadataUsageDiagnostic>& diagnostics) {
-    if (version < 23 || version > 108) {
-        addDiagnostic(diagnostics, MetadataUsageStatus::Unresolved, "unsupported-version", "MetadataUsage header version must be between 23 and 108");
+    if (version < 23 || version > 109) {
+        addDiagnostic(diagnostics, MetadataUsageStatus::Unresolved, "unsupported-version", "MetadataUsage header layout is confirmed only for versions 23 through 109");
         return false;
     }
     if (data.size() < 8) {
@@ -259,6 +259,10 @@ bool parseVersionedHeader(
             return false;
         }
         info.typeIndexWidth = stride - 4;
+    } else if (version >= 38 && info.unresolvedVirtualCallParameterTypes.size != 0) {
+        addDiagnostic(diagnostics, MetadataUsageStatus::Unresolved, "unknown-type-index-width",
+            "Cannot derive unresolved signature type index width without interfaceOffsets");
+        return false;
     }
     return true;
 }
@@ -636,6 +640,12 @@ MetadataUsageSignatureResult readUnresolvedSignatures(
         addDiagnostic(result.diagnostics, MetadataUsageStatus::Unresolved, "misaligned-signature-table", "Unresolved signature tables have invalid element strides");
         return result;
     }
+    if (version >= 38 &&
+        (types.count != types.size / header.typeIndexWidth || ranges.count != ranges.size / 8)) {
+        addDiagnostic(result.diagnostics, MetadataUsageStatus::Unresolved, "signature-count-mismatch",
+            "Unresolved signature table counts disagree with section sizes");
+        return result;
+    }
     const size_t typeCount = types.size / header.typeIndexWidth;
     const size_t rangeCount = ranges.size / 8;
     result.tablesValid = true;
@@ -689,6 +699,44 @@ MetadataUsageSignatureResult readUnresolvedSignatures(
         }
         result.signatures.push_back(std::move(signature));
     }
+    return result;
+}
+
+MetadataUsageRgctxResult resolveMetadataRgctx(const MetadataModel& metadata, uint32_t token) {
+    MetadataUsageRgctxResult result;
+    result.token = token;
+    const RgctxRangeModel* selected = nullptr;
+    for (const auto& range : metadata.rgctxRanges) {
+        if (range.token != token) continue;
+        if (selected != nullptr &&
+            (selected->start != range.start || selected->count != range.count)) {
+            result.status = MetadataUsageStatus::Ambiguous;
+            result.diagnostic = "Token has conflicting RGCTX ranges";
+            return result;
+        }
+        selected = &range;
+    }
+    if (selected == nullptr) {
+        result.diagnostic = "Token has no RGCTX range";
+        return result;
+    }
+    if (selected->count < 0 || (selected->count != 0 && selected->start < 0)) {
+        result.diagnostic = "Token has a negative RGCTX range";
+        return result;
+    }
+    if (selected->count == 0) {
+        result.status = MetadataUsageStatus::Resolved;
+        return result;
+    }
+    const uint64_t end = static_cast<uint64_t>(selected->start) +
+        static_cast<uint32_t>(selected->count);
+    if (end > metadata.rgctxValues.size()) {
+        result.diagnostic = "Token RGCTX range exceeds the value table";
+        return result;
+    }
+    result.values.assign(metadata.rgctxValues.begin() + selected->start,
+                         metadata.rgctxValues.begin() + static_cast<size_t>(end));
+    result.status = MetadataUsageStatus::Resolved;
     return result;
 }
 
@@ -948,6 +996,11 @@ MetadataUsageResult MetadataUsageReader::readVersioned(
     MetadataUsageHeaderInfo header;
     MetadataUsageResult error;
     if (!parseVersionedHeader(globalMetadata, version, header, error.diagnostics)) return error;
+    if (version >= 27) {
+        addDiagnostic(error, MetadataUsageStatus::Unresolved, "metadata-usage-tables-absent",
+            "This metadata version does not contain legacy MetadataUsage list and pair tables");
+        return error;
+    }
     return readImpl(versionedView(globalMetadata, header), metadata, genericMethods, std::nullopt);
 }
 
@@ -979,6 +1032,11 @@ MetadataUsageResult MetadataUsageReader::initializeMethodMetadataVersioned(
     MetadataUsageHeaderInfo header;
     MetadataUsageResult error;
     if (!parseVersionedHeader(globalMetadata, version, header, error.diagnostics)) return error;
+    if (version >= 27) {
+        addDiagnostic(error, MetadataUsageStatus::Unresolved, "metadata-usage-tables-absent",
+            "This metadata version does not contain legacy MetadataUsage list and pair tables");
+        return error;
+    }
     return readImpl(versionedView(globalMetadata, header), metadata, genericMethods, listIndex);
 }
 

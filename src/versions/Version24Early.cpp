@@ -216,6 +216,9 @@ bool plausible(std::span<const std::uint8_t> data, const Version24EarlyProfile& 
     for (const auto* table : tables) {
         if (!tableView(data, *table).valid) return false;
     }
+    Version24EarlyTable attributes{'C', "custom attribute ranges",
+        profile.header.customAttributeRangesOffset, profile.customAttributeRangeStride, {}};
+    if (!tableView(data, attributes).valid) return false;
     if (profile.imageTokenMustBeOne) {
         const auto images = tableView(data, profile.images);
         for (std::size_t index = 0; index < images.count(profile.images.stride); ++index) {
@@ -272,7 +275,7 @@ const Version24EarlyProfile& version24_0Profile() noexcept {
         {'I', "images", 176, 32, image24_0Fields},
         {'A', "assemblies", 184, 68, assembly24_0Fields},
         {'R', "RGCTX entries", 168, 8, rgctxFields},
-        true, 24, 28, true, false, 0, 0
+        8, true, 24, 28, true, false, 0, 0
     };
     return profile;
 }
@@ -287,7 +290,7 @@ const Version24EarlyProfile& version24_1Profile() noexcept {
         {'I', "images", 176, 40, image24_1Fields},
         {'A', "assemblies", 184, 68, assembly24_1Fields},
         {'R', "RGCTX entries", 168, 8, rgctxFields},
-        true, 20, 28, false, true, 32, 36
+        12, true, 20, 28, false, true, 32, 36
     };
     return profile;
 }
@@ -321,8 +324,9 @@ const Version24EarlyProfile* detectVersion24EarlyProfile(std::span<const std::ui
 
     const bool matches24_0 = plausible(metadata, version24_0Profile());
     const bool matches24_1 = declaredHeaderSize == 272 && plausible(metadata, version24_1Profile());
-    if (matches24_1 && !matches24_0) return &version24_1Profile();
+    if (matches24_0 == matches24_1) return nullptr;
     if (matches24_0) return &version24_0Profile();
+    if (matches24_1) return &version24_1Profile();
     return nullptr;
 }
 
@@ -371,6 +375,50 @@ std::vector<std::string> validateVersion24EarlyCodeRegistration(
     return errors;
 }
 
+Version24EarlyMethodInfo makeVersion24EarlyMethodInfo(
+    Version24EarlyKind kind, std::size_t pointerSize) noexcept {
+    Version24EarlyMethodInfo layout;
+    layout.pointerSize = pointerSize;
+    if ((kind != Version24EarlyKind::V24_0 && kind != Version24EarlyKind::V24_1) ||
+        (pointerSize != 4 && pointerSize != 8)) return layout;
+    // Eight pointer fields precede the version-dependent metadata fields.
+    layout.methodPointerOffset = 0;
+    layout.invokerOffset = static_cast<std::uint32_t>(pointerSize);
+    layout.declaringTypeOffset = static_cast<std::uint32_t>(3 * pointerSize);
+    layout.rgctxOrDefinitionOffset = static_cast<std::uint32_t>(6 * pointerSize);
+    layout.genericMethodOrContainerOffset = static_cast<std::uint32_t>(7 * pointerSize);
+    layout.hasCustomAttributeIndex = kind == Version24EarlyKind::V24_0;
+    layout.customAttributeIndexOffset = static_cast<std::uint32_t>(8 * pointerSize);
+    layout.tokenOffset = layout.customAttributeIndexOffset + (layout.hasCustomAttributeIndex ? 4 : 0);
+    layout.flagsOffset = layout.tokenOffset + 4;
+    layout.parameterCountOffset = layout.flagsOffset + 6;
+    layout.bitfieldOffset = layout.parameterCountOffset + 1;
+    layout.size = (static_cast<std::size_t>(layout.bitfieldOffset) + 1 + pointerSize - 1) & ~(pointerSize - 1);
+    return layout;
+}
+
+std::vector<std::string> validateVersion24EarlyMethodInfo(
+    Version24EarlyKind kind, const Version24EarlyMethodInfo& layout) {
+    if ((kind != Version24EarlyKind::V24_0 && kind != Version24EarlyKind::V24_1) ||
+        (layout.pointerSize != 4 && layout.pointerSize != 8)) {
+        return {"MethodInfo requires a known early-24 version and 4- or 8-byte pointers"};
+    }
+    const auto expected = makeVersion24EarlyMethodInfo(kind, layout.pointerSize);
+    if (layout.size != expected.size || layout.methodPointerOffset != expected.methodPointerOffset ||
+        layout.invokerOffset != expected.invokerOffset ||
+        layout.declaringTypeOffset != expected.declaringTypeOffset ||
+        layout.rgctxOrDefinitionOffset != expected.rgctxOrDefinitionOffset ||
+        layout.genericMethodOrContainerOffset != expected.genericMethodOrContainerOffset ||
+        layout.hasCustomAttributeIndex != expected.hasCustomAttributeIndex ||
+        layout.customAttributeIndexOffset != expected.customAttributeIndexOffset ||
+        layout.tokenOffset != expected.tokenOffset || layout.flagsOffset != expected.flagsOffset ||
+        layout.parameterCountOffset != expected.parameterCountOffset ||
+        layout.bitfieldOffset != expected.bitfieldOffset) {
+        return {"MethodInfo does not match the official early-24 runtime layout"};
+    }
+    return {};
+}
+
 std::vector<std::string> validateVersion24EarlyProfile(const Version24EarlyProfile& profile) {
     std::vector<std::string> errors;
     const bool is24_0 = profile.kind == Version24EarlyKind::V24_0;
@@ -391,10 +439,26 @@ std::vector<std::string> validateVersion24EarlyProfile(const Version24EarlyProfi
             actual->headerOffset != official->headerOffset || actual->stride != official->stride) {
             errors.push_back(std::string(official->name) + " does not match the official " + std::string(expected.name) + " descriptor");
         }
+        if (actual->fields.size() != official->fields.size()) {
+            errors.push_back(std::string(official->name) + " has a different field count from the official descriptor");
+        } else {
+            for (std::size_t index = 0; index < official->fields.size(); ++index) {
+                const auto& field = actual->fields[index];
+                const auto& canonical = official->fields[index];
+                if (field.name != canonical.name || field.offset != canonical.offset ||
+                    field.size != canonical.size) {
+                    errors.push_back(std::string(official->name) + " has a noncanonical field descriptor");
+                    break;
+                }
+            }
+        }
         validateFields(*actual, errors);
     }
     if (profile.header.size != 272 || profile.header.customAttributeRangesOffset != 224) {
         errors.push_back("metadata 24.0/24.1 canonical header must be 272 bytes with custom attributes at 224");
+    }
+    if (profile.customAttributeRangeStride != expected.customAttributeRangeStride) {
+        errors.push_back("custom attribute range stride does not match the official profile");
     }
     const auto hasHeaderSize = [&profile](std::uint32_t size) {
         return std::find(profile.acceptedHeaderSizes.begin(), profile.acceptedHeaderSizes.end(), size) !=
@@ -425,10 +489,13 @@ std::vector<std::string> validateVersion24EarlyProfile(const Version24EarlyProfi
                    !findField(profile.images, "customAttributeCount"))) {
         errors.push_back("metadata 24.1 image custom-attribute fields are missing");
     }
-    auto codeErrors = validateVersion24EarlyCodeRegistration(makeVersion24EarlyCodeRegistration(4));
-    auto code64Errors = validateVersion24EarlyCodeRegistration(makeVersion24EarlyCodeRegistration(8));
-    errors.insert(errors.end(), codeErrors.begin(), codeErrors.end());
-    errors.insert(errors.end(), code64Errors.begin(), code64Errors.end());
+    for (const auto pointerSize : {4U, 8U}) {
+        auto codeErrors = validateVersion24EarlyCodeRegistration(makeVersion24EarlyCodeRegistration(pointerSize));
+        auto methodErrors = validateVersion24EarlyMethodInfo(
+            profile.kind, makeVersion24EarlyMethodInfo(profile.kind, pointerSize));
+        errors.insert(errors.end(), codeErrors.begin(), codeErrors.end());
+        errors.insert(errors.end(), methodErrors.begin(), methodErrors.end());
+    }
     return errors;
 }
 
@@ -473,13 +540,11 @@ Version24EarlyValidation validateVersion24EarlyMetadata(
     auto& rgctx = views[6];
 
     Version24EarlyTable attributeRanges{
-        'C', "custom attribute ranges", profile.header.customAttributeRangesOffset, 12, {}
+        'C', "custom attribute ranges", profile.header.customAttributeRangesOffset,
+        profile.customAttributeRangeStride, {}
     };
-    TableView attributes;
-    if (profile.imageCustomAttributes) {
-        attributes = tableView(metadata, attributeRanges);
-        validateTable(metadata, attributeRanges, attributes, result.errors);
-    }
+    TableView attributes = tableView(metadata, attributeRanges);
+    validateTable(metadata, attributeRanges, attributes, result.errors);
     const std::size_t attributeCount = attributes.count(attributeRanges.stride);
 
     if (images.valid) {
@@ -512,7 +577,7 @@ Version24EarlyValidation validateVersion24EarlyMetadata(
     if (rgctx.valid) {
         for (std::size_t index = 0; index < rgctx.count(profile.rgctxEntries.stride); ++index) {
             std::uint32_t kind = 0;
-            if (read32(metadata, rgctx.offset + index * profile.rgctxEntries.stride, kind) && kind > 5) {
+            if (read32(metadata, rgctx.offset + index * profile.rgctxEntries.stride, kind) && kind > 4) {
                 result.errors.push_back("RGCTX entries[" + std::to_string(index) + "] has invalid data kind");
             }
         }

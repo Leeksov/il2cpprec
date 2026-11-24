@@ -155,11 +155,11 @@ RecoveredFunction cloneRecoveredFunction(const RecoveredFunction& function, IrSh
     return clone;
 }
 
-constexpr uint32_t diskCacheSchemaVersion = 4;
-constexpr uint32_t sourceProfileSchemaVersion = 2;
+constexpr uint32_t diskCacheSchemaVersion = 5;
+constexpr uint32_t sourceProfileSchemaVersion = 3;
 constexpr size_t maxDiskCacheFileSize = 256 * 1024 * 1024;
 constexpr uint64_t nullExpressionIndex = std::numeric_limits<uint64_t>::max();
-constexpr std::array<uint8_t, 8> diskCacheMagic = {'I', 'L', '2', 'R', 'P', 'C', '0', '4'};
+constexpr std::array<uint8_t, 8> diskCacheMagic = {'I', 'L', '2', 'R', 'P', 'C', '0', '5'};
 
 uint32_t rotateRight(uint32_t value, unsigned bits) noexcept {
     return (value >> bits) | (value << (32 - bits));
@@ -315,8 +315,12 @@ ProfileHash hashSourceProfile(const RecoverySourceProfile& profile) noexcept {
     hashInteger(hash, static_cast<uint32_t>(profile.rawMetadataVersion));
     hashInteger(hash, std::bit_cast<uint64_t>(profile.preciseMetadataVersion));
     hashInteger(hash, std::bit_cast<uint64_t>(profile.registrationVersion));
+    hashInteger(hash, static_cast<uint32_t>(profile.versionConfidence));
+    hashString(hash, profile.versionProvenance);
+    hashMetadataSection(hash, profile.methodSignatures);
     hashMetadataSection(hash, profile.generatedMethodTypeInfos);
     hashMetadataSection(hash, profile.generatedMethodTokens);
+    hashInteger(hash, static_cast<uint32_t>(profile.generatedMethodsStart));
     hashInteger(hash, profile.exceptionSemanticsVersion);
     hashInteger(hash, profile.vectorSemanticsVersion);
     return hash.finish();
@@ -502,6 +506,8 @@ std::vector<uint8_t> serializeDiskCache(
     BinaryWriter writer;
     writer.write(diskCacheMagic.data(), diskCacheMagic.size());
     writer.writeU32(diskCacheSchemaVersion);
+    const auto profileHash = hashSourceProfile(sourceProfile);
+    writer.write(profileHash.data(), profileHash.size());
     writer.writeU64(sourceProfile.lifterSemanticsVersion);
     writer.writeU64(sourceProfile.exceptionSemanticsVersion);
     writer.writeU64(sourceProfile.vectorSemanticsVersion);
@@ -519,12 +525,18 @@ std::vector<uint8_t> serializeDiskCache(
     writer.writeU32(static_cast<uint32_t>(sourceProfile.rawMetadataVersion));
     writer.writeU64(std::bit_cast<uint64_t>(sourceProfile.preciseMetadataVersion));
     writer.writeU64(std::bit_cast<uint64_t>(sourceProfile.registrationVersion));
+    writer.writeU32(static_cast<uint32_t>(sourceProfile.versionConfidence));
+    writer.writeString(sourceProfile.versionProvenance);
+    writer.writeU32(static_cast<uint32_t>(sourceProfile.methodSignatures.offset));
+    writer.writeU32(static_cast<uint32_t>(sourceProfile.methodSignatures.sectionSize));
+    writer.writeU32(static_cast<uint32_t>(sourceProfile.methodSignatures.count));
     writer.writeU32(static_cast<uint32_t>(sourceProfile.generatedMethodTypeInfos.offset));
     writer.writeU32(static_cast<uint32_t>(sourceProfile.generatedMethodTypeInfos.sectionSize));
     writer.writeU32(static_cast<uint32_t>(sourceProfile.generatedMethodTypeInfos.count));
     writer.writeU32(static_cast<uint32_t>(sourceProfile.generatedMethodTokens.offset));
     writer.writeU32(static_cast<uint32_t>(sourceProfile.generatedMethodTokens.sectionSize));
     writer.writeU32(static_cast<uint32_t>(sourceProfile.generatedMethodTokens.count));
+    writer.writeU32(static_cast<uint32_t>(sourceProfile.generatedMethodsStart));
     writer.write(job.image.code, job.image.size);
     writer.writeU64(expressions.size());
     for (const Expression* expression : expressions) {
@@ -648,6 +660,7 @@ std::optional<DiskCacheData> deserializeDiskCache(
     BinaryReader reader(bytes.data(), bytes.size() - 32);
     std::array<uint8_t, 8> magic{};
     uint32_t schema = 0;
+    ProfileHash profileHash{};
     uint64_t lifter = 0;
     uint64_t exceptionSemantics = 0;
     uint64_t vectorSemantics = 0;
@@ -659,6 +672,8 @@ std::optional<DiskCacheData> deserializeDiskCache(
     uint32_t rawMetadataVersion = 0;
     uint64_t preciseMetadataVersion = 0;
     uint64_t registrationVersion = 0;
+    uint32_t versionConfidence = 0;
+    std::string versionProvenance;
     std::string unityMetadataVersion;
     std::string binaryIdentity;
     std::string codeRegistrationIdentity;
@@ -667,6 +682,8 @@ std::optional<DiskCacheData> deserializeDiskCache(
     std::string layoutIdentity;
     MetadataSectionModel generatedMethodTypeInfos;
     MetadataSectionModel generatedMethodTokens;
+    MetadataSectionModel methodSignatures;
+    uint32_t generatedMethodsStart = 0;
     const auto readSection = [&reader](MetadataSectionModel& section) {
         uint32_t offset = 0;
         uint32_t size = 0;
@@ -678,7 +695,8 @@ std::optional<DiskCacheData> deserializeDiskCache(
         return true;
     };
     if (!reader.read(magic.data(), magic.size()) || magic != diskCacheMagic
-        || !reader.readU32(schema) || !reader.readU64(lifter)
+        || !reader.readU32(schema) || !reader.read(profileHash.data(), profileHash.size())
+        || !reader.readU64(lifter)
         || !reader.readU64(exceptionSemantics) || !reader.readU64(vectorSemantics)
         || !reader.readU32(architecture) || !reader.readU32(arm32Mode) || !reader.readU32(reserved)
         || !reader.readU64(address) || !reader.readU64(codeSize)
@@ -687,8 +705,12 @@ std::optional<DiskCacheData> deserializeDiskCache(
         || !reader.readString(profileIdentity) || !reader.readString(layoutIdentity)
         || !reader.readU32(rawMetadataVersion) || !reader.readU64(preciseMetadataVersion)
         || !reader.readU64(registrationVersion)
+        || !reader.readU32(versionConfidence) || !reader.readString(versionProvenance)
+        || !readSection(methodSignatures)
         || !readSection(generatedMethodTypeInfos) || !readSection(generatedMethodTokens)
+        || !reader.readU32(generatedMethodsStart)
         || schema != diskCacheSchemaVersion || lifter != sourceProfile.lifterSemanticsVersion
+        || profileHash != hashSourceProfile(sourceProfile)
         || exceptionSemantics != sourceProfile.exceptionSemanticsVersion
         || vectorSemantics != sourceProfile.vectorSemanticsVersion || reserved != 0
         || architecture != static_cast<uint32_t>(job.image.architecture)
@@ -701,12 +723,18 @@ std::optional<DiskCacheData> deserializeDiskCache(
         || rawMetadataVersion != static_cast<uint32_t>(sourceProfile.rawMetadataVersion)
         || preciseMetadataVersion != std::bit_cast<uint64_t>(sourceProfile.preciseMetadataVersion)
         || registrationVersion != std::bit_cast<uint64_t>(sourceProfile.registrationVersion)
+        || versionConfidence != static_cast<uint32_t>(sourceProfile.versionConfidence)
+        || versionProvenance != sourceProfile.versionProvenance
+        || methodSignatures.offset != sourceProfile.methodSignatures.offset
+        || methodSignatures.sectionSize != sourceProfile.methodSignatures.sectionSize
+        || methodSignatures.count != sourceProfile.methodSignatures.count
         || generatedMethodTypeInfos.offset != sourceProfile.generatedMethodTypeInfos.offset
         || generatedMethodTypeInfos.sectionSize != sourceProfile.generatedMethodTypeInfos.sectionSize
         || generatedMethodTypeInfos.count != sourceProfile.generatedMethodTypeInfos.count
         || generatedMethodTokens.offset != sourceProfile.generatedMethodTokens.offset
         || generatedMethodTokens.sectionSize != sourceProfile.generatedMethodTokens.sectionSize
         || generatedMethodTokens.count != sourceProfile.generatedMethodTokens.count
+        || generatedMethodsStart != static_cast<uint32_t>(sourceProfile.generatedMethodsStart)
         || codeSize > std::numeric_limits<size_t>::max() || codeSize > reader.remaining()) {
         return std::nullopt;
     }
@@ -1898,10 +1926,18 @@ RecoveryExactComparison RecoveryPipeline::compareProfilesExact(
         std::bit_cast<uint64_t>(before.preciseMetadataVersion), std::bit_cast<uint64_t>(after.preciseMetadataVersion));
     compareInteger(RecoveryExactMismatchKind::RegistrationVersion, "registrationVersion",
         std::bit_cast<uint64_t>(before.registrationVersion), std::bit_cast<uint64_t>(after.registrationVersion));
+    compareInteger(RecoveryExactMismatchKind::VersionConfidence, "versionConfidence",
+        static_cast<uint32_t>(before.versionConfidence), static_cast<uint32_t>(after.versionConfidence));
+    compareString(RecoveryExactMismatchKind::VersionProvenance, "versionProvenance",
+        before.versionProvenance, after.versionProvenance);
+    compareSection(RecoveryExactMismatchKind::MethodSignatures, "methodSignatures",
+        before.methodSignatures, after.methodSignatures);
     compareSection(RecoveryExactMismatchKind::GeneratedMethodTypeInfos, "generatedMethodTypeInfos",
         before.generatedMethodTypeInfos, after.generatedMethodTypeInfos);
     compareSection(RecoveryExactMismatchKind::GeneratedMethodTokens, "generatedMethodTokens",
         before.generatedMethodTokens, after.generatedMethodTokens);
+    compareInteger(RecoveryExactMismatchKind::GeneratedMethodsStart, "generatedMethodsStart",
+        static_cast<uint32_t>(before.generatedMethodsStart), static_cast<uint32_t>(after.generatedMethodsStart));
     compareInteger(RecoveryExactMismatchKind::ExceptionSemanticsVersion, "exceptionSemanticsVersion",
         before.exceptionSemanticsVersion, after.exceptionSemanticsVersion);
     compareInteger(RecoveryExactMismatchKind::VectorSemanticsVersion, "vectorSemanticsVersion",

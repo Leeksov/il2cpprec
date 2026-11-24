@@ -1,5 +1,6 @@
 #include <il2cpprec/metadata/GenericMethodResolver.hpp>
 
+#include <memory>
 #include <tuple>
 
 namespace il2cpprec {
@@ -13,14 +14,18 @@ bool sameMapping(const GenericMethodPointerModel& left, const GenericMethodPoint
         left.classInstAddress,
         left.methodInstAddress,
         left.methodPointer,
-        left.invokerPointer) == std::tie(
+        left.invokerPointer,
+        left.adjustorThunkIndex,
+        left.adjustorThunk) == std::tie(
         right.genericMethodIndex,
         right.methodIndex,
         right.invokerIndex,
         right.classInstAddress,
         right.methodInstAddress,
         right.methodPointer,
-        right.invokerPointer);
+        right.invokerPointer,
+        right.adjustorThunkIndex,
+        right.adjustorThunk);
 }
 
 } // namespace
@@ -71,6 +76,18 @@ GenericMethodTarget GenericMethodResolver::resolve(uint32_t genericMethodIndex) 
         result.diagnostic = "Generic method " + std::to_string(genericMethodIndex) + " has no method definition";
         return result;
     }
+    if (mapping.classInstAddress != 0 && spec.classInstAddress != 0 &&
+        mapping.classInstAddress != spec.classInstAddress) {
+        result.status = MetadataUsageStatus::Ambiguous;
+        result.diagnostic = "Generic method class instantiation conflicts with its method spec";
+        return result;
+    }
+    if (mapping.methodInstAddress != 0 && spec.methodInstAddress != 0 &&
+        mapping.methodInstAddress != spec.methodInstAddress) {
+        result.status = MetadataUsageStatus::Ambiguous;
+        result.diagnostic = "Generic method instantiation conflicts with its method spec";
+        return result;
+    }
     result.methodDefinitionIndex = spec.methodDefinitionIndex;
 
     const auto methods = methodDefinitions_.find(spec.methodDefinitionIndex);
@@ -91,9 +108,43 @@ GenericMethodTarget GenericMethodResolver::resolve(uint32_t genericMethodIndex) 
     return result;
 }
 
+GenericMethodTarget GenericMethodResolver::resolveSpec(uint32_t genericMethodIndex) const {
+    GenericMethodTarget result;
+    result.genericMethodIndex = genericMethodIndex;
+    if (genericMethodIndex >= metadata_->methodSpecs.size()) {
+        result.diagnostic = "Generic method " + std::to_string(genericMethodIndex) +
+            " exceeds methodSpecs count " + std::to_string(metadata_->methodSpecs.size());
+        return result;
+    }
+    const auto& spec = metadata_->methodSpecs[genericMethodIndex];
+    if (spec.methodDefinitionIndex < 0) {
+        result.diagnostic = "Generic method " + std::to_string(genericMethodIndex) +
+            " has no method definition";
+        return result;
+    }
+    result.methodDefinitionIndex = spec.methodDefinitionIndex;
+    const auto methods = methodDefinitions_.find(spec.methodDefinitionIndex);
+    if (methods == methodDefinitions_.end() || methods->second.empty()) {
+        result.diagnostic = "Generic method definition " + std::to_string(spec.methodDefinitionIndex) +
+            " was not found in MetadataModel";
+        return result;
+    }
+    if (methods->second.size() != 1) {
+        result.status = MetadataUsageStatus::Ambiguous;
+        result.diagnostic = "Generic method definition " + std::to_string(spec.methodDefinitionIndex) +
+            " has multiple MethodModel records";
+        return result;
+    }
+    result.method = *methods->second.front();
+    result.status = MetadataUsageStatus::Resolved;
+    return result;
+}
+
 MetadataUsageGenericMethodResolver GenericMethodResolver::usageResolver() const {
-    return [this](uint32_t genericMethodIndex) {
-        auto target = resolve(genericMethodIndex);
+    // Keep the indexed tables alive even when this resolver was a temporary.
+    auto resolver = std::make_shared<GenericMethodResolver>(*this);
+    return [resolver = std::move(resolver)](uint32_t genericMethodIndex) {
+        auto target = resolver->resolveSpec(genericMethodIndex);
         MetadataUsageGenericMethodResolution result;
         result.status = target.status;
         result.diagnostic = target.diagnostic;

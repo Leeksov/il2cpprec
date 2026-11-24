@@ -576,14 +576,20 @@ void MetadataRegistrationReader::read(
     if (version.preciseVersion == 0) {
         version.preciseVersion = registration.registrationVersion != 0 ? registration.registrationVersion : metadata.version;
     }
-    if (version.registrationVersion == 0) {
-        version.registrationVersion = registration.registrationVersion != 0
-            ? registration.registrationVersion
-            : version.preciseVersion;
+    if (registration.registrationVersion != 0) {
+        version.registrationVersion = registration.registrationVersion;
     }
-    version.confidence = registration.versionConfidence == MetadataVersionConfidence::Unknown
-        ? MetadataVersionConfidence::Registration
-        : registration.versionConfidence;
+    if (registration.versionConfidence != MetadataVersionConfidence::Unknown) {
+        version.confidence = registration.versionConfidence;
+    } else if (registration.registrationVersion != 0 &&
+               version.confidence != MetadataVersionConfidence::Explicit) {
+        version.confidence = MetadataVersionConfidence::Registration;
+    }
+    if (!registration.versionProvenance.empty()) {
+        version.provenance = registration.versionProvenance;
+    } else if (registration.registrationVersion != 0) {
+        version.provenance = "metadata-registration:layout";
+    }
     if (metadata.version == 0) metadata.version = version.preciseVersion;
     metadata.metadataRegistrationAddress = registration.metadataRegistrationAddress;
     metadata.codeRegistrationAddress = registration.codeRegistrationAddress;

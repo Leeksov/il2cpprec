@@ -36,6 +36,8 @@ struct Legacy19Profile {
     size_t fieldTokenOffset = 0;
     size_t imageTokenOffset = 0;
     bool referencedAssemblies = false;
+    size_t invokerArgumentCount = 0;
+    bool invokerTakesMethodInfo = false;
 };
 
 struct Legacy19FieldLayout {
@@ -104,11 +106,18 @@ struct Legacy19NativeRegistration {
     std::vector<uint64_t> metadataUsages;
 };
 
+struct Legacy19FieldReference {
+    int32_t typeIndex = -1;
+    int32_t fieldIndex = -1; // local index within the resolved declaring type
+};
+
 struct Legacy19ReadResult {
     MetadataModel metadata;
     Legacy19Profile profile;
     Legacy19MethodInfoLayout methodInfo;
     Legacy19NativeRegistration registration;
+    std::vector<Legacy19FieldReference> fieldRefs;
+    std::vector<int32_t> referencedAssemblies;
     std::vector<Legacy19Diagnostic> diagnostics;
 
     bool ok() const noexcept;

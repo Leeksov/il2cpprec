@@ -51,6 +51,7 @@ struct MetadataVersionModel {
     double preciseVersion = 0;
     double registrationVersion = 0;
     MetadataVersionConfidence confidence = MetadataVersionConfidence::Unknown;
+    std::string provenance;
 };
 
 struct MetadataSectionModel {
@@ -104,6 +105,8 @@ struct MetadataSectionsModel {
     MetadataSectionModel staticConstructorTypeIndices;
     MetadataSectionModel generatedMethodTypeInfos;
     MetadataSectionModel generatedMethodTokens;
+    MetadataSectionModel metadataUsageLists;
+    MetadataSectionModel metadataUsagePairs;
 };
 
 struct ParameterModel {
@@ -164,6 +167,34 @@ struct TypeModel {
     uint32_t flags = 0;
     uint32_t bitfield = 0;
     uint32_t token = 0;
+    int32_t eventStart = -1;
+    uint16_t eventCount = 0;
+    int32_t propertyStart = -1;
+    uint16_t propertyCount = 0;
+    int32_t nestedTypeStart = -1;
+    uint16_t nestedTypeCount = 0;
+};
+
+struct EventModel {
+    std::string name;
+    int32_t typeIndex = -1;
+    int32_t add = -1;
+    int32_t remove = -1;
+    int32_t raise = -1;
+    uint32_t token = 0;
+};
+
+struct PropertyModel {
+    std::string name;
+    int32_t get = -1;
+    int32_t set = -1;
+    uint32_t attrs = 0;
+    uint32_t token = 0;
+};
+
+struct AttributeDataRangeModel {
+    uint32_t token = 0;
+    uint32_t start = 0;
 };
 
 struct GenericInstModel {
@@ -340,6 +371,12 @@ struct MetadataModel {
     std::vector<FieldDefaultValueModel> fieldDefaultValues;
     std::vector<ParameterDefaultValueModel> parameterDefaultValues;
     std::vector<uint8_t> defaultValueData;
+    std::vector<EventModel> events;
+    std::vector<PropertyModel> properties;
+    std::vector<int32_t> genericParameterConstraints;
+    std::vector<int32_t> nestedTypes;
+    std::vector<uint8_t> attributeData;
+    std::vector<AttributeDataRangeModel> attributeDataRanges;
     MetadataVersionModel versionInfo;
     MetadataSectionsModel sections;
     std::vector<ImageModel> images;
