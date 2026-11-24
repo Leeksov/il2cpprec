@@ -4,6 +4,7 @@ from typing import Any
 
 
 QUALITY_KEYS = ("exact", "partial", "errors")
+VERIFICATION_LEVELS = ("metadata-supported", "provisional", "native-verified", "unverified")
 
 
 def empty_recovery() -> dict[str, int]:
@@ -40,6 +41,8 @@ def make_case(
     recovery: dict[str, int] | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
+    if verification not in VERIFICATION_LEVELS:
+        raise ValueError(f"unknown verification level: {verification}")
     case = {
         "id": case_id,
         "suite": suite,
@@ -63,8 +66,9 @@ def build_report(cases: list[dict[str, Any]], cli: str, diff: dict[str, Any] | N
             "passed": sum(case["status"] == "PASS" for case in cases),
             "failed": failed,
             "skipped": sum(case["status"] == "SKIP" for case in cases),
-            "provisional": sum(case["verification"] == "provisional" for case in cases),
-            "nativeVerified": sum(case["verification"] == "native-verified" for case in cases),
+            "metadataSupported": sum(case["verification"] == "metadata-supported" and case["status"] == "PASS" for case in cases),
+            "provisional": sum(case["verification"] == "provisional" and case["status"] == "PASS" for case in cases),
+            "nativeVerified": sum(case["verification"] == "native-verified" and case["status"] == "PASS" for case in cases),
         },
         "recovery": total_recovery(cases),
         "cases": cases,

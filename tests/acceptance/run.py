@@ -98,6 +98,15 @@ def load_cli_report(path: Path) -> dict[str, Any]:
     recovery = recovery_from_cli(report)
     if report.get("total") != sum(recovery.values()):
         raise RuntimeError("CLI JSON report total does not match exact/partial/errors")
+    statuses = {"exact": 0, "partial": 0, "error": 0}
+    for method in report["methods"]:
+        if not isinstance(method, dict) or method.get("status") not in statuses:
+            raise RuntimeError("CLI JSON report contains an invalid method status")
+        statuses[method["status"]] += 1
+    if (statuses["exact"], statuses["partial"], statuses["error"]) != (
+        recovery["exact"], recovery["partial"], recovery["errors"]
+    ):
+        raise RuntimeError("CLI JSON report method statuses do not match aggregate counts")
     return report
 
 
@@ -180,17 +189,20 @@ def run_synthetic(
         expected_exit = 1 if expected["errors"] else 0
         if result.returncode != expected_exit:
             raise RuntimeError(f"CLI exited {result.returncode}, expected {expected_exit}: {process_details(result)}")
+        verification = "metadata-supported" if suite == "matrix" else "provisional"
         return make_case(
             case_id,
             suite,
             "PASS",
-            "provisional",
-            "synthetic method resolution passed; native semantics are not verified",
+            verification,
+            "synthetic metadata profile and method resolution passed; native semantics are not verified",
             recovery,
             profile=profile,
             architecture=fixture.profile.architecture,
             methods=report["methods"],
-            command=[str(part) for part in command],
+            command=[cli.name, "--binary", "<fixture.elf>", "--metadata", "<global-metadata.dat>",
+                     "--workers", "1", "--report", "<recovery.json>"] +
+                    (["--output-dir", "<project>", "--include-images", INCLUDED_IMAGE] if filtered_build else []),
             outputDirectory=str(output_dir) if filtered_build else None,
         )
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
@@ -199,7 +211,7 @@ def run_synthetic(
             case_id,
             suite,
             "FAIL",
-            "provisional",
+            "metadata-supported" if suite == "matrix" else "provisional",
             str(error),
             recovery,
             architecture=fixture.profile.architecture,
@@ -266,8 +278,8 @@ def run_filtered_build(cli: Path, work: Path, requested_runtime: str) -> dict[st
             raise RuntimeError(f"filtered C# build exited {build.returncode}: {process_details(build)}")
         case["reason"] = "filtered generated C# project compiled; synthetic native semantics remain provisional"
         case["build"] = {
-            "compiler": dotnet,
-            "project": str(project),
+            "compiler": Path(dotnet).name,
+            "project": project.name,
             "compileItems": compile_items,
             "includedImage": INCLUDED_IMAGE,
         }
@@ -364,6 +376,17 @@ def load_baseline(value: str | None) -> dict[str, Any] | None:
     return baseline
 
 
+def remove_temp_paths(value: Any, work: Path) -> Any:
+    """Keep reports identical across separate temporary fixture directories."""
+    if isinstance(value, str):
+        return value.replace(str(work), "<work>")
+    if isinstance(value, list):
+        return [remove_temp_paths(item, work) for item in value]
+    if isinstance(value, dict):
+        return {key: remove_temp_paths(item, work) for key, item in value.items()}
+    return value
+
+
 def print_case(case: dict[str, Any]) -> None:
     recovery = case["recovery"]
     print(
@@ -423,7 +446,7 @@ def main() -> int:
                 cli, work, args.criticalops_binary, args.criticalops_metadata
             ))
 
-        report = build_report(cases, str(cli))
+        report = remove_temp_paths(build_report(cases, str(cli)), work)
         if baseline is not None:
             try:
                 report["diff"] = diff_reports(baseline, report)
@@ -437,6 +460,7 @@ def main() -> int:
         print(
             "ACCEPTANCE SUMMARY "
             f"passed={totals['passed']} failed={totals['failed']} skipped={totals['skipped']} "
+            f"metadata-supported={totals['metadataSupported']} "
             f"provisional={totals['provisional']} native-verified={totals['nativeVerified']} "
             f"exact={recovery['exact']} partial={recovery['partial']} errors={recovery['errors']}"
         )

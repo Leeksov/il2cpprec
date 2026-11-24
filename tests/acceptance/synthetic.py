@@ -60,6 +60,16 @@ def quality_methods() -> tuple[SyntheticMethod, ...]:
     )
 
 
+def _image_groups(methods: tuple[SyntheticMethod, ...]) -> list[tuple[str, list[int]]]:
+    groups: dict[str, list[int]] = {}
+    for index, method in enumerate(methods):
+        groups.setdefault(method.image, []).append(index)
+    for name, indices in groups.items():
+        if indices != list(range(indices[0], indices[0] + len(indices))):
+            raise ValueError(f"synthetic methods for image {name} must be contiguous")
+    return list(groups.items())
+
+
 class _Image:
     def __init__(self, pointer_size: int, initial_size: int = 0):
         self.pointer_size = pointer_size
@@ -106,6 +116,10 @@ class _Image:
 
 
 def _metadata(version: str, methods: tuple[SyntheticMethod, ...]) -> bytes:
+    image_groups = _image_groups(methods)
+    method_rids = {method_index: rid
+                   for _, indices in image_groups
+                   for rid, method_index in enumerate(indices, start=1)}
     header_size = 240 if version in ("24.0", "24.1") else 264
     type_stride = {
         "24.0": 104,
@@ -145,8 +159,8 @@ def _metadata(version: str, methods: tuple[SyntheticMethod, ...]) -> bytes:
     strings_offset = image.add("strings", bytes(strings), 4)
     methods_offset = image.allocate("methods", method_stride * len(methods), 4)
     types_offset = image.allocate("types", type_stride * len(methods), 4)
-    images_offset = image.allocate("images", image_stride * len(methods), 4)
-    image.allocate("assemblies", assembly_stride * len(methods), 4)
+    images_offset = image.allocate("images", image_stride * len(image_groups), 4)
+    assemblies_offset = image.allocate("assemblies", assembly_stride * len(image_groups), 4)
 
     for index, method in enumerate(methods):
         base = methods_offset + index * method_stride
@@ -161,7 +175,7 @@ def _metadata(version: str, methods: tuple[SyntheticMethod, ...]) -> bytes:
             token_offset = generic_offset + 24
         else:
             token_offset = generic_offset + 4
-        image.u32(token_offset, 0x06000000 | (index + 1))
+        image.u32(token_offset, 0x06000000 | (method_rids[index] if version not in ("24.0", "24.1") else index + 1))
         struct.pack_into("<H", image.bytes, token_offset + 4, 0x0010)
 
         base = types_offset + index * type_stride
@@ -187,11 +201,14 @@ def _metadata(version: str, methods: tuple[SyntheticMethod, ...]) -> bytes:
         struct.pack_into("<H", image.bytes, counts_offset + 4, 0)
         image.u32(counts_offset + 16, 0)
 
-        base = images_offset + index * image_stride
-        image.u32(base, string_index(method.image))
-        image.u32(base + 8, index)
-        image.u32(base + 12, 1)
+    for image_index, (image_name, indices) in enumerate(image_groups):
+        base = images_offset + image_index * image_stride
+        image.u32(base, string_index(image_name))
+        image.u32(base + 4, image_index)
+        image.u32(base + 8, indices[0])
+        image.u32(base + 12, len(indices))
         image.u32(base + 28, 1)
+        image.u32(assemblies_offset + image_index * assembly_stride, image_index)
 
     image.u32(0, 0xFAB11BAF)
     image.u32(4, 24)
@@ -204,9 +221,9 @@ def _metadata(version: str, methods: tuple[SyntheticMethod, ...]) -> bytes:
     image.u32(164, type_stride * len(methods))
     images_field = 176 if version in ("24.0", "24.1") else 168
     image.u32(images_field, images_offset)
-    image.u32(images_field + 4, image_stride * len(methods))
+    image.u32(images_field + 4, image_stride * len(image_groups))
     image.u32(images_field + 8, image.offset("assemblies"))
-    image.u32(images_field + 12, assembly_stride * len(methods))
+    image.u32(images_field + 12, assembly_stride * len(image_groups))
     return bytes(image.bytes)
 
 
@@ -221,6 +238,7 @@ def _code(architecture: str, kind: str) -> bytes:
 
 
 def _elf(profile: Profile, methods: tuple[SyntheticMethod, ...]) -> bytes:
+    image_groups = _image_groups(methods)
     architecture = profile.architecture
     pointer_size = 8 if architecture in ("x64", "arm64") else 4
     is64 = pointer_size == 8
@@ -262,22 +280,23 @@ def _elf(profile: Profile, methods: tuple[SyntheticMethod, ...]) -> bytes:
             module_slots, invoker_slot = 11, 3
 
         module_names: list[str] = []
-        for index, method in enumerate(methods):
-            image.add(f"image_name_{index}", method.image.encode("utf-8") + b"\0")
-            table(f"image_methods_{index}", [method_targets[index]])
-            invoker = image.allocate(f"invoker_{index}", 4, 4)
-            image.u32(invoker, 0)
-            module = image.allocate(f"module_{index}", module_slots * pointer_size, pointer_size)
-            image.pointer(module, f"image_name_{index}")
-            image.count(module + pointer_size, 1)
-            image.pointer(module + 2 * pointer_size, f"image_methods_{index}")
-            image.pointer(module + invoker_slot * pointer_size, f"invoker_{index}")
-            module_names.append(f"module_{index}")
+        for group_index, (image_name, indices) in enumerate(image_groups):
+            image.add(f"image_name_{group_index}", image_name.encode("utf-8") + b"\0")
+            table(f"image_methods_{group_index}", [method_targets[index] for index in indices])
+            invoker = image.allocate(f"invoker_{group_index}", 4 * len(indices), 4)
+            for row in range(len(indices)):
+                image.u32(invoker + 4 * row, 0)
+            module = image.allocate(f"module_{group_index}", module_slots * pointer_size, pointer_size)
+            image.pointer(module, f"image_name_{group_index}")
+            image.count(module + pointer_size, len(indices))
+            image.pointer(module + 2 * pointer_size, f"image_methods_{group_index}")
+            image.pointer(module + invoker_slot * pointer_size, f"invoker_{group_index}")
+            module_names.append(f"module_{group_index}")
         table("modules", module_names)
         registration = image.allocate("code_registration", registration_slots * pointer_size, pointer_size)
         pair(registration, 0, len(methods), "global_methods")
         pair(registration, 2, 1, "generic_methods")
-        pair(registration, modules_slot, len(methods), "modules")
+        pair(registration, modules_slot, len(image_groups), "modules")
 
     for index, method in enumerate(methods):
         image.add(f"code_{index}", _code(architecture, method.kind), pointer_size)
